@@ -332,6 +332,48 @@ android:networkSecurityConfig="@xml/network_security_config"
 
 ---
 
+## CI/CD（GitHub Actions）
+
+`.github/workflows/build.yml` 在**推送到 main、打 tag、或手动触发**时自动构建，
+Windows 与 Android 并行产出可下载的构建产物。
+
+| Job | Runner | 产物 | 说明 |
+| --- | --- | --- | --- |
+| `windows` | `windows-latest` | `gpt-image-studio.exe` + NSIS 安装包 | 先跑 `pnpm typecheck` 再 `pnpm tauri:build` |
+| `android` | `ubuntu-latest` × 3 | 每个 ABI 一个 APK | 矩阵并行：`arm64-v8a` / `armeabi-v7a` / `x86_64` |
+
+产物在 Actions 运行页面的 **Artifacts** 区域下载，保留 14 天。
+
+### 缓存策略
+
+| 缓存 | 手段 | Key |
+| --- | --- | --- |
+| pnpm 依赖 | `actions/setup-node` 的 `cache: pnpm` | lockfile 哈希 |
+| Rust 依赖 + 编译产物 | `Swatinem/rust-cache@v2` | `Cargo.lock` + job key，Windows 与各 ABI 各一份互不干扰 |
+| Gradle 缓存与 wrapper | `actions/cache@v4` | `tauri.conf.json` 哈希 |
+
+Rust 的 `target` 目录缓存是加速的关键：首次构建约 15–20 分钟，命中缓存后通常 3–5 分钟。
+设置了 `CARGO_BUILD_JOBS=3` 抑制 LTO 阶段的峰值内存（runner 只有 7GB 内存，并行过猛会被 OOM 杀掉）。
+
+### Android 签名
+
+CI 默认**生成一次性 keystore** 并签好 APK，保证产物开箱即可安装。
+但它每次构建都会换一把新密钥，因此**无法覆盖安装**上一次构建的版本。
+
+需要稳定签名（能覆盖升级、能上架）时，在仓库 **Settings → Secrets and variables → Actions**
+里配置三个 secret，三者必须同时配置：
+
+| Secret | 说明 |
+| --- | --- |
+| `ANDROID_KEY_BASE64` | keystore 的 base64：`base64 -i upload-keystore.jks \| tr -d '\n'` |
+| `ANDROID_KEY_ALIAS` | `keytool` 里的 alias |
+| `ANDROID_KEY_PASSWORD` | keystore 密码 |
+
+> 注意：`.github/workflows/*` 属于受保护路径。用**经典 PAT** 推送时，
+> token 必须勾选 `workflow` scope，否则 push 会被 GitHub 拒绝（仅 `repo` 不够）。
+
+---
+
 ## 数据与安全
 
 所有数据都在本机应用数据目录：
