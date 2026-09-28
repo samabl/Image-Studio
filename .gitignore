@@ -1,0 +1,30 @@
+node_modules/
+dist/
+dist-ssr/
+*.local
+.DS_Store
+.vite/
+
+# Rust / Tauri
+src-tauri/target/
+src-tauri/gen/
+
+# 本地密钥（如果用户把配置导出到仓库根目录）
+*.secret.json
+.env
+.env.local
+
+# 编辑器
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# 日志
+*.log
+npm-debug.log*
+pnpm-debug.log*

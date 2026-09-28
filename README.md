@@ -1,0 +1,396 @@
+# GPT Image Studio
+
+一个用 **Tauri 2** 构建的跨平台（Windows / Android）AI 图像工作台：**AI 对话 + 文生图 + 图生图 + 图像编辑**，
+通过可配置的 **Base URL + API Key** 调用任意 OpenAI 兼容网关，**对话模型与图像模型分别配置、并且可以互相联动**。
+
+---
+
+## 目录
+
+- [功能特性](#功能特性)
+- [技术栈](#技术栈)
+- [目录结构](#目录结构)
+- [快速开始](#快速开始)
+- [配置说明](#配置说明)
+- [对话 ⇄ 图像 联动的四种玩法](#对话--图像-联动的四种玩法)
+- [接口形态：images 与 chat](#接口形态images-与-chat)
+- [Windows 打包](#windows-打包)
+- [Android 打包](#android-打包)
+- [数据与安全](#数据与安全)
+- [已知限制](#已知限制)
+
+---
+
+## 功能特性
+
+| 能力 | 说明 |
+| --- | --- |
+| 💬 **AI 对话** | 多轮会话、SSE 流式输出、思维链折叠显示、Markdown 渲染（代码块带复制）、随时中断、重新生成、多会话管理 |
+| 👁 **多模态输入** | 对话里可以贴图片，让模型看图（vision）；支持粘贴、拖拽、文件选择 |
+| 🎨 **文生图** | `/images/generations`，尺寸 / 数量 / 质量 / 背景 / 输出格式可调 |
+| 🖼 **图生图** | 上传参考图 + 提示词，走 `/images/edits`，支持多图组合 |
+| ✏️ **图像编辑** | 内置**蒙版画笔**，涂抹要改的区域做局部重绘（inpainting），支持撤销 |
+| 🔗 **模型联动** | 对话模型可**直接调用图像模型**（function calling）；也能优化提示词、反推图片提示词 |
+| 🖼 **图库** | 所有产出自动落盘归档，带提示词/模型/尺寸元信息，支持筛选、批量删除、导出 |
+| ⚙️ **双通道独立配置** | 对话与图像可以有完全不同的 Base URL / Key / 模型 |
+| 📱 **跨平台** | 同一套代码出 Windows 安装包与 Android APK |
+
+---
+
+## 技术栈
+
+- **外壳**：Tauri 2（Rust + 系统 WebView）
+- **前端**：React 19 + TypeScript + Vite 8 + Zustand
+- **后端**：Rust + `reqwest`（全部网络请求都在 Rust 侧完成）
+- **零重依赖**：Markdown 渲染器自研，不引 `remark`/`unified` 全家桶；不引图表库
+
+> **为什么网络请求放在 Rust 而不是前端 `fetch`？**
+> 一是绕开 WebView 的 CORS 限制，二是避免 `http://` 端点被当成混合内容拦截，
+> 三是 API Key 不必暴露在页面的 JS 环境里。Android 上同样受益。
+
+---
+
+## 目录结构
+
+```
+.
+├── index.html
+├── vite.config.ts
+├── src/                          # 前端
+│   ├── App.tsx                   # 外壳：导航 / 顶栏 / 拖拽导入 / 路由
+│   ├── styles.css                # 设计系统 + 移动端适配
+│   ├── types.ts                  # 与 Rust 结构体一一对应的类型
+│   ├── lib/
+│   │   ├── api.ts                # invoke 封装（含流式 Channel）
+│   │   ├── store.ts              # Zustand 状态 + 对话/工具执行循环
+│   │   ├── image.ts              # 缩放、蒙版渲染等 canvas 工具
+│   │   ├── shell.ts              # 打开外链/文件夹、剪贴板
+│   │   └── platform.ts           # 平台判定
+│   └── components/
+│       ├── ChatView.tsx          # 对话页
+│       ├── StudioView.tsx        # 图像工作室
+│       ├── MaskCanvas.tsx        # 蒙版画笔
+│       ├── GalleryView.tsx       # 图库
+│       ├── SettingsView.tsx      # 设置
+│       ├── Markdown.tsx          # 轻量 Markdown 渲染器
+│       ├── Overlays.tsx          # Toast / 灯箱
+│       └── ui.tsx                # 基础控件
+└── src-tauri/                    # 后端
+    ├── Cargo.toml
+    ├── tauri.conf.json           # 应用配置（含 CSP、asset 协议、Android minSdk）
+    ├── capabilities/default.json # 权限声明
+    ├── icons/                    # 各平台图标（由 icons/source.png 生成）
+    └── src/
+        ├── main.rs
+        ├── lib.rs                # 所有 #[tauri::command]
+        ├── ai.rs                 # OpenAI 兼容协议：对话/流式/文生图/图生图
+        ├── config.rs             # 配置读写与默认值
+        ├── gallery.rs            # 图库落盘与索引
+        └── error.rs              # 统一错误类型
+```
+
+---
+
+## 快速开始
+
+### 环境要求
+
+| 依赖 | 版本 | 说明 |
+| --- | --- | --- |
+| Node.js | ≥ 20.19 | Vite 8 要求 |
+| pnpm | ≥ 9 | 也可以用 npm |
+| Rust | ≥ 1.77.2 | `rustup` 安装 |
+| MSVC 生成工具 | VS 2022 Build Tools | Windows 编译必需（勾选「使用 C++ 的桌面开发」） |
+| WebView2 | 系统自带 | Win10/11 一般已预装 |
+
+```bash
+# 1. 安装前端依赖
+pnpm install
+
+# 2. 开发模式（热重载）
+pnpm tauri:dev
+
+# 3. 生产构建（Windows 安装包）
+pnpm tauri:build
+
+# 4. 拿真实网关跑一遍协议层联调（可选，见下）
+$env:GIS_TEST_BASE = "http://10.0.0.1:3000"; $env:GIS_TEST_KEY = "sk-..."
+pnpm test:live
+```
+
+产物位置：
+
+- 可执行文件：`src-tauri/target/release/gpt-image-studio.exe`
+- 安装包：`src-tauri/target/release/bundle/nsis/*.exe`
+
+### 联调测试
+
+`src-tauri/tests/live_gateway.rs` 会直接打真实端点，覆盖：
+Base URL 正规化、SSE 流式对话、`tool_calls` 分片累积、文生图、图生图、蒙版重绘、
+以及「网关不支持某参数时自动降级重试」。
+
+未设置 `GIS_TEST_BASE` / `GIS_TEST_KEY` 时联网用例自动跳过，所以 `cargo test` 随手跑也安全。
+
+---
+
+## 配置说明
+
+打开应用 → **设置**，分别配置两个通道。两者完全独立。
+
+### Base URL 的三种写法都支持
+
+| 你填的 | 实际请求的端点 |
+| --- | --- |
+| `http://10.0.0.1:3000` | `http://10.0.0.1:3000/v1/chat/completions` |
+| `http://10.0.0.1:3000/v1` | `http://10.0.0.1:3000/v1/chat/completions` |
+| `http://10.0.0.1:3000/v1/chat/completions` | 原样使用 |
+
+> 不必纠结要不要带 `/v1`，三种写法都能正确识别。
+
+### 两个通道
+
+| | 对话模型 | 图像模型 |
+| --- | --- | --- |
+| 用途 | 聊天、看图、优化提示词、反推提示词、驱动出图 | 文生图 / 图生图 / 局部重绘 |
+| 关键字段 | `baseUrl` `apiKey` `model` `systemPrompt` `temperature` `maxTokens` `timeoutSecs` | `baseUrl` `apiKey` `model` `apiMode` `size` `n` `timeoutSecs` |
+| 拉取模型 | 「↻ 拉取模型列表」会请求 `/v1/models` 并缓存到本地 | 同左 |
+
+**超时设置很重要**：`gpt-image-2.5` 出图单张可能超过 2 分钟，图像通道默认给到 600 秒。
+
+---
+
+## 对话 ⇄ 图像 联动的四种玩法
+
+这是本项目的核心设计——两个模型不是各干各的，而是能互相驱动。
+
+### 1️⃣ 对话里直接出图（function calling）
+
+开启 **设置 → 联动 → 允许对话模型直接调用图像工具** 后，
+对话请求会自动带上两个工具定义：`generate_image` 与 `edit_image`。
+
+```
+你：帮我画一只在雨夜街头的赛博朋克猫
+助手：[调用 generate_image] → 图片直接出现在对话里
+你：把霓虹灯改成暖橙色
+助手：[调用 edit_image，源图=上一张] → 新图片
+```
+
+实现要点：
+- Rust 侧把流式 `tool_calls` 分片累积成完整调用（`ai.rs`）；
+- 前端 `store.ts` 的 `runTurn()` 负责执行工具、把结果作为 `role: "tool"` 消息回灌给模型，
+  最多循环 4 轮，防止模型陷入无意义的反复出图。
+
+### 2️⃣ 提示词优化（对话模型 → 图像模型）
+
+在图像工作室点 **✨ AI 优化**：把口语化想法交给对话模型，按
+「主体 → 细节 → 动作 → 环境 → 构图 → 光线 → 风格」的结构扩写成专业提示词。
+
+也可以在设置里打开 **出图前自动用对话模型润色提示词**，让这步自动发生。
+
+### 3️⃣ 图片反推提示词（图像模型 → 对话模型）
+
+点 **🔍 反推**：把图片喂给视觉模型，让它反推出一条可直接复用的生图提示词。
+图库里每张图也带这个按钮。
+
+### 4️⃣ 跨页接力
+
+- 对话里生成的图片 → **✎ 送去编辑** / **✨ 做变体** → 带着参考图跳到图像工作室；
+- 图库里的图片 → **💬 去对话** → 新建会话并把图片作为附件投喂给模型，让它指挥 `edit_image`。
+
+---
+
+## 接口形态：images 与 chat
+
+不同厂商的图像模型暴露方式不一样，所以图像通道提供了两种形态：
+
+| `apiMode` | 端点 | 适用 |
+| --- | --- | --- |
+| `images`（默认） | `POST /v1/images/generations`（文生图）<br>`POST /v1/images/edits`（图生图 / 蒙版，multipart） | `gpt-image-2`、`gpt-image-2.5` 等 |
+| `chat` | `POST /v1/chat/completions` + `modalities: ["image","text"]` | Gemini 系图像模型等 |
+
+响应解析同时兼容三种返回形态，无需手动切换：
+
+1. `data[].b64_json` —— 标准 base64 返回；
+2. `data[].url` —— 返回图片链接，Rust 侧自动下载落盘；
+3. 图片内嵌在 `choices[].message.content` 的 Markdown 里
+   （`![image](data:image/jpeg;base64,...)`，Gemini 系模型常见）。
+
+关于参数兼容性：`quality` / `background` / `output_format` 默认值为 **`auto`，表示不下发该参数**，
+以最大化对各家网关的兼容性。需要时在「高级参数」里显式指定即可。
+
+---
+
+## Windows 打包
+
+```bash
+pnpm tauri:build
+```
+
+- 安装包（NSIS）：`src-tauri/target/release/bundle/nsis/GPT Image Studio_0.1.0_x64-setup.exe`
+- 免安装可执行文件：`src-tauri/target/release/gpt-image-studio.exe`（前端已内嵌，双击即用）
+- 安装模式为 `currentUser`（免管理员），语言含简体中文
+- 若目标机器缺少 WebView2，安装包会走 `downloadBootstrapper` 自动下载
+- 想同时产出 MSI，把 `tauri.conf.json` 里的 `bundle.targets` 改成 `"all"`（首次会下载 WiX）
+
+> **首次打包需要能访问 GitHub。** NSIS / WiX 打包工具是 Tauri 在首次打包时从
+> `github.com/tauri-apps/binary-releases` 下载的（缓存到 `%LOCALAPPDATA%\tauri`）。
+> 如果网络访问不了 GitHub，`pnpm tauri:build` 会在**最后一步**报
+> `failed to bundle project: ...`，但此时 `gpt-image-studio.exe` 已经编译完成并可正常使用，
+> 只是没有安装包外壳。想拿到安装包，在能访问 GitHub 的网络下重跑即可。
+
+> ⚠️ **不要用 `cargo build --release` 代替。** 直接 `cargo build --release` 编出来的二进制
+> 会指向 `devUrl`（启动后显示「localhost 拒绝连接」），因为 tauri-build 判断是否处于 dev 模式
+> 依赖 Tauri CLI 注入的 `TAURI_ENV_*` 环境变量。请始终使用 `pnpm tauri:build` / `pnpm tauri:dev`。
+
+只想快速验证功能，用开发模式即可：`pnpm tauri:dev`
+
+---
+
+## Android 打包
+
+Android 需要额外安装工具链（本仓库不包含它们，也无法预置）：
+
+| 依赖 | 建议版本 |
+| --- | --- |
+| JDK | 17（Tauri 2 要求 17） |
+| Android SDK | Platform 34+、Build-Tools 34+ |
+| Android NDK | 26.x |
+| Rust targets | `aarch64-linux-android`、`armv7-linux-androideabi`、`i686-linux-android`、`x86_64-linux-android` |
+
+```bash
+# 1) 环境变量（Windows PowerShell 示例）
+$env:JAVA_HOME          = "C:\Program Files\Eclipse Adoptium\jdk-17"
+$env:ANDROID_HOME       = "$env:LOCALAPPDATA\Android\Sdk"
+$env:NDK_HOME           = "$env:ANDROID_HOME\ndk\26.1.10909125"
+
+# 2) 一条命令搞定：补 Rust 目标 + init 工程 + 注入明文流量配置
+pnpm android:setup
+# 也可以指定要放行的内网网关（比全局放开安全得多）
+# pnpm android:setup -- -CleartextHosts 10.213.196.114,192.168.1.10
+
+# 3) 打包 APK / AAB
+pnpm android:apk                    # 产出 APK
+pnpm tauri android build            # 产出 AAB（上架 Google Play 用）
+
+# 4) 真机调试
+pnpm android:dev
+```
+
+`scripts/setup-android.ps1` 会自动完成四件事：
+
+1. 校验 `JAVA_HOME` / `ANDROID_HOME` / `NDK_HOME`，缺什么就给出具体的安装命令；
+2. 补齐四个 Rust 交叉编译目标（`aarch64` / `armv7` / `i686` / `x86_64-linux-android`）；
+3. 调用 `pnpm tauri android init` 生成 `src-tauri/gen/android/`；
+4. 生成 `network_security_config.xml` 并注入 `AndroidManifest.xml`
+   —— **内网 `http://` 网关在 Android 9+ 上默认被拦截，这一步是必须的**。
+
+脚本可重复执行，已打过的补丁不会重复写入。
+
+### ⚠️ Android 必做：允许明文 HTTP
+
+如果你的 Base URL 是 `http://...`（内网网关多数如此），必须放行明文流量。
+`pnpm android:setup` 已经替你做了。手工等价做法是：
+
+在 `src-tauri/gen/android/app/src/main/AndroidManifest.xml` 的 `<application>` 上引用：
+
+```xml
+<application
+    android:networkSecurityConfig="@xml/network_security_config"
+    ... >
+```
+
+并新建 `src-tauri/gen/android/app/src/main/res/xml/network_security_config.xml`：
+
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">10.213.196.114</domain>
+        <domain includeSubdomains="true">localhost</domain>
+    </domain-config>
+</network-security-config>
+```
+
+然后在 `<application>` 上引用：
+
+```xml
+android:networkSecurityConfig="@xml/network_security_config"
+```
+
+> 补充说明：应用内所有 AI 请求都由 Rust 侧的 `reqwest` 直接发起，不经 WebView。
+> AOSP 的明文限制主要作用于 Java 网络栈，所以多数设备上即使不开也能通；
+> 但部分厂商 ROM / MDM 策略会更严格，加上这行最省事。
+
+### 其他 Android 说明
+
+- 权限：`INTERNET`（Tauri 自动加上）。
+- 文件选择：用的是标准 `<input type="file">`，Android 上会拉起系统相册/文件选择器；
+  桌面端则是原生文件对话框。两端行为一致，不需要额外插件。
+- 触屏：导航会自动变成底部标签栏；蒙版画笔用 Pointer Events，手指可直接涂抹。
+- `minSdkVersion` 在 `tauri.conf.json` 里配置，当前为 **24**（Android 7.0）。
+
+---
+
+## 数据与安全
+
+所有数据都在本机应用数据目录：
+
+| 平台 | 路径 |
+| --- | --- |
+| Windows | `%APPDATA%\com.gptimagestudio.desktop\` |
+| Android | `/data/data/com.gptimagestudio.desktop/files/` |
+
+```
+config.json            # 两个通道的配置（含 API Key）
+state/sessions.json    # 对话历史
+gallery/index.json     # 图库索引
+gallery/images/*.png   # 原图
+```
+
+设置页底部会直接把真实路径显示出来，并提供「打开目录」。
+
+**⚠️ 安全须知**
+
+- **API Key 以明文存放**在 `config.json` 中（这也是绝大多数同类桌面工具的做法）。
+  请勿把该文件提交到版本库或分享给他人；`.gitignore` 已排除常见密钥文件名，但 `config.json` 本身
+  位于系统目录、不在仓库内。
+- 渲染模型输出时**全程使用 React 节点，不使用 `dangerouslySetInnerHTML`**，
+  模型返回的 HTML/脚本不会被执行。
+- CSP 限制为 `default-src 'self'`，外链一律交给系统浏览器打开。
+- 只有同源网关返回的图片 URL 才会带上 `Authorization` 头下载，避免密钥泄漏给第三方图床。
+
+---
+
+## 验证状态
+
+本仓库交付前做过以下实测（在 Windows 11 + Rust 1.98 + Node 24 上）：
+
+| 项目 | 方式 | 结果 |
+| --- | --- | --- |
+| 协议层：Base URL 正规化 / data URL 解析 | 单元测试（不联网） | ✅ 通过 |
+| 协议层：模型列表、非流式对话、SSE 流式对话 | `tests/live_gateway.rs` 打真实网关 | ✅ 通过 |
+| 协议层：`tool_calls` 流式分片累积 | 真实模型返回，断言参数是合法 JSON | ✅ 通过 |
+| 协议层：文生图 → 图生图 → 蒙版局部重绘 | 真实网关全链路 | ✅ 通过 |
+| 兼容性：网关拒绝 `temperature` 时自动降级 | 故意发不支持参数，断言仍成功 | ✅ 通过 |
+| 应用：启动、配置读写、UI 渲染 | 运行 debug 构建并截图核对 | ✅ 通过 |
+| **联动**：对话模型自主调用出图 → 图片内联 → 基于结果继续回话 | 在真实 UI 里点击触发，走完整 Agent 闭环 | ✅ 通过 |
+| 应用：图库落盘 + asset 协议加载历史图 | 生成后切到图库页核对缩略图 | ✅ 通过 |
+| 应用：图像工作室（文生图 / 图生图 / 蒙版 UI） | 运行并截图核对 | ✅ 通过 |
+| Windows 打包（release + NSIS 安装包） | `pnpm tauri:build` | ✅ 通过 |
+| Android 打包 | **未在本机验证** —— 本机无 JDK / Android SDK / NDK | ⚠️ 见 [Android 打包](#android-打包) |
+
+Android 侧已按 Tauri 2 规范完成全部工程级配置（`tauri.conf.json` 的 `bundle.android`、
+图标集、权限声明、`INTERNET` 权限、明文流量脚本），但**没有在真机/模拟器上跑过**。
+装好工具链后执行 `pnpm android:setup && pnpm android:apk` 即可产出 APK。
+
+---
+
+## 已知限制
+
+- **Android 端不支持「导出到…」**：系统保存对话框在移动端行为不一致，图片目前保存在应用私有目录内。
+  后续可通过 MediaStore 或系统分享面板补齐。
+- **对话历史的图片**：以 data URL 形式存在 `sessions.json` 里，长期大量贴图会让该文件变大。
+  生成的图片会同时归档到图库（存的是文件路径），可以随时清理历史会话。
+- **`apiMode = chat` 不支持 `n > 1`**：该形态由对话模型决定出图数量。
+- 多图组合（一次传多张参考图）依赖网关支持 `image[]` 字段，部分网关只接受单张。

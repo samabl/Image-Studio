@@ -1,0 +1,21 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "GPT Image Studio 默认权限：核心 API + 文件选择对话框 + 打开外部链接/文件夹。",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging",
+    "core:window:allow-set-title",
+    "core:webview:allow-internal-toggle-devtools",
+    "dialog:default",
+    "dialog:allow-open",
+    "dialog:allow-save",
+    "dialog:allow-message",
+    "dialog:allow-confirm",
+    "opener:default",
+    "opener:allow-open-path",
+    "opener:allow-open-url",
+    "opener:allow-reveal-item-in-dir"
+  ]
+}

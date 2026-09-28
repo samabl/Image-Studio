@@ -1,0 +1,37 @@
+{
+  "name": "gpt-image-studio",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "跨平台 AI 图像工作台：对话 / 文生图 / 图生图 / 图像编辑",
+  "scripts": {
+    "dev": "vite",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build",
+    "android:setup": "pwsh -File scripts/setup-android.ps1",
+    "android:apk": "tauri android build --apk",
+    "android:dev": "tauri android dev",
+    "test:live": "cargo test --manifest-path src-tauri/Cargo.toml --test live_gateway -- --nocapture --test-threads=1"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.12.0",
+    "@tauri-apps/plugin-dialog": "^2.8.0",
+    "@tauri-apps/plugin-opener": "^2.6.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "zustand": "^5.0.15"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.12.0",
+    "@types/node": "^26.6.3",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.1",
+    "typescript": "^5.9.3",
+    "vite": "^8.3.1"
+  }
+}

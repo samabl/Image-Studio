@@ -1,0 +1,52 @@
+[package]
+name = "gpt-image-studio"
+version = "0.1.0"
+description = "跨平台 AI 图像工作台：对话 / 文生图 / 图生图 / 图像编辑"
+authors = ["GPT Image Studio"]
+edition = "2021"
+rust-version = "1.77.2"
+
+[lib]
+name = "gpt_image_studio_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["protocol-asset"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 所有 AI 请求都走 Rust 侧，绕开 WebView 的 CORS / 明文混合内容限制
+reqwest = { version = "0.12", default-features = false, features = [
+  "json",
+  "stream",
+  "multipart",
+  "rustls-tls",
+] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+futures-util = "0.3"
+base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }
+thiserror = "2"
+
+# 单实例保护：两个进程同时跑会互相覆盖 config.json / sessions.json。
+# 该插件只支持桌面端，Android 上用 cfg 排除。
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-single-instance = "2"
+
+[dev-dependencies]
+# 仅测试用：手工构造蒙版 PNG，验证 /images/edits 的 mask 分支
+flate2 = "1"
+crc32fast = "1"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true
