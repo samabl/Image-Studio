@@ -357,11 +357,28 @@ Windows 与 Android 并行产出可下载的构建产物。
 Rust 的 `target` 目录缓存是加速的关键：首次构建约 15–20 分钟，命中缓存后通常 3–5 分钟。
 设置了 `CARGO_BUILD_JOBS=3` 抑制 LTO 阶段的峰值内存（runner 只有 7GB 内存，并行过猛会被 OOM 杀掉）。
 
-> **踩坑记录：** Android job 没有使用 `android-actions/setup-android`。
-> 该 action 在 `ubuntu-24.04` 镜像上会尝试安装上游已移除的旧版 `tools` 包，
-> `sdkmanager` 直接以退出码 1 结束，把整个 job 打断。
-> GitHub 的 ubuntu 镜像本来就预装了完整 SDK（`/usr/local/lib/android/sdk`），
-> 所以工作流改成「探测预装 SDK + 按需补 NDK + 导出环境变量」。
+### 踩坑记录
+
+这几条都是实际跑 CI 踩出来的，写下来免得重复掉坑：
+
+1. **`android-actions/setup-android@v3` 在 ubuntu-24.04 上会挂。**
+   它尝试安装上游已移除的旧版 `tools` 包，`sdkmanager` 以退出码 1 结束并打断整个 job。
+   GitHub 的 ubuntu 镜像本来就预装了完整 SDK（`/usr/local/lib/android/sdk`），
+   所以改成「探测预装 SDK + 按需补 NDK + 导出环境变量」。
+
+2. **`tauri android init` / `build` 在非交互环境必须传 `--ci`。**
+   不传会一直等着输入而卡死；`init` 会自动读 `CI` 环境变量，但 `build` 不会，必须显式传。
+
+3. **不要用正则去改 Tauri 生成的 `app/build.gradle.kts`。**
+   模板用的是 Kotlin DSL 的 `getByName("release") { ... }`，版本之间还会变。
+   实测出现过「匹配不到 release 块 → 静默产出未签名 APK」而构建日志一路全绿的情况。
+
+4. **写 XML 时注意两件事**：PowerShell 单引号字符串不做转义（`'$1`n'` 会把
+   「反引号 + n」写进 XML，导致 Gradle 的 `ManifestMerger` 解析失败）；
+   以及别用 `Set-Content -Encoding UTF8`（Windows PowerShell 5.1 下会写 BOM，同样解析失败）。
+
+5. **APK 产出的目录是 `app/build/outputs/apk/universal/release/`**，
+   文件名里带 `universal`，即使只构建单个 ABI 也是这个名字。
 
 ### Android 签名
 
@@ -431,7 +448,7 @@ gallery/images/*.png   # 原图
 
 ## 验证状态
 
-本仓库交付前做过以下实测（在 Windows 11 + Rust 1.98 + Node 24 上）：
+### 本机实测（Windows 11 + Rust 1.98 + Node 24）
 
 | 项目 | 方式 | 结果 |
 | --- | --- | --- |
@@ -444,12 +461,28 @@ gallery/images/*.png   # 原图
 | **联动**：对话模型自主调用出图 → 图片内联 → 基于结果继续回话 | 在真实 UI 里点击触发，走完整 Agent 闭环 | ✅ 通过 |
 | 应用：图库落盘 + asset 协议加载历史图 | 生成后切到图库页核对缩略图 | ✅ 通过 |
 | 应用：图像工作室（文生图 / 图生图 / 蒙版 UI） | 运行并截图核对 | ✅ 通过 |
-| Windows 打包（release + NSIS 安装包） | `pnpm tauri:build` | ✅ 通过 |
-| Android 打包 | **未在本机验证** —— 本机无 JDK / Android SDK / NDK | ⚠️ 见 [Android 打包](#android-打包) |
+| Windows 打包（release 可执行文件） | `pnpm tauri:build` | ✅ 通过 |
+
+### CI 实测（GitHub Actions，ubuntu-24.04 / windows-latest）
+
+| 项目 | 方式 | 结果 |
+| --- | --- | --- |
+| Windows 构建 + NSIS 安装包 | `windows` job | ✅ 通过（产物 4.29 MB） |
+| Android 三个 ABI 构建 | `android` 矩阵 job | ✅ 通过（arm64-v8a / armeabi-v7a / x86_64） |
+| APK 签名 | 下载产物用 `apksigner verify` 复验 | ✅ 通过（v2 + v3，本地复验 APK Signing Block 存在） |
+| 明文流量配置进入包内 | 解包检查二进制 `AndroidManifest.xml` 字符串池 | ✅ 通过（含 `networkSecurityConfig`） |
+| AndroidManifest 补丁逻辑 | `scripts/test-android-manifest.ps1` | ✅ 13/13 |
+| 缓存建立 | Actions Caches API | ✅ 7 条 / 2.19 GB |
+
+**尚未验证**：Android 真机/模拟器运行。环境里没有设备，
+所以「APK 能装、能跑、能连上网关」这三件事只到「构建产物结构正确且已签名」为止。
+
+如果想在本机复现整套 Android 流程，见 [Android 打包](#android-打包)；
+`pnpm android:setup` + `pnpm android:apk` + `pnpm android:sign` 三步。
 
 Android 侧已按 Tauri 2 规范完成全部工程级配置（`tauri.conf.json` 的 `bundle.android`、
-图标集、权限声明、`INTERNET` 权限、明文流量脚本），但**没有在真机/模拟器上跑过**。
-装好工具链后执行 `pnpm android:setup && pnpm android:apk` 即可产出 APK。
+图标集、权限声明、`INTERNET` 权限、明文流量脚本），CI 上也能稳定产出**已签名的可安装 APK**，
+但**没有在真机/模拟器上跑过**（环境里没有设备）。
 
 ---
 
