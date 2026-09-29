@@ -148,6 +148,11 @@ jobs:
           echo "使用 NDK：$NDK_DIR"
           echo "NDK_HOME=$NDK_DIR" >> "$GITHUB_ENV"
 
+          # apksigner / zipalign 在 build-tools 里，后置签名要用
+          BUILD_TOOLS=$(ls -d "$ANDROID_HOME"/build-tools/* 2>/dev/null | sort -V | tail -1 || true)
+          echo "build-tools: ${BUILD_TOOLS:-未找到}"
+          ls "${BUILD_TOOLS:-/nonexistent}" 2>/dev/null | grep -E "^(apksigner|zipalign)" || true
+
       - name: 安装 pnpm
         uses: pnpm/action-setup@v4
         with:
@@ -192,27 +197,45 @@ jobs:
         shell: pwsh
         run: pwsh -File scripts/test-android-manifest.ps1
 
-      # 复用仓库里的脚本：init 工程 + 注入明文流量放行 + 配置签名。
+      # 准备签名材料。没配 secrets 就生成一把一次性 keystore，
+      # 保证产物可安装（代价是每次构建签名不同、无法覆盖安装）。
+      - name: 准备签名 keystore
+        shell: pwsh
+        env:
+          SECRET_KEY_BASE64: ${{ secrets.ANDROID_KEY_BASE64 }}
+          SECRET_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          SECRET_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ksAlias = if ($env:SECRET_KEY_ALIAS) { $env:SECRET_KEY_ALIAS } else { "ci-upload" }
+          $ksPass  = if ($env:SECRET_KEY_PASSWORD) { $env:SECRET_KEY_PASSWORD } else { "android" }
+          $tmp = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { [IO.Path]::GetTempPath() }
+
+          if ($env:SECRET_KEY_BASE64) {
+            Write-Host "使用仓库 secrets 中配置的 keystore"
+            $ks = Join-Path $tmp "upload.jks"
+            [IO.File]::WriteAllBytes($ks, [Convert]::FromBase64String($env:SECRET_KEY_BASE64))
+          } else {
+            Write-Host "::warning::未配置 ANDROID_KEY_BASE64，改用一次性 CI keystore；每次构建签名都不同，无法覆盖安装。"
+            $ks = Join-Path $tmp "ci-upload.jks"
+            & "$env:JAVA_HOME/bin/keytool" -genkeypair -v -keystore $ks -alias $ksAlias `
+              -keyalg RSA -keysize 2048 -validity 10000 `
+              -storepass $ksPass -keypass $ksPass `
+              -dname "CN=CI, OU=CI, O=GPT Image Studio, L=CI, S=CI, C=CN"
+            if ($LASTEXITCODE -ne 0) { throw "keytool 生成 keystore 失败" }
+          }
+          if (-not (Test-Path $ks)) { throw "keystore 未生成：$ks" }
+          Write-Host "keystore: $ks"
+
+          foreach ($pair in @(@("ANDROID_KS_PATH", $ks), @("ANDROID_KS_ALIAS", $ksAlias), @("ANDROID_KS_PASSWORD", $ksPass))) {
+            [IO.File]::AppendAllText($env:GITHUB_ENV, "$($pair[0])=$($pair[1])`n")
+          }
+
+      # 复用仓库里的脚本：init 工程 + 注入明文流量放行。
       # GitHub runner 自带 pwsh，所以 Windows/Linux 用同一份逻辑。
       - name: 配置 Android 工程
         shell: pwsh
-        env:
-          # 没有配 secrets 时用一个临时生成的 keystore，保证产物可安装。
-          # 想要稳定签名的用户请配置 ANDROID_KEY_* 三个 secret（见 README）。
-          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS || 'ci-upload' }}
-          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD || 'android' }}
-          ANDROID_KEY_BASE64: ${{ secrets.ANDROID_KEY_BASE64 }}
-        run: |
-          if (-not $env:ANDROID_KEY_BASE64) {
-            Write-Host "未配置 ANDROID_KEY_BASE64，生成一次性 CI keystore"
-            $ks = Join-Path $env:RUNNER_TEMP "ci-upload.jks"
-            & "$env:JAVA_HOME/bin/keytool" -genkeypair -v `
-              -keystore $ks -alias ci-upload -keyalg RSA -keysize 2048 -validity 10000 `
-              -storepass android -keypass android `
-              -dname "CN=CI, OU=CI, O=GPT Image Studio, L=CI, S=CI, C=CN"
-            $env:ANDROID_KEY_BASE64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes($ks))
-          }
-          pwsh -File scripts/setup-android.ps1 -CleartextHosts 10.213.196.114,localhost,10.0.2.2
+        run: pwsh -File scripts/setup-android.ps1 -CleartextHosts 10.213.196.114,localhost,10.0.2.2
 
       - name: 构建 APK
         # --ci：跳过交互式提问（签名等），否则 runner 上会卡住等输入
@@ -229,18 +252,18 @@ jobs:
             echo "(pnpm 尚未安装，跳过)"
           fi
 
-      - name: 校验签名
+      # Tauri 的 Gradle 模板没有配 signingConfig，产出的 release APK 是未签名的，
+      # 无法直接安装。这里用 apksigner 做后置签名：与 Gradle 模板结构无关，稳定得多。
+      - name: 签名 APK（zipalign + apksigner）
+        shell: pwsh
         run: |
-          set -e
-          APK=$(find src-tauri/gen/android/app/build/outputs/apk -name "*.apk" | head -1)
-          if [ -z "$APK" ]; then echo "没有找到 APK"; exit 1; fi
-          echo "产物: $APK"
-          APKSIGNER=$(ls "$ANDROID_HOME"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -1)
-          if [ -n "$APKSIGNER" ]; then
-            "$APKSIGNER" verify --print-certs "$APK" && echo "签名校验通过" \
-              || echo "::warning::APK 未签名，无法直接安装。请配置 ANDROID_KEY_* secrets。"
-          fi
-          ls -lh "$APK"
+          pwsh -File scripts/sign-android-apk.ps1 `
+            -KeystorePath $env:ANDROID_KS_PATH `
+            -KeyAlias $env:ANDROID_KS_ALIAS `
+            -KeyPassword $env:ANDROID_KS_PASSWORD
+
+      - name: 列出最终产物
+        run: find src-tauri/gen/android/app/build/outputs/apk -name "*.apk" -exec ls -lh {} \;
 
       - name: 上传 APK
         uses: actions/upload-artifact@v4

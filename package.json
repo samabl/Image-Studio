@@ -13,8 +13,10 @@
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
     "android:setup": "pwsh -File scripts/setup-android.ps1",
-    "android:apk": "tauri android build --apk",
+    "android:apk": "tauri android build --apk --ci",
     "android:dev": "tauri android dev",
+    "android:sign": "pwsh -File scripts/sign-android-apk.ps1",
+    "test:android": "pwsh -File scripts/test-android-manifest.ps1",
     "test:live": "cargo test --manifest-path src-tauri/Cargo.toml --test live_gateway -- --nocapture --test-threads=1"
   },
   "dependencies": {

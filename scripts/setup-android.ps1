@@ -3,25 +3,22 @@
     一键生成并配置 Tauri Android 工程（Windows / Linux / macOS 通用，CI 与本地共用）。
 
 .DESCRIPTION
-    做五件事：
+    做四件事：
       1. 校验 JAVA_HOME / ANDROID_HOME / NDK_HOME，缺什么给出具体安装命令；
       2. 补齐 Rust 交叉编译目标；
       3. 调用 `pnpm tauri android init` 生成 src-tauri/gen/android；
       4. 生成 network_security_config.xml 并注入 AndroidManifest.xml
-         —— 内网 http:// 网关在 Android 9+ 上默认被拦截，这一步是必须的；
-      5. 若提供了签名材料，写入 keystore.properties 并给 app/build.gradle.kts
-         打上 release signingConfig（Tauri 模板默认没有这段）。
+         —— 内网 http:// 网关在 Android 9+ 上默认被拦截，这一步是必须的。
+
+    签名**不在这里做**。Tauri 的 Gradle 模板用的是 `getByName("release") { ... }`
+    这类 Kotlin DSL 写法，靠正则去改它非常脆（实测因为匹配不到 release 块而静默产出
+    未签名 APK）。签名改用与模板无关的后置方案：
+        pwsh -File scripts/sign-android-apk.ps1 -KeystorePath ... -KeyAlias ... -KeyPassword ...
 
     脚本可重复执行：已打过的补丁不会重复写入。
 
 .EXAMPLE
-    # 本地：只放行内网网关
     pwsh -File scripts/setup-android.ps1 -CleartextHosts 10.213.196.114
-
-.EXAMPLE
-    # CI：从环境变量拿签名材料（不落盘到仓库）
-    $env:ANDROID_KEY_BASE64="..."; $env:ANDROID_KEY_ALIAS="upload"; $env:ANDROID_KEY_PASSWORD="..."
-    pwsh -File scripts/setup-android.ps1
 #>
 [CmdletBinding()]
 param(
@@ -32,12 +29,7 @@ param(
     [switch]$AllowAllCleartext,
 
     # 跳过 `tauri android init`
-    [switch]$SkipInit,
-
-    # 签名用的 keystore 路径；不传则读 $env:ANDROID_KEY_BASE64 解码到临时文件
-    [string]$KeystorePath,
-    [string]$KeyAlias = $env:ANDROID_KEY_ALIAS,
-    [string]$KeyPassword = $env:ANDROID_KEY_PASSWORD
+    [switch]$SkipInit
 )
 
 $ErrorActionPreference = "Stop"
@@ -49,13 +41,15 @@ Set-Location $root
 . (Join-Path $PSScriptRoot "lib/android-manifest.ps1")
 
 $onWindows = $IsWindows -or ($PSVersionTable.PSEdition -eq "Desktop")
+# 统一以「UTF-8 无 BOM」写 XML：带 BOM 会让 Gradle 的 ManifestMerger 解析失败。
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
 function Info($m) { Write-Host "  $m" -ForegroundColor Cyan }
 function Ok($m)   { Write-Host "  [ok] $m" -ForegroundColor Green }
 function Warn($m) { Write-Host "  [!] $m" -ForegroundColor Yellow }
 function Fail($m) { Write-Host "  [x] $m" -ForegroundColor Red; exit 1 }
 
-Write-Host "`n=== 1/5 检查构建环境 ===" -ForegroundColor White
+Write-Host "`n=== 1/4 检查构建环境 ===" -ForegroundColor White
 
 # --- Java ---
 $javaHome = $env:JAVA_HOME
@@ -101,14 +95,14 @@ if (-not $ndk) {
     }
 }
 if (-not $ndk -or -not (Test-Path $ndk)) {
-    Warn "未找到 Android NDK。可在 SDK Manager 安装 NDK（26.x/27.x），或设置 NDK_HOME。"
+    Warn "未找到 Android NDK。可在 SDK Manager 安装 NDK（26.x/27.x/29.x），或设置 NDK_HOME。"
     Fail "缺少 NDK，无法继续。"
 }
 $env:NDK_HOME = $ndk
 Ok "NDK_HOME = $ndk"
 
 # --- Rust 交叉目标 ---
-Write-Host "`n=== 2/5 检查 Rust 交叉编译目标 ===" -ForegroundColor White
+Write-Host "`n=== 2/4 检查 Rust 交叉编译目标 ===" -ForegroundColor White
 $targets = @(
     "aarch64-linux-android",
     "armv7-linux-androideabi",
@@ -128,7 +122,7 @@ foreach ($t in $targets) {
 }
 
 # --- 生成工程 ---
-Write-Host "`n=== 3/5 生成 Android 工程 ===" -ForegroundColor White
+Write-Host "`n=== 3/4 生成 Android 工程 ===" -ForegroundColor White
 $manifest = Join-Path $root "src-tauri/gen/android/app/src/main/AndroidManifest.xml"
 
 if ($SkipInit) {
@@ -147,7 +141,7 @@ if ($SkipInit) {
 if (-not (Test-Path $manifest)) { Fail "找不到 AndroidManifest.xml：$manifest" }
 
 # --- 明文 HTTP 放行 ---
-Write-Host "`n=== 4/5 配置明文 HTTP 放行 ===" -ForegroundColor White
+Write-Host "`n=== 4/4 配置明文 HTTP 放行 ===" -ForegroundColor White
 
 $resXmlDir = Join-Path $root "src-tauri/gen/android/app/src/main/res/xml"
 $nsFile = Join-Path $resXmlDir "network_security_config.xml"
@@ -165,10 +159,6 @@ if ($AllowAllCleartext) {
     $domainBlock = "`n    <domain-config cleartextTrafficPermitted=`"true`">`n$domains`n    </domain-config>`n"
 }
 
-# 统一以「UTF-8 无 BOM」写 XML：带 BOM 会让 Gradle 的 ManifestMerger 解析失败。
-# 不用 Set-Content -Encoding UTF8 —— 它在 Windows PowerShell 5.1 下会写 BOM。
-$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-
 New-Item -ItemType Directory -Force -Path $resXmlDir | Out-Null
 $xml = @"
 <?xml version="1.0" encoding="utf-8"?>
@@ -179,6 +169,7 @@ $baseConfig$domainBlock</network-security-config>
 "@
 [IO.File]::WriteAllText($nsFile, $xml, $utf8NoBom)
 Ok "已写入 network_security_config.xml"
+
 $content = Get-Content $manifest -Raw
 $changed = $false
 
@@ -226,100 +217,16 @@ if ($changed) {
     Ok "AndroidManifest.xml 已更新"
 }
 
-# --- 签名 ---
-Write-Host "`n=== 5/5 配置 release 签名 ===" -ForegroundColor White
-
-# 支持 CI 传 base64（不落盘到仓库）
-if (-not $KeystorePath -and $env:ANDROID_KEY_BASE64) {
-    $KeystorePath = Join-Path ([IO.Path]::GetTempPath()) "android-upload.jks"
-    [IO.File]::WriteAllBytes($KeystorePath, [Convert]::FromBase64String($env:ANDROID_KEY_BASE64))
-    Info "已从 ANDROID_KEY_BASE64 解码 keystore 到临时目录"
-}
-
-if (-not $KeystorePath) {
-    Warn "未提供签名材料，release APK 会是没有签名的产物（无法直接安装）。"
-    Info "要拿到可安装的 release APK，任选其一："
-    Info "  a) 传入 -KeystorePath/-KeyAlias/-KeyPassword 三个参数"
-    Info "  b) 设置环境变量 ANDROID_KEY_BASE64 / ANDROID_KEY_ALIAS / ANDROID_KEY_PASSWORD"
-    Info "  c) 用 `pnpm tauri android build --apk --debug` 出一个 debug 签名的 APK"
-} elseif (-not (Test-Path $KeystorePath)) {
-    Fail "keystore 文件不存在：$KeystorePath"
-} else {
-    if (-not $KeyAlias) { Fail "缺少 -KeyAlias（或 ANDROID_KEY_ALIAS）" }
-    if (-not $KeyPassword) { Fail "缺少 -KeyPassword（或 ANDROID_KEY_PASSWORD）" }
-
-    $absKey = (Resolve-Path $KeystorePath).Path
-    $gradleDir = Join-Path $root "src-tauri/gen/android"
-    $propsFile = Join-Path $gradleDir "keystore.properties"
-
-    # Tauri 模板里 storeFile 走 file(...)，Windows 路径反斜杠会被当转义，统一成正斜杠
-    $storeFile = $absKey -replace '\\', '/'
-    @(
-        "password=$KeyPassword",
-        "keyAlias=$KeyAlias",
-        "storeFile=$storeFile"
-    ) | Set-Content -Path $propsFile -Encoding ascii
-    Ok "已写入 keystore.properties"
-
-    # 模板默认没有 signingConfigs，需要补上并把 release buildType 指过去
-    $gradleFile = Join-Path $gradleDir "app/build.gradle.kts"
-    if (-not (Test-Path $gradleFile)) {
-        Warn "没找到 app/build.gradle.kts，跳过 Gradle 签名配置"
-    } else {
-        $g = Get-Content $gradleFile -Raw
-        if ($g -match 'signingConfigs\s*\{') {
-            Ok "build.gradle.kts 已有 signingConfigs，跳过"
-        } else {
-            if ($g -notmatch 'import java\.io\.FileInputStream') {
-                $g = "import java.io.FileInputStream`n" + $g
-            }
-            $block = @"
-    signingConfigs {
-        create("release") {
-            val keystorePropertiesFile = rootProject.file("keystore.properties")
-            val keystoreProperties = Properties()
-            if (keystorePropertiesFile.exists()) {
-                keystoreProperties.load(FileInputStream(keystorePropertiesFile))
-            }
-            keyAlias = keystoreProperties["keyAlias"] as String
-            keyPassword = keystoreProperties["password"] as String
-            storeFile = file(keystoreProperties["storeFile"] as String)
-            storePassword = keystoreProperties["password"] as String
-        }
-    }
-
-"@
-            if ($g -match '(?m)^\s*buildTypes\s*\{') {
-                $g = $g -replace '(?m)^(\s*)buildTypes\s*\{', ($block + '$0')
-                Ok "已在 buildTypes 前插入 signingConfigs"
-            } else {
-                Warn "build.gradle.kts 里没有 buildTypes 块，请手工添加 signingConfigs"
-            }
-            # release 分支指向新的签名配置
-            if ($g -match 'signingConfig\s*=\s*signingConfigs\.getByName\("release"\)') {
-                Ok "release 已引用 release 签名配置"
-            } elseif ($g -match '(?ms)release\s*\{') {
-                # 注意：必须用 Regex 实例的 Replace(input, replacement, count) 重载，
-                # 静态的 [regex]::Replace(...,1) 会把 1 当成 RegexOptions 而不是次数。
-                $re = [regex]'(?ms)(release\s*\{)'
-                $g = $re.Replace($g, "`$1`n            signingConfig = signingConfigs.getByName(`"release`")", 1)
-                Ok "已让 release buildType 使用 release 签名配置"
-            } else {
-                Warn "没找到 buildTypes.release 块，请手工加上 signingConfig = signingConfigs.getByName(\"release\")"
-            }
-            Set-Content -Path $gradleFile -Value $g -Encoding UTF8
-            Ok "app/build.gradle.kts 已更新"
-        }
-    }
-}
-
 Write-Host "`n完成。`n" -ForegroundColor Green
 Write-Host @"
 后续命令：
-  打包 APK   : pnpm tauri android build --apk
-  打包 AAB   : pnpm tauri android build
+  打包 APK   : pnpm tauri android build --apk --ci
+  签名 APK   : pwsh -File scripts/sign-android-apk.ps1 -KeystorePath <jks> -KeyAlias <alias> -KeyPassword <pwd>
+  打包 AAB   : pnpm tauri android build --ci
   真机调试   : pnpm tauri android dev
   产物目录   : src-tauri/gen/android/app/build/outputs/apk/
 
-注意：改了 tauri.conf.json 的 identifier / version 后需重新 init（先删掉 src-tauri/gen/android）。
+注意：
+  - tauri android build 没有 --ci 的自动行为，非交互环境务必显式传，否则会卡在提问上。
+  - 改了 tauri.conf.json 的 identifier / version 后需重新 init（先删掉 src-tauri/gen/android）。
 "@ -ForegroundColor Gray

@@ -269,8 +269,10 @@ pnpm android:setup
 # pnpm android:setup -- -CleartextHosts 10.213.196.114,192.168.1.10
 
 # 3) 打包 APK / AAB
-pnpm android:apk                    # 产出 APK
-pnpm tauri android build            # 产出 AAB（上架 Google Play 用）
+pnpm android:apk                    # 产出 APK（未签名）
+# 签名（必做，否则装不上）：
+pwsh -File scripts/sign-android-apk.ps1 -KeystorePath <jks> -KeyAlias <alias> -KeyPassword <pwd>
+pnpm tauri android build --ci       # 产出 AAB（上架 Google Play 用）
 
 # 4) 真机调试
 pnpm android:dev
@@ -362,6 +364,23 @@ Rust 的 `target` 目录缓存是加速的关键：首次构建约 15–20 分�
 > 所以工作流改成「探测预装 SDK + 按需补 NDK + 导出环境变量」。
 
 ### Android 签名
+
+Tauri 生成的 Gradle 模板**没有配 `signingConfig`**，所以 `tauri android build --apk`
+产出的 `app-universal-release-unsigned.apk` 是未签名的，**无法直接安装**。
+
+本项目用 **`apksigner` 后置签名**解决，而不是去改 `app/build.gradle.kts`：
+
+```bash
+pnpm tauri android build --apk --ci
+pwsh -File scripts/sign-android-apk.ps1 \
+  -KeystorePath ./upload-keystore.jks -KeyAlias upload -KeyPassword <你的密码>
+```
+
+脚本会依次做 zipalign → apksigner sign → apksigner verify，**校验通过才删掉未签名原件**。
+
+> 为什么不改 Gradle 模板？Tauri 用的是 `getByName("release") { ... }` 这类 Kotlin DSL，
+> 版本之间还会变，靠正则匹配非常脆。实测就出现过「匹配不到 release 块 → 静默产出未签名 APK」
+> 的情况，而构建日志一路全绿。apksigner 只依赖 Android SDK 自带的稳定命令行工具。
 
 CI 默认**生成一次性 keystore** 并签好 APK，保证产物开箱即可安装。
 但它每次构建都会换一把新密钥，因此**无法覆盖安装**上一次构建的版本。
