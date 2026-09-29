@@ -355,6 +355,12 @@ Windows 与 Android 并行产出可下载的构建产物。
 Rust 的 `target` 目录缓存是加速的关键：首次构建约 15–20 分钟，命中缓存后通常 3–5 分钟。
 设置了 `CARGO_BUILD_JOBS=3` 抑制 LTO 阶段的峰值内存（runner 只有 7GB 内存，并行过猛会被 OOM 杀掉）。
 
+> **踩坑记录：** Android job 没有使用 `android-actions/setup-android`。
+> 该 action 在 `ubuntu-24.04` 镜像上会尝试安装上游已移除的旧版 `tools` 包，
+> `sdkmanager` 直接以退出码 1 结束，把整个 job 打断。
+> GitHub 的 ubuntu 镜像本来就预装了完整 SDK（`/usr/local/lib/android/sdk`），
+> 所以工作流改成「探测预装 SDK + 按需补 NDK + 导出环境变量」。
+
 ### Android 签名
 
 CI 默认**生成一次性 keystore** 并签好 APK，保证产物开箱即可安装。
