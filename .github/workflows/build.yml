@@ -185,6 +185,13 @@ jobs:
       - name: 安装前端依赖
         run: pnpm install --frozen-lockfile
 
+      # 快速单元测试：AndroidManifest 补丁逻辑。
+      # 这段逻辑曾把字面量（反引号+n）写进 XML，导致 Gradle 的
+      # processUniversalReleaseMainManifest 阶段解析失败，所以固定在构建前跑。
+      - name: 校验 AndroidManifest 补丁逻辑
+        shell: pwsh
+        run: pwsh -File scripts/test-android-manifest.ps1
+
       # 复用仓库里的脚本：init 工程 + 注入明文流量放行 + 配置签名。
       # GitHub runner 自带 pwsh，所以 Windows/Linux 用同一份逻辑。
       - name: 配置 Android 工程

@@ -44,6 +44,10 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
+# AndroidManifest 的补丁逻辑单独成文件，便于单元测试
+# （见 scripts/test-android-manifest.ps1）
+. (Join-Path $PSScriptRoot "lib/android-manifest.ps1")
+
 $onWindows = $IsWindows -or ($PSVersionTable.PSEdition -eq "Desktop")
 
 function Info($m) { Write-Host "  $m" -ForegroundColor Cyan }
@@ -161,6 +165,10 @@ if ($AllowAllCleartext) {
     $domainBlock = "`n    <domain-config cleartextTrafficPermitted=`"true`">`n$domains`n    </domain-config>`n"
 }
 
+# 统一以「UTF-8 无 BOM」写 XML：带 BOM 会让 Gradle 的 ManifestMerger 解析失败。
+# 不用 Set-Content -Encoding UTF8 —— 它在 Windows PowerShell 5.1 下会写 BOM。
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
 New-Item -ItemType Directory -Force -Path $resXmlDir | Out-Null
 $xml = @"
 <?xml version="1.0" encoding="utf-8"?>
@@ -169,33 +177,52 @@ $xml = @"
 <network-security-config>
 $baseConfig$domainBlock</network-security-config>
 "@
-Set-Content -Path $nsFile -Value $xml -Encoding UTF8
+[IO.File]::WriteAllText($nsFile, $xml, $utf8NoBom)
 Ok "已写入 network_security_config.xml"
-
 $content = Get-Content $manifest -Raw
 $changed = $false
 
-if ($content -notmatch 'networkSecurityConfig') {
-    if ($content -match '<application\b') {
-        $content = $content -replace '(<application\b)', '$1`n        android:networkSecurityConfig="@xml/network_security_config"'
-        $changed = $true
-        Ok "已注入 android:networkSecurityConfig"
-    } else {
-        Warn "AndroidManifest.xml 里没找到 <application> 标签，请手动添加 networkSecurityConfig"
-    }
+# 1) 引用网络安全配置
+$patched = Add-AndroidManifestAttribute `
+    -Content $content `
+    -Name "android:networkSecurityConfig" `
+    -Value "@xml/network_security_config"
+if ($null -eq $patched) {
+    Warn "AndroidManifest.xml 里没找到 <application> 标签，请手动添加 networkSecurityConfig"
+} elseif ($patched -ne $content) {
+    $content = $patched
+    $changed = $true
+    Ok "已注入 android:networkSecurityConfig"
 } else {
     Ok "networkSecurityConfig 已存在，跳过"
 }
 
-if ($AllowAllCleartext -and $content -notmatch 'usesCleartextTraffic') {
-    if ($content -match '<application\b') {
-        $content = $content -replace '(<application\b)', '$1`n        android:usesCleartextTraffic="true"'
+# 2) 可选：放行全部明文流量
+if ($AllowAllCleartext) {
+    $patched = Add-AndroidManifestAttribute `
+        -Content $content `
+        -Name "android:usesCleartextTraffic" `
+        -Value "true"
+    if ($null -ne $patched -and $patched -ne $content) {
+        $content = $patched
         $changed = $true
         Ok "已注入 android:usesCleartextTraffic"
     }
 }
+
+# 写入前必须仍是合法 XML。
+# 之前这里用了单引号里的 `n，把字面量「反引号+n」写进了 XML，
+# 结果 Gradle 在 processUniversalReleaseMainManifest 阶段报
+# "Error parsing AndroidManifest.xml" 才暴露出来 —— 现在就地拦住。
+if (-not (Test-WellFormedXml $content)) {
+    Fail "补丁后的 AndroidManifest.xml 不是合法 XML，已中止（不会写入坏文件）"
+}
+if (-not (Test-WellFormedXml $xml)) {
+    Fail "生成的 network_security_config.xml 不是合法 XML，已中止"
+}
+
 if ($changed) {
-    Set-Content -Path $manifest -Value $content -Encoding UTF8
+    [IO.File]::WriteAllText($manifest, $content, $utf8NoBom)
     Ok "AndroidManifest.xml 已更新"
 }
 
