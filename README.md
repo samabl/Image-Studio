@@ -156,6 +156,42 @@ Base URL 正规化、SSE 流式对话、`tool_calls` 分片累积、文生图、
 | 拉取模型 | 「↻ 拉取模型列表」会请求 `/v1/models` 并缓存到本地 | 同左 |
 
 **超时设置很重要**：`gpt-image-2.5` 出图单张可能超过 2 分钟，图像通道默认给到 600 秒。
+如果网关前面还有反向代理 / 内网穿透，**代理那一侧的空闲超时必须比这里更宽松**，
+否则请求会先被代理掐断、返回像 `502 Bad Gateway ... upstream timeout after 30000ms` 这样的错误体
+（App 会把它显示成「接口返回 502」）。
+
+### HTTPS 网关 / 自签证书（TLS 信任）
+
+App 的请求全部走 Rust 侧（`reqwest` + `rustls`），信任库同时含两套：
+
+| 信任来源 | 覆盖什么 | 来源 |
+| --- | --- | --- |
+| `rustls-tls` | Mozilla 内置根证书 | 编译进 App，公网 CA 全部可用 |
+| `rustls-tls-native-roots` | **操作系统信任库** | Windows 证书存储 / macOS 钥匙串 / Linux 的 `SSL_CERT_FILE`、`/etc/ssl/certs` |
+
+所以自签根证书**导入系统信任库**后，App 就能直接走 `https://<内网网关>`：
+
+```powershell
+Import-Certificate -FilePath portforward-ca.crt -CertStoreLocation Cert:\LocalMachine\Root
+```
+
+> 只装给浏览器/Node 是不够的：浏览器读系统库、Node 要 `NODE_EXTRA_CA_CERTS`，
+> 而 App 之前只用 `webpki-roots`（Mozilla 内置根），看不到系统里导入的证书，
+> 会直接抛 `InvalidCertificate(UnknownIssuer)`。现在两套都读。
+
+**Android 例外**：`rustls-native-certs` 在 Android 上走的是 Unix 分支，
+读不到 `/system/etc/security/cacerts`，等效于「只有公网 CA」。给安卓用请优先选：
+
+- 由穿透 / 隧道服务提供**受信任证书**的入口（如 `https://<隧道域名>:<端口>`），客户端零配置；
+- 或让网关提供明文 HTTP 入口，并按「Android 必做：允许明文 HTTP」放行该域名。
+
+自带联调用例可以验证信任是否生效（不花额度，只打 `/v1/models`）：
+
+```powershell
+$env:GIS_TEST_BASE = "https://<内网网关>:2233"
+$env:GIS_TEST_KEY  = "sk-..."
+cargo test --manifest-path src-tauri/Cargo.toml --test live_gateway list_models -- --nocapture
+```
 
 ---
 

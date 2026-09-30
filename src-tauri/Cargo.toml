@@ -22,11 +22,17 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # 所有 AI 请求都走 Rust 侧，绕开 WebView 的 CORS / 明文混合内容限制
+#
+# TLS 同时启用两套内置根：`rustls-tls` = Mozilla 内置根（公网 CA），
+# `rustls-tls-native-roots` = 操作系统信任库。只带前者时，App 看不到
+# Windows / Android 证书库里导入的自签根证书，局域网网关（如 PortForward2233
+# 的本地 CA）在 App 里会直接报 UnknownIssuer —— 浏览器和 Node 却都能过。
 reqwest = { version = "0.12", default-features = false, features = [
   "json",
   "stream",
   "multipart",
   "rustls-tls",
+  "rustls-tls-native-roots",
 ] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 futures-util = "0.3"
