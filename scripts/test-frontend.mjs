@@ -395,6 +395,17 @@ test("模型池兼容旧配置，独立连接不继承其他服务的密钥", as
   assert.equal(imageModels.selectImageModel(pool).id, "model-A");
 });
 
+test("图像模型选择复用同连接的完整列表，并隔离不同密钥、服务与协议", async () => {
+  const h = await harness(); const { image, chat } = h.useConfig.getState().config;
+  const config = { ...image, models: ["image-A"], modelPool: [{ id: "image-A", apiMode: "auto" }, { id: "custom-C", apiMode: "chat" }] };
+  const shared = { ...chat, baseUrl: `${image.baseUrl}/v1/chat/completions`, models: ["image-A", "gemini-B", "flux-D"] };
+  assert.deepEqual(imageModels.availableImageModelIds(config, shared), ["image-A", "gemini-B", "flux-D", "custom-C"]);
+  for (const patch of [{ apiKey: "another-key" }, { baseUrl: "https://another.example.test" }, { protocol: "anthropic" }]) {
+    assert.deepEqual(imageModels.availableImageModelIds(config, { ...shared, ...patch }), ["image-A", "custom-C"]);
+  }
+  assert.deepEqual(imageModels.availableImageModelIds({ ...config, apiMode: "gemini" }, { ...shared, protocol: "gemini" }), ["image-A", "gemini-B", "flux-D", "custom-C"]);
+});
+
 test("图像工具枚举限制启用模型，合成只提供可编辑模型", async () => {
   const h = await harness(); const cfg = h.useConfig.getState().config.image;
   const pool = { ...cfg, modelPool: [{ id: "A", apiMode: "auto", supportsEditing: false }, { id: "C", apiMode: "chat", supportsEditing: true }] };
@@ -499,11 +510,12 @@ test("模型池多选界面展示全部模型与逐模型协议、能力和连�
   const url = await compile("src/components/ImageModelPool.tsx", { react: import.meta.resolve("react"), "react/jsx-runtime": import.meta.resolve("react/jsx-runtime"), "./ui": ui, "../lib/imageModels": imageModelsUrl });
   const { ImageModelPool } = await import(url); const h = await harness();
   const config = { ...h.useConfig.getState().config.image, models: ["A", "gemini-B", "flux-C"], modelPool: [{ id: "A", apiMode: "auto" }, { id: "gemini-B", apiMode: "chat" }] };
-  const html = renderToStaticMarkup(createElement(ImageModelPool, { config, onChange() {}, onBlur() {} }));
+  const html = renderToStaticMarkup(createElement(ImageModelPool, { config, onChange() {}, onBlur() {}, onFetch() {} }));
   assert.equal((html.match(/type="checkbox"/g) ?? []).length, 3);
   assert.equal((html.match(/checked=""/g) ?? []).length, 2);
   assert.ok(html.includes("完成选择")); assert.ok(html.includes("gemini-B 接口类型"));
   assert.ok(html.includes("A 模型能力")); assert.ok(html.includes("A API Key"));
+  assert.ok(html.includes('aria-expanded="true"')); assert.ok(html.includes("拉取可选模型"));
 });
 
 test("Android 返回键逐层关闭界面，首页连续两次才返回桌面并保存状态", async () => {

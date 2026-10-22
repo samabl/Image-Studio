@@ -1,19 +1,29 @@
-import { useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { Field } from "./ui";
 import { canEditImageModel, configuredImageModels, IMAGE_API_LABELS, imageModelConnection } from "../lib/imageModels";
 import type { ImageApiMode, ImageConfig, ImageModelConfig } from "../types";
 
-export function ImageModelPool({ config, onChange, onBlur }: {
+export function ImageModelPool({ config, availableModels = config.models, onChange, onBlur, onFetch, loading }: {
   config: ImageConfig;
+  availableModels?: string[];
   onChange: (pool: ImageModelConfig[]) => void;
   onBlur: () => void;
+  onFetch?: () => void;
+  loading?: boolean;
 }) {
   const [query, setQuery] = useState("");
   const [customId, setCustomId] = useState("");
-  const listRef = useRef<HTMLDetailsElement>(null);
+  const [expanded, setExpanded] = useState(true);
   const pool = configuredImageModels(config);
-  const models = [...new Set([...config.models, ...pool.map((entry) => entry.id)])]
+  const allModels = [...new Set([...availableModels, ...pool.map((entry) => entry.id)])];
+  const models = allModels
     .filter((id) => id.toLowerCase().includes(query.trim().toLowerCase()));
+  useEffect(() => { setExpanded(true); setQuery(""); }, [availableModels.length]);
+  useEffect(() => {
+    const back = (event: Event) => { if (expanded) { event.preventDefault(); setExpanded(false); setQuery(""); } };
+    window.addEventListener("image-studio-back", back);
+    return () => window.removeEventListener("image-studio-back", back);
+  }, [expanded]);
   const patch = (id: string, value: Partial<ImageModelConfig>) => onChange(pool.map((entry) => entry.id === id ? { ...entry, ...value } : entry));
   const add = () => {
     const id = customId.trim();
@@ -25,13 +35,20 @@ export function ImageModelPool({ config, onChange, onBlur }: {
   return (
     <div className="image-model-pool">
       <div className="hint">勾选 Chat 可调用的模型。自动模式允许不同模型分别生成素材，再使用支持参考图的模型合成；也可在会话里固定一个模型。</div>
-      <details ref={listRef} className="image-model-select" onToggle={(e) => { if (!e.currentTarget.open) setQuery(""); }}>
-        <summary>多选生图模型（已启用 {pool.length} 个）</summary>
+      <div className="image-model-select">
+        <div className="image-model-select-head">
+          <button type="button" className="btn sm" aria-expanded={expanded} aria-controls="image-model-checkboxes" onClick={() => { setExpanded(!expanded); setQuery(""); }}>
+            {expanded ? "收起模型列表" : "展开模型列表"}（{allModels.length} 个可选，已启用 {pool.length} 个）
+          </button>
+          {onFetch && <button type="button" className="btn sm ghost" disabled={loading} onClick={() => { setExpanded(true); setQuery(""); onFetch(); }}>{loading ? "获取中…" : "↻ 拉取可选模型"}</button>}
+        </div>
+        {expanded && <div id="image-model-checkboxes">
+        {availableModels.length === 0 && <div className="hint">尚未拉取模型列表。点击“拉取可选模型”后即可勾选，也可手动添加。</div>}
         <input className="input" value={query} placeholder="搜索全部模型…" aria-label="搜索生图模型池" onChange={(e) => setQuery(e.target.value)} />
         <div className="image-model-options">
           {models.map((id) => {
             const selected = pool.some((entry) => entry.id === id);
-            return <label key={id}><input type="checkbox" checked={selected} disabled={selected && pool.length === 1}
+            return <label className={selected ? "selected" : ""} key={id}><input type="checkbox" checked={selected} disabled={selected && pool.length === 1}
               onChange={(e) => {
                 onChange(e.target.checked ? [...pool, { id, apiMode: "auto" }] : pool.filter((entry) => entry.id !== id));
                 onBlur();
@@ -40,10 +57,10 @@ export function ImageModelPool({ config, onChange, onBlur }: {
           {!models.length && <div className="hint">没有匹配的模型，可在下方手动添加 ID。</div>}
         </div>
         <button type="button" className="btn sm" onClick={() => {
-          if (listRef.current) { listRef.current.open = false; listRef.current.querySelector("summary")?.focus(); }
-          setQuery(""); onBlur();
+          setExpanded(false); setQuery(""); onBlur();
         }}>完成选择</button>
-      </details>
+        </div>}
+      </div>
       <div className="image-model-add">
         <input className="input" value={customId} placeholder="手动添加模型 ID" aria-label="添加生图模型 ID"
           onChange={(e) => setCustomId(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); add(); } }} />

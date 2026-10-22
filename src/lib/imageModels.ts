@@ -1,4 +1,4 @@
-import type { ImageApiMode, ImageConfig, ImageModelConfig, ResolvedImageApiMode } from "../types";
+import type { ChatConfig, ImageApiMode, ImageConfig, ImageModelConfig, ResolvedImageApiMode } from "../types";
 
 export const IMAGE_API_LABELS: Record<ImageApiMode, string> = {
   auto: "自动识别",
@@ -44,6 +44,13 @@ export function canEditImageModel(entry: ImageModelConfig): boolean {
 function sameService(a: string, b: string): boolean {
   try { return new URL(a).origin === new URL(b).origin; }
   catch { return a.replace(/\/$/, "") === b.replace(/\/$/, ""); }
+}
+
+/** 同一连接已拉取的列表可直接用于选图像模型，无需再重复输入或拉取。 */
+export function availableImageModelIds(config: ImageConfig, chat?: ChatConfig): string[] {
+  const protocol = resolveImageApiMode(config.apiMode, config.model, config.baseUrl) === "gemini" ? "gemini" : "openai";
+  const shared = chat && chat.protocol === protocol && chat.apiKey === config.apiKey && sameService(chat.baseUrl, config.baseUrl) ? chat.models : [];
+  return [...new Set([...config.models, ...shared, ...configuredImageModels(config).map((entry) => entry.id)])];
 }
 
 export function imageModelConnection(config: ImageConfig, entry: ImageModelConfig) {

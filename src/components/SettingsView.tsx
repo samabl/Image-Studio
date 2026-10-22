@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { Field, Switch } from "./ui";
 import { ModelPicker } from "./ModelPicker";
 import { ImageModelPool } from "./ImageModelPool";
-import { configuredImageModels, defaultImageConnection, IMAGE_API_LABELS, resolveImageApiMode } from "../lib/imageModels";
+import { availableImageModelIds, defaultImageConnection, IMAGE_API_LABELS, resolveImageApiMode } from "../lib/imageModels";
 import { useConfig, useGallery, useToast } from "../lib/store";
 import { backgroundTaskStatus, configureBackgroundTasks, listModels } from "../lib/api";
 import { openLocalPath } from "../lib/shell";
@@ -253,7 +253,7 @@ export function SettingsView() {
                 </button>
               }
             >
-              <ModelPicker value={cfg.image.model} models={[...new Set([...cfg.image.models, ...configuredImageModels(cfg.image).map((model) => model.id)])]}
+              <ModelPicker value={cfg.image.model} models={availableImageModelIds(cfg.image, cfg.chat)}
                 onChange={(model) => patchImage({ model })} onBlur={() => void flush()} />
             </Field>
 
@@ -277,7 +277,9 @@ export function SettingsView() {
             </Field>
 
             <Field label="Chat 生图模型池">
-              <ImageModelPool config={cfg.image} onChange={(modelPool) => patchImage({ modelPool })} onBlur={() => void flush()} />
+              <ImageModelPool config={cfg.image} availableModels={availableImageModelIds(cfg.image, cfg.chat)}
+                onFetch={() => void fetchModels("image")} loading={loading === "image"}
+                onChange={(modelPool) => patchImage({ modelPool })} onBlur={() => void flush()} />
             </Field>
 
             <div className="grid-2">
