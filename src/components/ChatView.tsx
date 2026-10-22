@@ -5,6 +5,7 @@ import { showImage } from "./Overlays";
 import { useConfig, useSessions, useStudio, useToast, channelReady } from "../lib/store";
 import { fileToAttachment } from "../lib/image";
 import { SaveImageButton } from "./SaveImageButton";
+import { ImageToolDetails } from "./ImageToolDetails";
 import type { ChatAttachment, ChatMessage, GeneratedRef } from "../types";
 
 const SUGGESTIONS = [
@@ -185,7 +186,8 @@ export function ChatView() {
               <MessageRow key={m.id} message={m} />
             ))}
             {streaming && (
-              <MessageRow
+                <MessageRow
+                  key={streaming.messageId}
                 message={{
                   id: streaming.messageId,
                   role: "assistant",
@@ -402,11 +404,9 @@ function MessageRow({ message, live }: { message: ChatMessage; live?: boolean })
           ) : null}
 
           {message.toolCalls && message.toolCalls.length > 0 && !live && (
-            <div style={{ marginTop: 9, display: "flex", gap: 6, flexWrap: "wrap" }}>
+            <div className="image-tool-list">
               {message.toolCalls.map((tc) => (
-                <span key={tc.id} className="chip accent" title={tc.arguments}>
-                  🔧 {tc.name === "generate_image" ? "生成图像" : tc.name === "edit_image" ? "编辑图像" : tc.name}
-                </span>
+                <ImageToolDetails key={tc.id} call={tc} labels={tc.sourceLabels} sentPrompt={tc.sentPrompt} />
               ))}
             </div>
           )}

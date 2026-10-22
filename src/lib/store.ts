@@ -807,12 +807,16 @@ async function runTurn(sessionId: string, set: Setter, get: () => SessionState):
         if (stopped) abort();
       });
       const streamed = get().runs[sessionId]?.streaming;
-      patchRun({ streaming: null });
       if (!streamed) break;
       // 停止时保留已生成文字，丢弃未执行的工具调用。
-      append({ id: messageId, role: "assistant", content: streamed.content.trim(), reasoning: streamed.reasoning.trim() || undefined,
+      const assistant: ChatMessage = { id: messageId, role: "assistant", content: streamed.content.trim(), reasoning: streamed.reasoning.trim() || undefined,
         toolCalls: final.ok && streamed.toolCalls.length ? streamed.toolCalls : undefined,
-        model: cfg.chat.model, createdAt: Date.now(), ...(final.ok ? {} : { error: final.error }) });
+        model: cfg.chat.model, createdAt: Date.now(), ...(final.ok ? {} : { error: final.error }) };
+      // 以同一个 key 原子替换流式消息，避免消息短暂消失或折叠状态被重置。
+      set((state) => ({
+        sessions: state.sessions.map((s) => s.id === sessionId ? { ...s, messages: [...s.messages, assistant], updatedAt: Date.now() } : s),
+        runs: state.runs[sessionId]?.runId === runId ? { ...state.runs, [sessionId]: { ...state.runs[sessionId], streaming: null } } : state.runs,
+      }));
       if (!final.ok || !active() || !streamed.toolCalls.length) break;
       const conv = readSession();
       if (!conv) break;
@@ -831,12 +835,15 @@ async function runTurn(sessionId: string, set: Setter, get: () => SessionState):
           if (call.name === "edit_image" && !sources.length) throw new Error("没有选择可用的参考图片");
           const images = await Promise.all(sources.map((image) => image.dataUrl || (image.path ? api.readImageDataUrl(image.path) : Promise.reject(new Error("参考图片无法读取")))));
           if (!active()) throw new Error("已停止");
-          patchRun({ toolNote: `${sources.length ? `正在使用 ${sources.length} 张素材编辑` : "正在生成图片"}：${prompt.slice(0, 60)}` });
+          const sourceLabels = sources.map((source) => source.label);
+          const sentPrompt = `${prompt}\n\n用户原始要求（必须保留文字、数量、构图、素材对应关系与禁止项）：\n${original}`;
+          update(messageId, { toolCalls: readSession()?.messages.find((m) => m.id === messageId)?.toolCalls?.map((tc) => tc.id === call.id ? { ...tc, sourceLabels, sentPrompt } : tc) });
+          patchRun({ toolNote: sources.length ? `正在使用 ${sources.length} 张素材编辑图像…` : "正在生成图片…" });
           const imgCfg = cfg.image;
           const request = api.cancellableImage({
             baseUrl: imgCfg.baseUrl, apiKey: imgCfg.apiKey, model: imgCfg.model, apiMode: imgCfg.apiMode,
-            prompt: `${prompt}\n\n用户原始要求（必须保留文字、数量、构图、素材对应关系与禁止项）：\n${original}`,
-            images, imageLabels: sources.map((source) => source.label),
+            prompt: sentPrompt,
+            images, imageLabels: sourceLabels,
             n: Math.min(Math.max(Math.floor(Number(args.n ?? 1)) || 1, 1), 4),
             size: typeof args.size === "string" && args.size !== "auto" ? args.size : imgCfg.size === "auto" ? undefined : imgCfg.size,
             quality: imgCfg.quality, background: imgCfg.background, outputFormat: imgCfg.outputFormat, timeoutSecs: imgCfg.timeoutSecs,

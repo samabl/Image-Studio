@@ -90,6 +90,9 @@ export interface ToolCall {
   name: string;
   arguments: string;
   providerData?: Record<string, unknown>;
+  /** 本地展示元数据，不透传协议；保留实际输入顺序与完整发送指令。 */
+  sourceLabels?: string[];
+  sentPrompt?: string;
 }
 
 export interface ChatAttachment {

@@ -18,7 +18,11 @@ class MainActivity : TauriActivity() {
     super.onCreate(savedInstanceState)
   }
 
-  override fun setContentView(view: View) {
+  override fun setContentView(view: View?) {
+    if (view == null) {
+      super.setContentView(view)
+      return
+    }
     // WebView 的 safe-area-inset 在部分 Android 版本上为零。原生容器先避开
     // 状态栏、刘海、导航栏和键盘，让页面与全屏预览始终位于可用区域。
     val content = FrameLayout(this).apply {

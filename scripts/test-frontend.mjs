@@ -220,6 +220,57 @@ test("Android 工作室取消和启动服务失败时清理任务，避免继续
   assert.deepEqual(h.useSessions.getState().runs, {});
 });
 
+test("完整 AI 指令和文字跨生图、回图检查及下一轮保存，流式消息原子落盘", async () => {
+  const h = await harness(); const sessions = h.useSessions.getState;
+  const pending = sessions().send("只改手臂，其他保持", [attachment("original")]);
+  const prompt = "保留原画风，修正手臂和袖口。\n" + "原图面部、发饰、场景、衣服和床铺细节保持不变。".repeat(12) + "这是完整指令的结尾。";
+  const explanation = "**修正方案**：只调整手臂和袖口。";
+  const transient = [];
+  const unsubscribe = h.useSessions.subscribe((state) => {
+    if (!state.runs[state.currentId]?.streaming && !state.sessions.find((s) => s.id === state.currentId)?.messages.some((m) => m.content === explanation)) transient.push(state);
+  });
+  h.streams[0].onEvent({ type: "delta", text: explanation });
+  h.streams[0].onEvent({ type: "toolCalls", calls: [{ id: "edit", name: "edit_image", arguments: JSON.stringify({ prompt, source_image_ids: ["original"] }) }] });
+  h.streams[0].onEvent({ type: "done", finishReason: "tool_calls" });
+  await tick(); unsubscribe();
+  assert.equal(transient.length, 0, "完成流式消息与移除临时消息必须一次更新");
+  const before = sessions().current().messages.find((m) => m.role === "assistant");
+  assert.equal(before.content, explanation);
+  assert.equal(JSON.parse(before.toolCalls[0].arguments).prompt, prompt);
+  assert.equal(before.toolCalls[0].sentPrompt, h.imageCalls[0].request.prompt);
+  assert.equal(before.toolCalls[0].sourceLabels[0], "素材 1：original.png（图片 ID：original）");
+  assert.equal(sessions().runs[sessions().currentId].toolNote, "正在使用 1 张素材编辑图像…");
+  h.imageCalls[0].resolve([{ id: "g", path: "g.png", dataUrl: attachment("g").dataUrl, prompt, model: "image", size: "1024x1024" }]);
+  await tick(); complete(h.streams[1], "**检查完成**：手臂已修正。"); await pending;
+  const after = sessions().current().messages.find((m) => m.id === before.id);
+  assert.deepEqual(after, before);
+  await sessions().persist();
+  assert.deepEqual(h.saves.at(-1).sessions[0].messages.find((m) => m.id === before.id), JSON.parse(JSON.stringify(before)));
+  const next = sessions().send("继续修袖口", []);
+  complete(h.streams[2], "保留上次修正，下一步修袖口。"); await next;
+  assert.deepEqual(sessions().current().messages.find((m) => m.id === before.id), before);
+});
+
+test("旧历史与新消息中的完整 AI 指令可展示、复制，不依赖临时进度", async () => {
+  const { createElement } = await import("react");
+  const { renderToStaticMarkup } = await import("react-dom/server");
+  const shell = `data:text/javascript,${encodeURIComponent("export async function copyText() {};")}`;
+  const store = `data:text/javascript,${encodeURIComponent("export const useToast = { getState: () => ({push(){}}) };")}`;
+  const url = await compile("src/components/ImageToolDetails.tsx", { "../lib/shell": shell, "../lib/store": store, "react/jsx-runtime": import.meta.resolve("react/jsx-runtime") });
+  const { ImageToolDetails } = await import(url);
+  const prompt = "修正手臂。\n" + "不要改变构图和场景。".repeat(50) + "完整提示词结尾";
+  const call = {id:"edit", name:"edit_image", arguments:JSON.stringify({prompt,source_image_ids:["result","original"]})};
+  const old = renderToStaticMarkup(createElement(ImageToolDetails,{call}));
+  assert.ok(old.includes(prompt));
+  assert.ok(old.includes("完整提示词结尾"));
+  assert.ok(old.includes("result → original"));
+  assert.ok(old.includes("复制完整指令"));
+  const current = renderToStaticMarkup(createElement(ImageToolDetails,{call,labels:["结果图 1","原始素材 1"],sentPrompt:prompt+"\n原始要求：只改手臂"}));
+  assert.ok(current.includes("结果图 1 → 原始素材 1"));
+  assert.ok(current.includes("原始要求：只改手臂"));
+  assert.ok(renderToStaticMarkup(createElement(ImageToolDetails,{call:{...call,arguments:"{invalid"}})).includes("{invalid"));
+});
+
 test("优化提示词读取全部参考图，并要求保留原始约束", async () => {
   const h = await harness();
   await h.optimizePromptText("两个人，素材 1 的人物，素材 2 的背景", [attachment("a"), attachment("b")]);
