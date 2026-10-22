@@ -33,6 +33,7 @@ pub const DEFAULT_REVERSE_SYSTEM_PROMPT: &str = "\
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ChatConfig {
+    pub protocol: String,
     pub base_url: String,
     pub api_key: String,
     pub model: String,
@@ -51,6 +52,7 @@ pub struct ChatConfig {
 impl Default for ChatConfig {
     fn default() -> Self {
         Self {
+            protocol: "openai".into(),
             base_url: "http://10.213.196.114:3000".into(),
             api_key: String::new(),
             model: "gpt-5.6-luna".into(),
@@ -196,7 +198,10 @@ pub fn load_config(app: &AppHandle) -> AppResult<AppConfig> {
             // 配置损坏时不让应用起不来：备份坏文件后回退默认值。
             let backup = path.with_extension("json.broken");
             let _ = fs::rename(&path, &backup);
-            eprintln!("config.json 解析失败({e})，已备份到 {} 并使用默认配置", backup.display());
+            eprintln!(
+                "config.json 解析失败({e})，已备份到 {} 并使用默认配置",
+                backup.display()
+            );
             Ok(AppConfig::default())
         }
     }

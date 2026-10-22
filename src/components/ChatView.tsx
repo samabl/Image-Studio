@@ -4,6 +4,7 @@ import { Empty, FileImage, Spinner } from "./ui";
 import { showImage } from "./Overlays";
 import { useConfig, useSessions, useStudio, useToast, channelReady } from "../lib/store";
 import { fileToAttachment } from "../lib/image";
+import { SaveImageButton } from "./SaveImageButton";
 import type { ChatAttachment, ChatMessage, GeneratedRef } from "../types";
 
 const SUGGESTIONS = [
@@ -16,25 +17,24 @@ export function ChatView() {
   const cfg = useConfig((s) => s.config);
   const sessions = useSessions((s) => s.sessions);
   const currentId = useSessions((s) => s.currentId);
-  const streaming = useSessions((s) => s.streaming);
-  const busy = useSessions((s) => s.busy);
-  const toolNote = useSessions((s) => s.toolNote);
-
-  const [text, setText] = useState("");
+  const runs = useSessions((s) => s.runs);
+  const run = currentId ? runs[currentId] : undefined;
+  const streaming = run?.streaming;
+  const busy = Boolean(run);
+  const toolNote = run?.toolNote;
+  const backgroundCount = Object.keys(runs).filter((id) => id !== currentId).length;
   const [showSessions, setShowSessions] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
 
-  // 待发送附件放在 store 里，这样窗口级拖拽/粘贴导入也能直达对话输入框
-  const atts = useSessions((s) => s.draftAtts);
-  const setAtts = (updater: (prev: ChatAttachment[]) => ChatAttachment[]) =>
-    useSessions.setState((s) => ({ draftAtts: updater(s.draftAtts) }));
-
   const session = useMemo(
     () => sessions.find((s) => s.id === currentId) ?? null,
     [sessions, currentId],
   );
+  const text = session?.draftText ?? "";
+  const atts = session?.draftAtts ?? [];
+  const setText = (value: string) => useSessions.getState().setDraftText(value);
 
   // 新消息 / 流式增量时贴底
   useEffect(() => {
@@ -60,19 +60,19 @@ export function ChatView() {
     const value = text.trim();
     if (!value && atts.length === 0) return;
     if (busy) return;
-    setText("");
     void useSessions.getState().send(value, atts);
   };
 
   const onPickFiles = async (files: FileList | null) => {
     if (!files?.length) return;
+    const targetSession = currentId;
     try {
       const next: ChatAttachment[] = [];
-      for (const f of Array.from(files).slice(0, 6)) {
+      for (const f of Array.from(files)) {
         if (!f.type.startsWith("image/")) continue;
         next.push(await fileToAttachment(f));
       }
-      setAtts((prev) => [...prev, ...next]);
+      if (targetSession) useSessions.getState().addDraftAtts(next, targetSession);
     } catch (err) {
       useToast.getState().push("error", (err as Error).message);
     }
@@ -98,6 +98,7 @@ export function ChatView() {
         >
           🗂 {showSessions ? "收起" : `历史 (${sessions.length})`}
         </button>
+        {backgroundCount > 0 && <span className="chip accent">后台 {backgroundCount} 个任务</span>}
         <div style={{ flex: 1 }} />
         {cfg && (
           <span className="chip" title="当前对话模型">
@@ -132,6 +133,7 @@ export function ChatView() {
               }}
             >
               <span className="t">{s.title || "新对话"}</span>
+              {runs[s.id] && <Spinner />}
               {sessions.length > 1 && (
                 <span
                   role="button"
@@ -221,12 +223,18 @@ export function ChatView() {
           <div className="composer-box">
             {atts.length > 0 && (
               <div className="pending-att">
-                {atts.map((a) => (
+                {atts.map((a, index) => (
                   <div className="item" key={a.id}>
-                    <img src={a.dataUrl} alt={a.name ?? ""} />
+                    <img src={a.dataUrl} alt={a.name ?? ""} onClick={() => showImage({ dataUrl: a.dataUrl, title: a.name })} />
+                    <span className="ref-number" title={a.name}>素材 {index + 1}</span>
+                    <div className="ref-order">
+                      <button type="button" disabled={index === 0} title="前移素材" onClick={() => useSessions.getState().moveDraftAtt(a.id, -1)}>←</button>
+                      <button type="button" disabled={index === atts.length - 1} title="后移素材" onClick={() => useSessions.getState().moveDraftAtt(a.id, 1)}>→</button>
+                    </div>
                     <button
                       type="button"
-                      onClick={() => setAtts((prev) => prev.filter((x) => x.id !== a.id))}
+                      title="移除素材"
+                      onClick={() => useSessions.getState().removeDraftAtt(a.id)}
                     >
                       ✕
                     </button>
@@ -256,6 +264,7 @@ export function ChatView() {
                 }
               }}
               onKeyDown={(e) => {
+                if (e.nativeEvent.isComposing) return;
                 const sendOnEnter = cfg?.ui.sendOnEnter ?? true;
                 if (e.key === "Enter" && !e.shiftKey && sendOnEnter) {
                   e.preventDefault();
@@ -364,13 +373,13 @@ function MessageRow({ message, live }: { message: ChatMessage; live?: boolean })
         <div className="bubble-body">
           {message.attachments && message.attachments.length > 0 && (
             <div className="att-grid">
-              {message.attachments.map((a) => (
-                <img
+              {message.attachments.map((a, index) => (
+                <div key={a.id} className="att-labeled"><span className="chip">素材 {index + 1} · {a.name ?? "图片"}</span><img
                   key={a.id}
                   src={a.dataUrl}
                   alt={a.name ?? ""}
                   onClick={() => showImage({ dataUrl: a.dataUrl, title: a.name })}
-                />
+                /></div>
               ))}
             </div>
           )}
@@ -429,6 +438,7 @@ function GeneratedImages({ images }: { images: GeneratedRef[] }) {
             }
           />
           <div className="gen-actions">
+            <SaveImageButton image={{ dataUrl: img.dataUrl, path: img.path }} />
             <button
               type="button"
               className="btn sm ghost"

@@ -53,6 +53,8 @@ macro_rules! cfg_or_skip {
 
 fn chat_req(cfg: &Cfg, prompt: &str) -> ChatRequest {
     ChatRequest {
+        protocol: None,
+        stream: None,
         base_url: cfg.base.clone(),
         api_key: cfg.key.clone(),
         model: cfg.chat_model.clone(),
@@ -80,7 +82,10 @@ fn url_normalization() {
             "http://h:3000/v1/chat/completions",
             "http://h:3000/v1/chat/completions",
         ),
-        ("https://api.example.com", "https://api.example.com/v1/chat/completions"),
+        (
+            "https://api.example.com",
+            "https://api.example.com/v1/chat/completions",
+        ),
     ];
     for (input, expect) in cases {
         let got = ai::build_url(input, "/chat/completions").expect("应当解析成功");
@@ -111,7 +116,10 @@ YPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
     let url = format!("data:image/png;base64,{PNG_1PX}");
     let (mime, bytes) = ai::parse_data_url(&url).expect("应当解析成功");
     assert_eq!(mime, "image/png");
-    assert_eq!(&bytes[..8], &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+    assert_eq!(
+        &bytes[..8],
+        &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]
+    );
 
     // 带换行/空格的 base64 也要能解
     let messy = format!("data:image/jpeg;base64,{}\n", PNG_1PX);
@@ -125,7 +133,9 @@ YPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
 #[tokio::test]
 async fn list_models() {
     let cfg = cfg_or_skip!();
-    let models = ai::list_models(&cfg.base, &cfg.key).await.expect("拉取模型列表失败");
+    let models = ai::list_models(&cfg.base, &cfg.key)
+        .await
+        .expect("拉取模型列表失败");
     assert!(!models.is_empty(), "模型列表为空");
     println!("拿到 {} 个模型", models.len());
     for m in models.iter().take(50) {
@@ -145,8 +155,8 @@ async fn chat_once_roundtrip() {
 
 #[tokio::test]
 async fn chat_stream_roundtrip() {
-    use std::sync::{Arc, Mutex};
     use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
 
     let cfg = cfg_or_skip!();
 
@@ -212,7 +222,10 @@ async fn tool_calling_roundtrip() {
         }
     })];
 
-    let mut req = chat_req(&cfg, "帮我画一只在阳光下打盹的橘猫，请调用 generate_image 工具");
+    let mut req = chat_req(
+        &cfg,
+        "帮我画一只在阳光下打盹的橘猫，请调用 generate_image 工具",
+    );
     req.tools = Some(tools);
     req.max_tokens = Some(300);
 
@@ -229,8 +242,8 @@ async fn tool_calling_roundtrip() {
         println!("tool_call -> name={} args={}", c.name, c.arguments);
         assert_eq!(c.name, "generate_image");
         // 参数必须是完整可解析的 JSON：流式分片累积逻辑对不对，全看这里
-        let parsed: serde_json::Value =
-            serde_json::from_str(&c.arguments).expect("tool_call 参数不是合法 JSON，分片累积有 bug");
+        let parsed: serde_json::Value = serde_json::from_str(&c.arguments)
+            .expect("tool_call 参数不是合法 JSON，分片累积有 bug");
         assert!(
             parsed
                 .get("prompt")
@@ -282,6 +295,7 @@ async fn image_pipeline() {
     let cfg = cfg_or_skip!();
 
     let gen_req = ImageRequest {
+        image_labels: vec![],
         base_url: cfg.base.clone(),
         api_key: cfg.key.clone(),
         model: cfg.image_model.clone(),
@@ -312,6 +326,7 @@ async fn image_pipeline() {
     // 把生成的图作为参考图，走图生图
     let source = ai::to_data_url(&first.mime, &first.bytes);
     let edit_req = ImageRequest {
+        image_labels: vec![],
         base_url: cfg.base.clone(),
         api_key: cfg.key.clone(),
         model: cfg.image_model.clone(),
@@ -350,6 +365,7 @@ async fn image_pipeline() {
     let mask_data_url = ai::to_data_url("image/png", &mask_png);
 
     let masked_req = ImageRequest {
+        image_labels: vec![],
         base_url: cfg.base.clone(),
         api_key: cfg.key.clone(),
         model: cfg.image_model.clone(),
@@ -366,7 +382,9 @@ async fn image_pipeline() {
         timeout_secs: Some(600),
     };
 
-    let masked = ai::run_image_request(&masked_req).await.expect("蒙版局部重绘失败");
+    let masked = ai::run_image_request(&masked_req)
+        .await
+        .expect("蒙版局部重绘失败");
     assert_eq!(masked.len(), 1);
     println!("蒙版重绘 OK：{} bytes", masked[0].bytes.len());
     assert!(masked[0].bytes.len() > 1024);
@@ -388,7 +406,6 @@ fn png_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
     out.extend_from_slice(&hasher.finalize().to_be_bytes());
 }
 
-/// 生成 w×h 的 8bit RGBA PNG，`alpha(x, y)` 给出每个像素的 alpha 值。
 fn make_png<F: Fn(u32, u32) -> u8>(w: u32, h: u32, alpha: F) -> Vec<u8> {
     use std::io::Write;
 

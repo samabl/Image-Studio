@@ -360,6 +360,16 @@ select.input {
   flex-wrap: wrap;
 }
 
+.model-picker details { margin-top: 8px; }
+.model-picker summary { cursor: pointer; color: var(--text-dim); font-size: 12px; padding: 6px 0; }
+.model-options { display: flex; flex-direction: column; gap: 4px; max-height: 220px; overflow-y: auto; margin-top: 8px; }
+.model-options button { justify-content: flex-start; overflow-wrap: anywhere; text-align: left; }
+.ref-number { position: absolute; left: 3px; bottom: 22px; padding: 2px 5px; border-radius: 4px; font-size: 10px; color: white; background: #000b; pointer-events: none; }
+.ref-order { position: absolute; bottom: 1px; left: 2px; right: 2px; display: flex; gap: 3px; }
+.ref-order button, .pending-att .item .ref-order button { position: static; width: auto; height: 19px; flex: 1; border-radius: 3px; background: #000b; color: white; border: 0; cursor: pointer; font-size: 11px; }
+.ref-order button:disabled { opacity: .3; cursor: default; }
+.att-labeled { display: flex; flex-direction: column; gap: 4px; }
+
 .card {
   background: var(--surface);
   border: 1px solid var(--border-soft);

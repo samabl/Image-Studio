@@ -1,8 +1,7 @@
 import { create } from "zustand";
 import { useToast } from "../lib/store";
 import { copyText, revealPath } from "../lib/shell";
-import { galleryExport } from "../lib/api";
-import { save } from "@tauri-apps/plugin-dialog";
+import { SaveImageButton } from "./SaveImageButton";
 import { isDesktop } from "../lib/platform";
 import { FileImage } from "./ui";
 import type { GalleryItem } from "../types";
@@ -54,15 +53,16 @@ export function Lightbox() {
   if (!image) return null;
 
   const item = image.item ?? null;
-  const src = image.dataUrl ?? image.path ?? "";
-  const fileName = item?.fileName ?? (image.path ? image.path.split(/[\\/]/).pop() : "") ?? "";
+  const src = image.dataUrl || image.path || item?.dataUrl || item?.path || "";
 
   return (
     <div className="lightbox" onClick={hide}>
       <button type="button" className="btn icon lightbox-close" onClick={hide} title="关闭">
         ✕
       </button>
-      <img src={src} alt={image.title ?? ""} onClick={(e) => e.stopPropagation()} />
+      <div onClick={(e) => e.stopPropagation()}>
+        <FileImage dataUrl={image.dataUrl || item?.dataUrl} path={image.path ?? item?.path} alt={image.title ?? ""} />
+      </div>
       <div className="lightbox-bar" onClick={(e) => e.stopPropagation()}>
         {image.title && <span className="chip">{image.title}</span>}
         {item && (
@@ -81,29 +81,9 @@ export function Lightbox() {
         >
           {src.startsWith("data:") ? "复制 DataURL" : "复制路径"}
         </button>
+        <SaveImageButton image={image} />
         {isDesktop && item && (
           <>
-            <button
-              type="button"
-              className="btn sm"
-              onClick={() => {
-                void (async () => {
-                  try {
-                    const picked = await save({
-                      defaultPath: fileName,
-                      filters: [{ name: "图片", extensions: ["png", "jpg", "jpeg", "webp"] }],
-                    });
-                    if (!picked) return;
-                    const saved = await galleryExport(item.id, picked);
-                    useToast.getState().push("success", `已导出到 ${saved}`);
-                  } catch (err) {
-                    useToast.getState().push("error", (err as Error).message);
-                  }
-                })();
-              }}
-            >
-              导出到…
-            </button>
             <button
               type="button"
               className="btn sm"

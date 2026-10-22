@@ -1,6 +1,7 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import type {
   AppConfig,
+  ChatProtocol,
   ChatEvent,
   ChatRequest,
   GalleryItem,
@@ -31,8 +32,8 @@ export const saveState = (key: string, value: string) => call<void>("save_state"
 
 // --- 模型 -----------------------------------------------------------------
 
-export const listModels = (baseUrl: string, apiKey: string) =>
-  call<string[]>("list_models", { baseUrl, apiKey });
+export const listModels = (baseUrl: string, apiKey: string, protocol: ChatProtocol = "openai") =>
+  call<string[]>("list_models", { baseUrl, apiKey, protocol });
 
 // --- 对话 -----------------------------------------------------------------
 
@@ -60,10 +61,42 @@ export function chatStream(
 
 export const chatOnce = (request: ChatRequest) => call<string>("chat_once", { request });
 
+export function cancellableText(request: ChatRequest) {
+  let cancel = () => {};
+  const promise = new Promise<string>((resolve, reject) => {
+    let text = "";
+    let settled = false;
+    const finish = (error?: string) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error || !text.trim()) reject(new Error(error || "模型返回了空内容"));
+      else resolve(text.trim());
+    };
+    const timer = setTimeout(() => { task.cancel(); finish("等待响应超时"); }, ((request.timeoutSecs ?? 300) + 60) * 1000);
+    const task = chatStream({ ...request, stream: false }, (event) => {
+      if (settled) return;
+      if (event.type === "delta") text += event.text;
+      else if (event.type === "error") finish(event.message);
+      else if (event.type === "done") finish();
+    });
+    cancel = () => { task.cancel(); finish("已停止"); };
+  });
+  return { promise, cancel: () => cancel() };
+}
+
 // --- 图像 -----------------------------------------------------------------
 
-export const generateImage = (request: ImageRequest, parentId?: string | null) =>
-  call<GalleryItem[]>("generate_image", { request, parentId: parentId ?? null });
+export const generateImage = (request: ImageRequest, parentId?: string | null, requestId?: string) =>
+  call<GalleryItem[]>("generate_image", { request, parentId: parentId ?? null, requestId: requestId ?? null });
+
+export function cancellableImage(request: ImageRequest, parentId?: string | null) {
+  const requestId = `image_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  return {
+    promise: generateImage(request, parentId, requestId),
+    cancel: () => { void call<void>("chat_cancel", { streamId: requestId }).catch(() => undefined); },
+  };
+}
 
 export const saveDataUrl = (dataUrl: string, meta: SaveMeta) =>
   call<GalleryItem[]>("save_data_url", { dataUrl, meta });

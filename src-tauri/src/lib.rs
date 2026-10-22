@@ -3,6 +3,7 @@ pub mod ai;
 pub mod config;
 pub mod error;
 pub mod gallery;
+pub mod native;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,7 +19,41 @@ use gallery::{GalleryItem, GalleryLock, SaveMeta};
 
 /// 流式对话的取消标志表，key 为前端生成的 streamId。
 #[derive(Default)]
-pub struct Streams(pub Mutex<HashMap<String, Arc<AtomicBool>>>);
+pub struct Streams(Mutex<HashMap<String, RequestEntry>>);
+
+struct RequestEntry {
+    flag: Arc<AtomicBool>,
+    registered: bool,
+    created_at: std::time::Instant,
+}
+
+impl Streams {
+    fn register(&self, id: &str) -> Arc<AtomicBool> {
+        let mut requests = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        requests.retain(|_, entry| entry.registered || entry.created_at.elapsed().as_secs() < 60);
+        let entry = requests.entry(id.into()).or_insert_with(|| RequestEntry {
+            flag: Arc::new(AtomicBool::new(false)),
+            registered: false,
+            created_at: std::time::Instant::now(),
+        });
+        entry.registered = true;
+        entry.flag.clone()
+    }
+
+    fn cancel(&self, id: &str) {
+        let mut requests = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = requests.entry(id.into()).or_insert_with(|| RequestEntry {
+            flag: Arc::new(AtomicBool::new(false)),
+            registered: false,
+            created_at: std::time::Instant::now(),
+        });
+        entry.flag.store(true, Ordering::Relaxed);
+    }
+
+    fn finish(&self, id: &str) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // 配置
@@ -80,7 +115,9 @@ fn state_path(app: &AppHandle, key: &str) -> AppResult<std::path::PathBuf> {
     if safe.is_empty() {
         return Err(error::AppError::other("非法的状态键名"));
     }
-    Ok(config::app_root(app)?.join("state").join(format!("{safe}.json")))
+    Ok(config::app_root(app)?
+        .join("state")
+        .join(format!("{safe}.json")))
 }
 
 // ---------------------------------------------------------------------------
@@ -89,8 +126,12 @@ fn state_path(app: &AppHandle, key: &str) -> AppResult<std::path::PathBuf> {
 
 /// 拉取 `/v1/models`。传入的 baseUrl/apiKey 允许是「还没保存」的临时值，方便配置页先测后存。
 #[tauri::command]
-async fn list_models(base_url: String, api_key: String) -> AppResult<Vec<String>> {
-    ai::list_models(&base_url, &api_key).await
+async fn list_models(
+    base_url: String,
+    api_key: String,
+    protocol: Option<String>,
+) -> AppResult<Vec<String>> {
+    native::list_models(&base_url, &api_key, protocol.as_deref().unwrap_or("openai")).await
 }
 
 // ---------------------------------------------------------------------------
@@ -104,20 +145,11 @@ async fn chat_stream(
     request: ChatRequest,
     on_event: Channel<ChatEvent>,
 ) -> AppResult<()> {
-    let flag = Arc::new(AtomicBool::new(false));
-    streams
-        .0
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(stream_id.clone(), flag.clone());
+    let flag = streams.register(&stream_id);
 
     let result = ai::chat_stream(request, on_event, flag).await;
 
-    streams
-        .0
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&stream_id);
+    streams.finish(&stream_id);
 
     result
 }
@@ -125,14 +157,7 @@ async fn chat_stream(
 /// 主动中断某个流式回答。Rust 侧下一轮循环就会退出，及时止住 token 消耗。
 #[tauri::command]
 fn chat_cancel(streams: State<'_, Streams>, stream_id: String) {
-    if let Some(flag) = streams
-        .0
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&stream_id)
-    {
-        flag.store(true, Ordering::Relaxed);
-    }
+    streams.cancel(&stream_id);
 }
 
 /// 非流式对话：用于提示词优化、图像反推等内部调用。
@@ -151,6 +176,8 @@ async fn generate_image(
     lock: State<'_, GalleryLock>,
     request: ImageRequest,
     parent_id: Option<String>,
+    request_id: Option<String>,
+    streams: State<'_, Streams>,
 ) -> AppResult<Vec<GalleryItem>> {
     let kind = if request.images.is_empty() {
         "generate"
@@ -172,8 +199,44 @@ async fn generate_image(
         parent_id,
     };
 
-    let images = ai::run_image_request(&request).await?;
+    let flag = request_id
+        .as_ref()
+        .map(|id| streams.register(id))
+        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+    let result = tokio::select! {
+        result = ai::run_image_request(&request) => result,
+        _ = native::wait_cancel(flag) => Err(error::AppError::other("已停止图像请求")),
+    };
+    if let Some(id) = &request_id {
+        streams.finish(id);
+    }
+    let images = result?;
     gallery::save_images(&app, &lock, &meta, images)
+}
+
+#[cfg(test)]
+mod request_tests {
+    use super::*;
+
+    #[test]
+    fn cancel_before_registration_is_retained() {
+        let requests = Streams::default();
+        requests.cancel("first");
+        assert!(requests.register("first").load(Ordering::Relaxed));
+        assert!(!requests.register("second").load(Ordering::Relaxed));
+        requests.finish("first");
+        assert!(!requests.register("first").load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn cancellation_is_scoped_to_each_request() {
+        let requests = Streams::default();
+        let first = requests.register("first");
+        let second = requests.register("second");
+        requests.cancel("first");
+        assert!(first.load(Ordering::Relaxed));
+        assert!(!second.load(Ordering::Relaxed));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -247,6 +310,7 @@ fn import_image_file(path: String) -> AppResult<String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init());
 

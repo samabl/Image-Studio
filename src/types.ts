@@ -2,7 +2,10 @@
 // 与 Rust 侧一一对应的类型定义（Rust 结构体统一 serde(rename_all="camelCase")）
 // ---------------------------------------------------------------------------
 
+export type ChatProtocol = "openai" | "anthropic" | "gemini";
+
 export interface ChatConfig {
+  protocol: ChatProtocol;
   baseUrl: string;
   apiKey: string;
   model: string;
@@ -15,13 +18,13 @@ export interface ChatConfig {
   models: string[];
 }
 
-export type ImageApiMode = "images" | "chat";
+export type ImageApiMode = "images" | "chat" | "gemini";
 
 export interface ImageConfig {
   baseUrl: string;
   apiKey: string;
   model: string;
-  /** images = /images/generations 与 /images/edits；chat = /chat/completions + modalities */
+  /** images = 图像接口；chat = 兼容对话出图；gemini = 原生 GenerateContent */
   apiMode: ImageApiMode;
   size: string;
   quality: string;
@@ -86,6 +89,7 @@ export interface ToolCall {
   id: string;
   name: string;
   arguments: string;
+  providerData?: Record<string, unknown>;
 }
 
 export interface ChatAttachment {
@@ -130,6 +134,8 @@ export interface ChatSession {
   messages: ChatMessage[];
   createdAt: number;
   updatedAt: number;
+  draftText?: string;
+  draftAtts?: ChatAttachment[];
 }
 
 // ---------------------------------------------------------------------------
@@ -155,6 +161,7 @@ export interface ImageRequest {
   apiMode?: ImageApiMode;
   prompt: string;
   images?: string[];
+  imageLabels?: string[];
   mask?: string | null;
   n?: number;
   size?: string;
@@ -166,6 +173,8 @@ export interface ImageRequest {
 }
 
 export interface ChatRequest {
+  protocol?: ChatProtocol;
+  stream?: boolean;
   baseUrl: string;
   apiKey: string;
   model: string;

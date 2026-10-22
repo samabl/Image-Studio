@@ -1,7 +1,7 @@
 # GPT Image Studio
 
 一个用 **Tauri 2** 构建的跨平台（Windows / Android）AI 图像工作台：**AI 对话 + 文生图 + 图生图 + 图像编辑**，
-通过可配置的 **Base URL + API Key** 调用任意 OpenAI 兼容网关，**对话模型与图像模型分别配置、并且可以互相联动**。
+通过可配置的 **协议 + Base URL + API Key** 调用 OpenAI 兼容接口、Anthropic Messages 与 Gemini 原生接口，**对话模型与图像模型分别配置、并且可以互相联动**。
 
 ---
 
@@ -25,13 +25,15 @@
 
 | 能力 | 说明 |
 | --- | --- |
-| 💬 **AI 对话** | 多轮会话、SSE 流式输出、思维链折叠显示、Markdown 渲染（代码块带复制）、随时中断、重新生成、多会话管理 |
-| 👁 **多模态输入** | 对话里可以贴图片，让模型看图（vision）；支持粘贴、拖拽、文件选择 |
+| 💬 **AI 对话** | 多轮会话、SSE 流式输出、独立草稿、多个会话并发、后台状态提示、按会话停止、重新生成 |
+| 👁 **多模态输入** | 支持粘贴、拖拽、文件选择；素材从 1 编号，可重排；对话工具可明确选择、组合和引用多张图片 |
+| 🔌 **多家协议** | 对话：OpenAI Chat Completions / Anthropic Messages / Gemini GenerateContent；出图：OpenAI Images / 兼容 Chat / Gemini 原生 |
 | 🎨 **文生图** | `/images/generations`，尺寸 / 数量 / 质量 / 背景 / 输出格式可调 |
 | 🖼 **图生图** | 上传参考图 + 提示词，走 `/images/edits`，支持多图组合 |
 | ✏️ **图像编辑** | 内置**蒙版画笔**，涂抹要改的区域做局部重绘（inpainting），支持撤销 |
 | 🔗 **模型联动** | 对话模型可**直接调用图像模型**（function calling）；也能优化提示词、反推图片提示词 |
 | 🖼 **图库** | 所有产出自动落盘归档，带提示词/模型/尺寸元信息，支持筛选、批量删除、导出 |
+| ⤓ **保存图像** | 对话、工作室、图库与放大预览统一保存原图；桌面系统保存对话框、Android 系统文档保存 |
 | ⚙️ **双通道独立配置** | 对话与图像可以有完全不同的 Base URL / Key / 模型 |
 | 📱 **跨平台** | 同一套代码出 Windows 安装包与 Android APK |
 
@@ -153,7 +155,13 @@ Base URL 正规化、SSE 流式对话、`tool_calls` 分片累积、文生图、
 | --- | --- | --- |
 | 用途 | 聊天、看图、优化提示词、反推提示词、驱动出图 | 文生图 / 图生图 / 局部重绘 |
 | 关键字段 | `baseUrl` `apiKey` `model` `systemPrompt` `temperature` `maxTokens` `timeoutSecs` | `baseUrl` `apiKey` `model` `apiMode` `size` `n` `timeoutSecs` |
-| 拉取模型 | 「↻ 拉取模型列表」会请求 `/v1/models` 并缓存到本地 | 同左 |
+| 拉取模型 | 按协议拉取模型并缓存；独立搜索框列出全部模型，不按当前模型名称过滤 | 同左 |
+
+对话通道的 `protocol` 默认为 `openai`，旧配置自动兼容。原生 Anthropic 使用 `x-api-key` 与 `/v1/messages`；原生 Gemini 使用 `x-goog-api-key` 与 `generateContent` / `streamGenerateContent`。Gemini 可填 `https://generativelanguage.googleapis.com/v1beta` 或对应原生网关地址。
+
+多图操作中，展示顺序、发送顺序和「素材 1、素材 2」标签一致。对话的 `edit_image` 工具可通过 `source_image_ids` 明确指定图片和顺序，未指定时使用最近一组全部图片；第一张是编辑基底，蒙版只作用于第一张。重排或移除编辑基底会清除旧蒙版。
+
+提示词优化会读取全部素材，并要求保留文字、数量、构图和禁止项；自动优化时同时保留原始要求。对话工具的实际输出会回传给模型检查。每个会话拥有独立的草稿、流式状态和取消函数，切换会话不会停止后台任务。
 
 **超时设置很重要**：`gpt-image-2.5` 出图单张可能超过 2 分钟，图像通道默认给到 600 秒。
 如果网关前面还有反向代理 / 内网穿透，**代理那一侧的空闲超时必须比这里更宽松**，
@@ -243,6 +251,7 @@ cargo test --manifest-path src-tauri/Cargo.toml --test live_gateway list_models 
 | --- | --- | --- |
 | `images`（默认） | `POST /v1/images/generations`（文生图）<br>`POST /v1/images/edits`（图生图 / 蒙版，multipart） | `gpt-image-2`、`gpt-image-2.5` 等 |
 | `chat` | `POST /v1/chat/completions` + `modalities: ["image","text"]` | Gemini 系图像模型等 |
+| `gemini` | `POST /v1beta/models/{model}:generateContent` + `inlineData` / `responseModalities` | Gemini 原生图像接口，支持多素材与多次出图 |
 
 响应解析同时兼容三种返回形态，无需手动切换：
 
@@ -262,7 +271,7 @@ cargo test --manifest-path src-tauri/Cargo.toml --test live_gateway list_models 
 pnpm tauri:build
 ```
 
-- 安装包（NSIS）：`src-tauri/target/release/bundle/nsis/GPT Image Studio_0.1.0_x64-setup.exe`
+- 安装包（NSIS）：`src-tauri/target/release/bundle/nsis/GPT Image Studio_0.2.0_x64-setup.exe`
 - 免安装可执行文件：`src-tauri/target/release/gpt-image-studio.exe`（前端已内嵌，双击即用）
 - 安装模式为 `currentUser`（免管理员），语言含简体中文
 - 若目标机器缺少 WebView2，安装包会走 `downloadBootstrapper` 自动下载
@@ -380,7 +389,7 @@ Windows 与 Android 并行产出可下载的构建产物。
 | `windows` | `windows-latest` | `gpt-image-studio.exe` + NSIS 安装包 | 先跑 `pnpm typecheck` 再 `pnpm tauri:build` |
 | `android` | `ubuntu-latest` × 3 | 每个 ABI 一个 APK | 矩阵并行：`arm64-v8a` / `armeabi-v7a` / `x86_64` |
 
-产物在 Actions 运行页面的 **Artifacts** 区域下载，保留 14 天。
+产物在 Actions 运行页面的 **Artifacts** 区域下载，保留 14 天。推送 `v*` 版本 tag 时，全部平台构建及回归测试通过后会自动发布 GitHub Release，包含 Windows 免安装 EXE、安装包、三个 ABI 的已签名 APK 和 `SHA256SUMS`。版本需与配置一致，并提供 `release-notes/<tag>.md`。
 
 ### 缓存策略
 
@@ -524,9 +533,11 @@ Android 侧已按 Tauri 2 规范完成全部工程级配置（`tauri.conf.json` 
 
 ## 已知限制
 
-- **Android 端不支持「导出到…」**：系统保存对话框在移动端行为不一致，图片目前保存在应用私有目录内。
-  后续可通过 MediaStore 或系统分享面板补齐。
+- **Android 保存尚未真机验证**：已接入系统文档保存对话框和 `content://` 写入；图片仍会自动归档到应用私有图库。
 - **对话历史的图片**：以 data URL 形式存在 `sessions.json` 里，长期大量贴图会让该文件变大。
   生成的图片会同时归档到图库（存的是文件路径），可以随时清理历史会话。
 - **`apiMode = chat` 不支持 `n > 1`**：该形态由对话模型决定出图数量。
 - 多图组合（一次传多张参考图）依赖网关支持 `image[]` 字段，部分网关只接受单张。
+- 原生 Gemini 和兼容 Chat 出图不支持蒙版参数，局部重绘请使用 `images` 协议。Gemini 的数量参数通过多次请求实现；兼容 Chat 的数量由模型决定。
+
+本次功能的离线回归：`pnpm test:frontend` 与 `cargo test --manifest-path src-tauri/Cargo.toml --test protocols`。原生协议联调使用 `tests/native_gateway.rs`，分别设置 `GIS_TEST_NATIVE=1` 或 `GIS_TEST_MULTI_IMAGE=1` 后运行；多图出图可通过 `GIS_TEST_IMAGE_MODE=images|gemini` 选择。项目内的 `test api.md` 已加入 Git 忽略列表。

@@ -3,6 +3,7 @@ import { Empty, Seg } from "./ui";
 import { GalleryThumb, showImage } from "./Overlays";
 import { useConfig, useGallery, useSessions, useStudio, useToast, reversePromptText } from "../lib/store";
 import { readImageDataUrl } from "../lib/api";
+import { SaveImageButton } from "./SaveImageButton";
 import type { GalleryItem, GalleryKind } from "../types";
 
 type Filter = "all" | GalleryKind;
@@ -106,7 +107,8 @@ export function GalleryView() {
                   <span className="chip">{item.size}</span>
                   {item.parentId && <span className="chip accent">派生</span>}
                 </div>
-                <div className="gal-info" style={{ paddingTop: 0, gap: 4 }}>
+                <div className="gal-info" style={{ paddingTop: 0, gap: 4 }} onClick={(e) => e.stopPropagation()}>
+                  <SaveImageButton image={{ item, path: item.path, dataUrl: item.dataUrl }} />
                   <button
                     type="button"
                     className="btn sm ghost"

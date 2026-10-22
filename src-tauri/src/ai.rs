@@ -33,13 +33,24 @@ pub fn build_url(base: &str, path: &str) -> AppResult<String> {
     if b.ends_with(path) {
         return Ok(b.to_string());
     }
+    for endpoint in [
+        "/chat/completions",
+        "/images/generations",
+        "/images/edits",
+        "/messages",
+        "/models",
+    ] {
+        if let Some(root) = b.strip_suffix(endpoint) {
+            return build_url(root, path);
+        }
+    }
     if b.ends_with("/v1") {
         return Ok(format!("{b}{path}"));
     }
     Ok(format!("{b}/v1{path}"))
 }
 
-fn client(timeout_secs: u64) -> AppResult<reqwest::Client> {
+pub(crate) fn client(timeout_secs: u64) -> AppResult<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(20))
         .timeout(Duration::from_secs(timeout_secs.clamp(10, 3600)))
@@ -87,8 +98,29 @@ fn ext_for_mime(mime: &str) -> &'static str {
     match mime {
         "image/jpeg" | "image/jpg" => "jpg",
         "image/webp" => "webp",
+        "image/gif" => "gif",
         _ => "png",
     }
+}
+
+fn decode_image_base64(b64: &str, format: &Option<String>) -> AppResult<(String, Vec<u8>)> {
+    let (_, bytes) = parse_data_url(&format!("data:image/png;base64,{b64}"))?;
+    let mime = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        "image/png"
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        "image/jpeg"
+    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        "image/webp"
+    } else if bytes.starts_with(b"GIF8") {
+        "image/gif"
+    } else {
+        match format.as_deref() {
+            Some("jpeg" | "jpg") => "image/jpeg",
+            Some("webp") => "image/webp",
+            _ => "image/png",
+        }
+    };
+    Ok((mime.into(), bytes))
 }
 
 // ---------------------------------------------------------------------------
@@ -128,7 +160,7 @@ pub fn unsupported_param(text: &str) -> Option<String> {
 /// 部分网关把 `max_tokens` 换成了 `max_completion_tokens`。与其在设置页堆一堆
 /// 「是否发送某参数」的开关，不如让请求自己适配 —— 命中一次 400 就摘掉该字段重发，
 /// 对用户完全透明。
-async fn post_json(
+pub(crate) async fn post_json(
     client: &reqwest::Client,
     url: &str,
     api_key: &str,
@@ -163,10 +195,24 @@ async fn post_json(
                         obj.insert("max_completion_tokens".into(), v);
                         true
                     } else {
-                        obj.remove(&param).is_some()
+                        !matches!(
+                            param.as_str(),
+                            "model"
+                                | "messages"
+                                | "tools"
+                                | "tool_choice"
+                                | "prompt"
+                                | "image"
+                                | "images"
+                                | "mask"
+                                | "n"
+                        ) && obj.remove(&param).is_some()
                     };
                     if changed {
-                        eprintln!("网关不支持参数 `{param}`，已自动调整后重试（第 {} 次）", attempt + 1);
+                        eprintln!(
+                            "网关不支持参数 `{param}`，已自动调整后重试（第 {} 次）",
+                            attempt + 1
+                        );
                         continue;
                     }
                 }
@@ -238,6 +284,10 @@ pub async fn list_models(base_url: &str, api_key: &str) -> AppResult<Vec<String>
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatRequest {
+    #[serde(default)]
+    pub protocol: Option<String>,
+    #[serde(default)]
+    pub stream: Option<bool>,
     pub base_url: String,
     pub api_key: String,
     pub model: String,
@@ -264,6 +314,8 @@ pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_data: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -284,7 +336,7 @@ struct ToolCallAcc {
     arguments: String,
 }
 
-fn build_chat_body(req: &ChatRequest, stream: bool) -> Value {
+pub(crate) fn build_chat_body(req: &ChatRequest, stream: bool) -> Value {
     let mut body = Map::new();
     body.insert("model".into(), json!(req.model));
     body.insert("messages".into(), json!(req.messages));
@@ -330,12 +382,20 @@ pub async fn chat_stream(
     on_event: Channel<ChatEvent>,
     cancel: Arc<AtomicBool>,
 ) -> AppResult<()> {
+    let protocol = req.protocol.as_deref().unwrap_or("openai");
+    if protocol != "openai" || req.stream == Some(false) {
+        return crate::native::chat_stream(req, on_event, cancel).await;
+    }
     let url = build_url(&req.base_url, "/chat/completions")?;
     let idle = Duration::from_secs(req.timeout_secs.unwrap_or(300).clamp(30, 1800));
     let mut body = build_chat_body(&req, true);
     let client = stream_client()?;
 
-    let resp = match post_json(&client, &url, &req.api_key, &mut body, true).await {
+    let response = tokio::select! {
+        result = post_json(&client, &url, &req.api_key, &mut body, true) => result,
+        _ = crate::native::wait_cancel(cancel.clone()) => return Ok(()),
+    };
+    let resp = match response {
         Ok(r) => r,
         Err(err) => {
             let _ = on_event.send(ChatEvent::Error {
@@ -344,6 +404,40 @@ pub async fn chat_stream(
             return Ok(());
         }
     };
+
+    // 部分兼容网关忽略 stream=true，直接返回完整 JSON，保留文本及工具调用。
+    if !resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|value| value.contains("text/event-stream"))
+    {
+        let value = tokio::select! {
+            value = resp.json::<Value>() => value?,
+            _ = crate::native::wait_cancel(cancel.clone()) => return Ok(()),
+        };
+        let reply = crate::native::parse_reply(&value, "openai")?;
+        if !reply.content.is_empty() {
+            on_event.send(ChatEvent::Delta {
+                text: reply.content,
+            })?;
+        }
+        if !reply.reasoning.is_empty() {
+            on_event.send(ChatEvent::Reasoning {
+                text: reply.reasoning,
+            })?;
+        }
+        if !reply.calls.is_empty() {
+            on_event.send(ChatEvent::ToolCalls { calls: reply.calls })?;
+        }
+        if let Some(usage) = reply.usage {
+            on_event.send(ChatEvent::Usage { usage })?;
+        }
+        on_event.send(ChatEvent::Done {
+            finish_reason: Some("stop".into()),
+        })?;
+        return Ok(());
+    }
 
     // 通道断开（前端组件卸载）或用户点了「停止」时置位，循环顶部统一检查
     let mut closed = false;
@@ -356,7 +450,7 @@ pub async fn chat_stream(
     }
 
     let mut stream = resp.bytes_stream();
-    let mut buf = String::new();
+    let mut buf = Vec::<u8>::new();
     let mut tool_accs: Vec<ToolCallAcc> = Vec::new();
     let mut finish_reason: Option<String> = None;
     let mut usage: Option<Value> = None;
@@ -366,7 +460,10 @@ pub async fn chat_stream(
         if closed || cancel.load(Ordering::Relaxed) {
             break;
         }
-        let next = tokio::time::timeout(idle, stream.next()).await;
+        let next = tokio::select! {
+            next = tokio::time::timeout(idle, stream.next()) => next,
+            _ = crate::native::wait_cancel(cancel.clone()) => break,
+        };
         let chunk = match next {
             Err(_) => {
                 emit!(ChatEvent::Error {
@@ -384,10 +481,10 @@ pub async fn chat_stream(
             Ok(Some(Ok(c))) => c,
         };
 
-        buf.push_str(&String::from_utf8_lossy(&chunk));
+        buf.extend_from_slice(&chunk);
 
-        while let Some(pos) = buf.find('\n') {
-            let raw: String = buf.drain(..=pos).collect();
+        while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
+            let raw = String::from_utf8_lossy(&buf.drain(..=pos).collect::<Vec<_>>()).into_owned();
             let line = raw.trim_end_matches(['\n', '\r']).trim();
             if line.is_empty() || line.starts_with(':') || line.starts_with("event:") {
                 continue;
@@ -491,6 +588,7 @@ pub async fn chat_stream(
             .into_iter()
             .filter(|a| !a.name.is_empty())
             .map(|a| ToolCall {
+                provider_data: None,
                 id: if a.id.is_empty() {
                     format!("call_{}", uuid::Uuid::new_v4().simple())
                 } else {
@@ -524,6 +622,9 @@ pub async fn chat_stream(
 
 /// 非流式对话，返回纯文本。用于提示词优化 / 反推等内部工具调用。
 pub async fn chat_once(req: ChatRequest) -> AppResult<String> {
+    if req.protocol.as_deref().unwrap_or("openai") != "openai" {
+        return crate::native::chat_once(req).await;
+    }
     let url = build_url(&req.base_url, "/chat/completions")?;
     let client = client(req.timeout_secs.unwrap_or(180))?;
     let mut body = build_chat_body(&req, false);
@@ -573,6 +674,8 @@ pub struct ImageRequest {
     /// data URL 列表：文生图为空，图生图/编辑为参考图
     #[serde(default)]
     pub images: Vec<String>,
+    #[serde(default)]
+    pub image_labels: Vec<String>,
     /// data URL，蒙版（透明区域 = 待编辑区域）
     #[serde(default)]
     pub mask: Option<String>,
@@ -651,9 +754,7 @@ fn extract_urls_from_text(text: &str) -> Vec<String> {
     while let Some(idx) = rest.find("data:image/") {
         let tail = &rest[idx..];
         let end = tail
-            .find(|c: char| {
-                matches!(c, ')' | '"' | '\'' | ']' | '<' | '>') || c.is_whitespace()
-            })
+            .find(|c: char| matches!(c, ')' | '"' | '\'' | ']' | '<' | '>') || c.is_whitespace())
             .unwrap_or(tail.len());
         out.push(tail[..end].to_string());
         rest = &tail[end..];
@@ -684,7 +785,13 @@ async fn download(client: &reqwest::Client, url: &str, api_key: &str) -> AppResu
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(';').next().unwrap_or("image/png").trim().to_string())
+        .map(|s| {
+            s.split(';')
+                .next()
+                .unwrap_or("image/png")
+                .trim()
+                .to_string()
+        })
         .filter(|m| m.starts_with("image/"))
         .unwrap_or_else(|| "image/png".into());
     let bytes = resp.bytes().await?.to_vec();
@@ -699,7 +806,10 @@ async fn download(client: &reqwest::Client, url: &str, api_key: &str) -> AppResu
 }
 
 /// 走 `/images/generations`（文生图）。
-async fn generate_via_images(req: &ImageRequest, client: &reqwest::Client) -> AppResult<Vec<RawImage>> {
+async fn generate_via_images(
+    req: &ImageRequest,
+    client: &reqwest::Client,
+) -> AppResult<Vec<RawImage>> {
     let url = build_url(&req.base_url, "/images/generations")?;
 
     let mut body = Map::new();
@@ -748,7 +858,7 @@ async fn generate_via_images(req: &ImageRequest, client: &reqwest::Client) -> Ap
                 .and_then(Value::as_str)
                 .map(str::to_string);
             if let Some(b64) = item.get("b64_json").and_then(Value::as_str) {
-                let (mime, bytes) = parse_data_url(&format!("data:image/png;base64,{b64}"))
+                let (mime, bytes) = decode_image_base64(b64, &req.output_format)
                     .map_err(|e| AppError::other(format!("返回的图像无法解码：{e}")))?;
                 out.push(RawImage {
                     bytes,
@@ -774,11 +884,15 @@ async fn generate_via_images(req: &ImageRequest, client: &reqwest::Client) -> Ap
 }
 
 /// 走 `/chat/completions` + `modalities:["image","text"]`（Gemini 系图像模型）。
-async fn generate_via_chat(req: &ImageRequest, client: &reqwest::Client) -> AppResult<Vec<RawImage>> {
+async fn generate_via_chat(
+    req: &ImageRequest,
+    client: &reqwest::Client,
+) -> AppResult<Vec<RawImage>> {
     let url = build_url(&req.base_url, "/chat/completions")?;
 
     let mut content: Vec<Value> = vec![json!({ "type": "text", "text": req.prompt })];
-    for img in &req.images {
+    for (i, img) in req.images.iter().enumerate() {
+        content.push(json!({ "type": "text", "text": crate::native::image_label(req, i) }));
         content.push(json!({
             "type": "image_url",
             "image_url": { "url": img }
@@ -825,7 +939,8 @@ async fn generate_via_chat(req: &ImageRequest, client: &reqwest::Client) -> AppR
         }
     }
     urls.retain(|u| u.starts_with("data:image") || u.starts_with("http"));
-    urls.dedup();
+    let mut seen = std::collections::HashSet::new();
+    urls.retain(|url| seen.insert(url.clone()));
 
     let mut out = Vec::new();
     for u in urls {
@@ -857,7 +972,7 @@ async fn edit_via_images(req: &ImageRequest, client: &reqwest::Client) -> AppRes
 
     let mut form = reqwest::multipart::Form::new()
         .text("model", req.model.clone())
-        .text("prompt", req.prompt.clone())
+        .text("prompt", crate::native::ordered_image_prompt(req))
         .text("n", req.n.unwrap_or(1).clamp(1, 10).to_string());
 
     if let Some(s) = opt_str(&req.size) {
@@ -879,7 +994,7 @@ async fn edit_via_images(req: &ImageRequest, client: &reqwest::Client) -> AppRes
         let (mime, bytes) = parse_data_url(data_url)?;
         let ext = ext_for_mime(&mime);
         let part = reqwest::multipart::Part::bytes(bytes)
-            .file_name(format!("image_{i}.{ext}"))
+            .file_name(format!("image_{}.{ext}", i + 1))
             .mime_str(&mime)?;
         form = if multi {
             form.part("image[]", part)
@@ -923,7 +1038,7 @@ async fn edit_via_images(req: &ImageRequest, client: &reqwest::Client) -> AppRes
                 .and_then(Value::as_str)
                 .map(str::to_string);
             if let Some(b64) = item.get("b64_json").and_then(Value::as_str) {
-                let (mime, bytes) = parse_data_url(&format!("data:image/png;base64,{b64}"))?;
+                let (mime, bytes) = decode_image_base64(b64, &req.output_format)?;
                 out.push(RawImage {
                     ext: ext_for_mime(&mime).to_string(),
                     bytes,
@@ -951,6 +1066,15 @@ async fn edit_via_images(req: &ImageRequest, client: &reqwest::Client) -> AppRes
 pub async fn run_image_request(req: &ImageRequest) -> AppResult<Vec<RawImage>> {
     let client = client(req.timeout_secs.unwrap_or(600))?;
     let mode = req.api_mode.as_deref().unwrap_or("images");
+    if mode != "images" && req.mask.as_ref().is_some_and(|mask| !mask.is_empty()) {
+        return Err(AppError::config(
+            "当前图像协议不支持蒙版，请使用 images 协议进行局部重绘",
+        ));
+    }
+
+    if mode == "gemini" {
+        return crate::native::generate_images(req, &client).await;
+    }
 
     if mode == "chat" {
         return generate_via_chat(req, &client).await;

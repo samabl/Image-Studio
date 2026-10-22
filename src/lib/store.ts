@@ -1,11 +1,13 @@
 import { create } from "zustand";
 import * as api from "./api";
 import { renderMask, uid, type Stroke } from "./image";
+import { attachmentLabel, conversationMessages, imageToolInstructions, selectImageSources, userImageContent } from "./chat";
 import type {
   AppConfig,
   ChatAttachment,
   ChatConfig,
   ChatMessage,
+  ChatRequest,
   ChatSession,
   GalleryItem,
   ImageConfig,
@@ -224,12 +226,14 @@ interface StudioState {
   setPrompt: (prompt: string) => void;
   addRefs: (refs: ChatAttachment[]) => void;
   removeRef: (id: string) => void;
+  moveRef: (id: string, offset: number) => void;
   setRefs: (refs: ChatAttachment[]) => void;
   setStrokes: (strokes: Stroke[]) => void;
   setBrushSize: (size: number) => void;
   setMaskEnabled: (on: boolean) => void;
   patch: (patch: Partial<Pick<StudioState, "size" | "quality" | "background" | "outputFormat" | "n">>) => void;
   run: () => Promise<void>;
+  stop: () => void;
   optimize: (instruction?: string) => Promise<void>;
   reverse: (dataUrl?: string) => Promise<void>;
   /** 把任意一张图送到工作室作为参考图（图库 / 对话联动入口） */
@@ -250,6 +254,8 @@ function imageRequestBase() {
   };
 }
 
+let studioCancel: (() => void) | null = null;
+let studioStopped = false;
 export const useStudio = create<StudioState>((set, get) => ({
   mode: "generate",
   prompt: "",
@@ -271,13 +277,28 @@ export const useStudio = create<StudioState>((set, get) => ({
   setMode: (mode) => set({ mode }),
   setPrompt: (prompt) => set({ prompt }),
   addRefs: (refs) => set({ refs: [...get().refs, ...refs], mode: "edit" }),
-  removeRef: (id) => set({ refs: get().refs.filter((r) => r.id !== id) }),
-  setRefs: (refs) => set({ refs }),
+  removeRef: (id) => {
+    const state = get();
+    if (state.busy) return;
+    set({ refs: state.refs.filter((r) => r.id !== id), ...(state.refs[0]?.id === id ? { strokes: [], maskEnabled: false } : {}) });
+  },
+  moveRef: (id, offset) => {
+    const state = get();
+    if (state.busy) return;
+    const refs = [...state.refs];
+    const from = refs.findIndex((r) => r.id === id);
+    const to = from + offset;
+    if (from < 0 || to < 0 || to >= refs.length) return;
+    [refs[from], refs[to]] = [refs[to], refs[from]];
+    set({ refs, ...(from === 0 || to === 0 ? { strokes: [], maskEnabled: false } : {}) });
+  },
+  setRefs: (refs) => { if (!get().busy) set({ refs, strokes: [], maskEnabled: false }); },
   setStrokes: (strokes) => set({ strokes }),
   setBrushSize: (brushSize) => set({ brushSize }),
   setMaskEnabled: (maskEnabled) => set({ maskEnabled }),
   patch: (patch) => set(patch),
-  reset: () =>
+  reset: () => {
+    if (get().busy) return;
     set({
       mode: "generate",
       prompt: "",
@@ -288,9 +309,11 @@ export const useStudio = create<StudioState>((set, get) => ({
       parentId: null,
       error: null,
       note: "",
-    }),
+    });
+  },
 
   sendToStudio: (item, mode) => {
+    if (get().busy) { toast.info("工作室任务仍在执行，请停止或等待完成后再编辑"); return; }
     set({
       refs: [{ id: uid("att"), dataUrl: item.dataUrl, galleryId: item.galleryId }],
       strokes: [],
@@ -306,6 +329,7 @@ export const useStudio = create<StudioState>((set, get) => ({
 
   run: async () => {
     const state = get();
+    if (state.busy) return;
     const cfg = useConfig.getState().config;
     if (!cfg) return;
 
@@ -315,19 +339,22 @@ export const useStudio = create<StudioState>((set, get) => ({
       return;
     }
 
+    studioStopped = false;
     set({ busy: true, error: null, note: "正在提交请求…", results: [] });
     try {
       // 联动：出图前先用对话模型把提示词打磨一遍
       if (cfg.linkage.enabled && cfg.linkage.autoOptimizePrompt && channelReady("chat")) {
         set({ note: "正在用对话模型优化提示词…" });
         try {
-          prompt = await optimizePromptText(prompt);
+          prompt = await optimizePromptText(prompt, state.refs, (cancel) => { studioCancel = cancel; });
           set({ prompt });
         } catch (err) {
+          if (studioStopped) return;
           toast.info(`提示词优化失败，改用原文：${(err as Error).message}`);
         }
       }
 
+      if (studioStopped) return;
       const refs = state.refs.map((r) => r.dataUrl);
       let mask: string | null = null;
       if (state.maskEnabled && state.strokes.length > 0 && refs.length > 0) {
@@ -339,11 +366,13 @@ export const useStudio = create<StudioState>((set, get) => ({
         note: mask ? "正在按蒙版编辑图像…" : refs.length > 0 ? "正在生成变体…" : "正在生成图像…",
       });
 
-      const items = await api.generateImage(
+      if (studioStopped) return;
+      const request = api.cancellableImage(
         {
           ...imageRequestBase(),
-          prompt,
+          prompt: prompt !== state.prompt.trim() ? `${prompt}\n\n用户原始要求（必须保留）：\n${state.prompt.trim()}` : prompt,
           images: refs,
+          imageLabels: state.refs.map(attachmentLabel),
           mask,
           n: state.n,
           size: state.size === "auto" ? undefined : state.size,
@@ -353,20 +382,26 @@ export const useStudio = create<StudioState>((set, get) => ({
         },
         state.parentId,
       );
-
+      studioCancel = request.cancel;
+      const items = await request.promise;
       set({ results: items, note: "" });
       useGallery.getState().add(items);
       toast.success(`已生成 ${items.length} 张图片`);
     } catch (err) {
+      if (studioStopped) { set({ note: "已停止" }); return; }
       const message = (err as Error).message;
       set({ error: message, note: "" });
       toast.error(message);
     } finally {
+      studioCancel = null;
       set({ busy: false });
     }
   },
 
+  stop: () => { studioStopped = true; studioCancel?.(); set({ note: "正在停止…" }); },
+
   optimize: async (instruction) => {
+    if (get().busy) return;
     const current = get().prompt.trim();
     if (!current && !instruction) {
       toast.error("请先写下你的想法，再让 AI 润色");
@@ -377,23 +412,29 @@ export const useStudio = create<StudioState>((set, get) => ({
       toast.error("请先在「设置」里配置对话模型");
       return;
     }
+    studioStopped = false;
     set({ busy: true, note: "正在优化提示词…" });
     try {
       const text = await optimizePromptText(
         instruction ? `${instruction}\n\n原始描述：${current || "（无）"}` : current,
-        instruction ? undefined : get().refs[0]?.dataUrl,
+        get().refs,
+        (cancel) => { studioCancel = cancel; },
       );
+      if (studioStopped) return;
       set({ prompt: text, note: "" });
       toast.success("提示词已优化");
     } catch (err) {
+      if (studioStopped) return;
       toast.error((err as Error).message);
       set({ note: "" });
     } finally {
-      set({ busy: false });
+      studioCancel = null;
+      set({ busy: false, note: "" });
     }
   },
 
   reverse: async (dataUrl) => {
+    if (get().busy) return;
     const cfg = useConfig.getState().config;
     if (!cfg || !channelReady("chat")) {
       toast.error("请先在「设置」里配置对话模型");
@@ -404,16 +445,20 @@ export const useStudio = create<StudioState>((set, get) => ({
       toast.error("请先添加一张参考图");
       return;
     }
+    studioStopped = false;
     set({ busy: true, note: "正在反推提示词…" });
     try {
-      const text = await reversePromptText(source);
+      const text = await reversePromptText(source, (cancel) => { studioCancel = cancel; });
+      if (studioStopped) return;
       set({ prompt: text, note: "" });
       toast.success("已根据图片反推提示词");
     } catch (err) {
+      if (studioStopped) return;
       toast.error((err as Error).message);
       set({ note: "" });
     } finally {
-      set({ busy: false });
+      studioCancel = null;
+      set({ busy: false, note: "" });
     }
   },
 }));
@@ -427,6 +472,7 @@ function chatChannelConfig() {
   if (!cfg) throw new Error("配置尚未加载");
   const lk = cfg.linkage;
   return {
+    protocol: cfg.chat.protocol,
     baseUrl: cfg.chat.baseUrl,
     apiKey: cfg.chat.apiKey,
     model: lk.visionModel.trim() || cfg.chat.model,
@@ -435,29 +481,32 @@ function chatChannelConfig() {
 }
 
 /** 用对话模型把口语化描述扩写成专业生图提示词。 */
-export async function optimizePromptText(idea: string, imageDataUrl?: string): Promise<string> {
+export async function optimizePromptText(idea: string, refs: ChatAttachment[] = [], onCancel?: (cancel: () => void) => void): Promise<string> {
   const cfg = useConfig.getState().config;
   if (!cfg) throw new Error("配置尚未加载");
-  const content: unknown[] = [{ type: "text", text: idea }];
-  if (imageDataUrl) {
-    content.push({ type: "image_url", image_url: { url: imageDataUrl } });
-  }
-  return api.chatOnce({
+  const content = userImageContent(idea, refs.map((a, i) => ({ ...a, label: attachmentLabel(a, i) })));
+  const request: ChatRequest = {
     ...chatChannelConfig(),
     messages: [
-      { role: "system", content: cfg.linkage.optimizeSystemPrompt },
-      { role: "user", content: imageDataUrl ? content : idea },
+      { role: "system", content: `${cfg.linkage.optimizeSystemPrompt}\n必须保留原文中的文字、语言、数量、构图、素材编号与对应关系、保持不变的内容和禁止项。不要擅自增加元素或改变风格。编辑时只改指定内容，其他部分保持原样。` },
+      { role: "user", content: refs.length ? content : idea },
     ],
-    temperature: 0.8,
-    maxTokens: 1024,
-  });
+    temperature: 0.3,
+    maxTokens: 2048,
+  };
+  if (onCancel) {
+    const task = api.cancellableText(request);
+    onCancel(task.cancel);
+    return task.promise;
+  }
+  return api.chatOnce(request);
 }
 
 /** 看图说话：把画面反推成提示词。 */
-export async function reversePromptText(imageDataUrl: string): Promise<string> {
+export async function reversePromptText(imageDataUrl: string, onCancel?: (cancel: () => void) => void): Promise<string> {
   const cfg = useConfig.getState().config;
   if (!cfg) throw new Error("配置尚未加载");
-  return api.chatOnce({
+  const request: ChatRequest = {
     ...chatChannelConfig(),
     messages: [
       { role: "system", content: cfg.linkage.reverseSystemPrompt },
@@ -471,7 +520,13 @@ export async function reversePromptText(imageDataUrl: string): Promise<string> {
     ],
     temperature: 0.6,
     maxTokens: 1024,
-  });
+  };
+  if (onCancel) {
+    const task = api.cancellableText(request);
+    onCancel(task.cancel);
+    return task.promise;
+  }
+  return api.chatOnce(request);
 }
 
 // ---------------------------------------------------------------------------
@@ -487,17 +542,17 @@ export interface StreamingState {
   toolCalls: ToolCall[];
 }
 
+export interface SessionRun {
+  runId: string;
+  streaming: StreamingState | null;
+  toolNote: string;
+  cancel: (() => void) | null;
+}
+
 interface SessionState {
   sessions: ChatSession[];
   currentId: string | null;
-  streaming: StreamingState | null;
-  busy: boolean;
-  /** 正在执行的工具说明，显示在气泡下方 */
-  toolNote: string;
-  cancelRef: (() => void) | null;
-  /** 输入框里待发送的附件。放在 store 里，拖拽/粘贴导入才能直达对话。 */
-  draftAtts: ChatAttachment[];
-
+  runs: Record<string, SessionRun>;
   init: () => Promise<void>;
   persist: () => Promise<void>;
   newSession: () => void;
@@ -505,62 +560,24 @@ interface SessionState {
   deleteSession: (id: string) => void;
   renameSession: (id: string, title: string) => void;
   current: () => ChatSession | null;
-  addDraftAtts: (atts: ChatAttachment[]) => void;
+  setDraftText: (text: string, sessionId?: string) => void;
+  addDraftAtts: (atts: ChatAttachment[], sessionId?: string) => void;
   removeDraftAtt: (id: string) => void;
+  moveDraftAtt: (id: string, offset: number) => void;
   clearDraftAtts: () => void;
   send: (text: string, attachments: ChatAttachment[]) => Promise<void>;
-  stop: () => void;
+  stop: (sessionId?: string) => void;
   regenerate: () => Promise<void>;
 }
 
 function newSessionObj(): ChatSession {
   const now = Date.now();
-  return { id: uid("sess"), title: "新对话", messages: [], createdAt: now, updatedAt: now };
+  return { id: uid("sess"), title: "新对话", messages: [], createdAt: now, updatedAt: now, draftText: "", draftAtts: [] };
 }
 
-/** 内部：把一条消息转成 OpenAI 格式（可能拆成多条，如 assistant + tool）。 */
-function toApiMessages(m: ChatMessage): unknown[] {
-  if (m.role === "tool") {
-    return [{ role: "tool", tool_call_id: m.toolCallId, content: m.content || "已完成" }];
-  }
-  if (m.role === "assistant") {
-    const out: Record<string, unknown> = { role: "assistant", content: m.content || null };
-    if (m.toolCalls?.length) {
-      out.tool_calls = m.toolCalls.map((tc) => ({
-        id: tc.id,
-        type: "function",
-        function: { name: tc.name, arguments: tc.arguments },
-      }));
-    }
-    return [out];
-  }
-
-  // user
-  const atts = m.attachments ?? [];
-  if (atts.length === 0) return [{ role: "user", content: m.content }];
-  const parts: unknown[] = [];
-  if (m.content.trim()) parts.push({ type: "text", text: m.content });
-  for (const a of atts) {
-    parts.push({ type: "image_url", image_url: { url: a.dataUrl } });
-  }
-  return [{ role: "user", content: parts }];
-}
-
-/** 找到会话里最近一张可用作编辑源图的图片。 */
-function latestImage(messages: ChatMessage[]): { dataUrl: string; galleryId?: string } | null {
-  for (let i = messages.length - 1; i >= 0; i -= 1) {
-    const m = messages[i];
-    if (m.images?.length) {
-      const img = m.images[m.images.length - 1];
-      return { dataUrl: img.dataUrl ?? "", galleryId: img.galleryId };
-    }
-    if (m.attachments?.length) {
-      const a = m.attachments[m.attachments.length - 1];
-      return { dataUrl: a.dataUrl, galleryId: a.galleryId };
-    }
-  }
-  return null;
-}
+// 串行保存快照，避免并发会话较旧的快照覆盖较新的历史。
+let persistenceQueue: Promise<void> = Promise.resolve();
+let draftSaveTimer: ReturnType<typeof setTimeout> | null = null;
 
 /** 提供给对话模型的图像工具定义。 */
 export function imageTools(): unknown[] {
@@ -574,10 +591,14 @@ export function imageTools(): unknown[] {
         parameters: {
           type: "object",
           properties: {
+            source_image_ids: {
+              type: "array", items: { type: "string" },
+              description: "按输入顺序排列的图片 ID；编辑时第一张为编辑基底，其余为参考。使用消息中标记的图片 ID。",
+            },
             prompt: {
               type: "string",
               description:
-                "完整的图像提示词，包含主体、外观细节、环境、构图、光线与风格；英文效果通常更好。",
+                "忠实表达用户要求的完整提示词，保留指定文字、语言、数量与构图，禁止擅自改变要求。",
             },
             size: {
               type: "string",
@@ -595,10 +616,14 @@ export function imageTools(): unknown[] {
       function: {
         name: "edit_image",
         description:
-          "基于当前对话中最近的一张图片进行修改（改颜色、换风格、加/去元素等）。当用户说「把刚才那张图改成…」时调用。",
+          "修改、合成或组合一张或多张素材。用 source_image_ids 选择全部所需图片并指定输入顺序。未指定时使用最近一组图片。",
         parameters: {
           type: "object",
           properties: {
+            source_image_ids: {
+              type: "array", items: { type: "string" },
+              description: "按输入顺序排列的图片 ID；编辑时第一张为编辑基底，其余为参考。使用消息中标记的图片 ID。",
+            },
             prompt: {
               type: "string",
               description: "编辑指令，说明要如何改动原图，未被提及的部分应保持不变。",
@@ -611,394 +636,220 @@ export function imageTools(): unknown[] {
   ];
 }
 
-export const useSessions = create<SessionState>((set, get) => ({
-  sessions: [],
-  currentId: null,
-  streaming: null,
-  busy: false,
-  toolNote: "",
-  cancelRef: null,
-  draftAtts: [],
-
-  addDraftAtts: (atts) => set({ draftAtts: [...get().draftAtts, ...atts] }),
-  removeDraftAtt: (id) => set({ draftAtts: get().draftAtts.filter((a) => a.id !== id) }),
-  clearDraftAtts: () => set({ draftAtts: [] }),
-
-  init: async () => {
-    try {
-      const raw = await api.loadState("sessions");
-      if (raw) {
-        const parsed = JSON.parse(raw) as { sessions: ChatSession[]; currentId: string | null };
-        if (Array.isArray(parsed.sessions) && parsed.sessions.length > 0) {
-          set({
-            sessions: parsed.sessions,
-            currentId: parsed.currentId ?? parsed.sessions[0].id,
-          });
-          return;
+export const useSessions = create<SessionState>((set, get) => {
+  const draft = (patch: Partial<ChatSession>, sessionId = get().currentId) => {
+    set((state) => ({ sessions: state.sessions.map((s) => s.id === sessionId ? { ...s, ...patch } : s) }));
+    if (draftSaveTimer) clearTimeout(draftSaveTimer);
+    draftSaveTimer = setTimeout(() => { draftSaveTimer = null; void get().persist(); }, 500);
+  };
+  return {
+    sessions: [], currentId: null, runs: {},
+    setDraftText: (draftText, sessionId) => draft({ draftText }, sessionId),
+    addDraftAtts: (atts, sessionId) => {
+      const session = get().sessions.find((s) => s.id === (sessionId ?? get().currentId));
+      if (session) draft({ draftAtts: [...(session.draftAtts ?? []), ...atts] }, session.id);
+    },
+    removeDraftAtt: (id) => draft({ draftAtts: (get().current()?.draftAtts ?? []).filter((a) => a.id !== id) }),
+    moveDraftAtt: (id, offset) => {
+      const atts = [...(get().current()?.draftAtts ?? [])];
+      const from = atts.findIndex((a) => a.id === id);
+      const to = from + offset;
+      if (from < 0 || to < 0 || to >= atts.length) return;
+      [atts[from], atts[to]] = [atts[to], atts[from]];
+      draft({ draftAtts: atts });
+    },
+    clearDraftAtts: () => draft({ draftAtts: [] }),
+    init: async () => {
+      try {
+        const raw = await api.loadState("sessions");
+        if (raw) {
+          const parsed = JSON.parse(raw) as { sessions: ChatSession[]; currentId: string | null };
+          if (Array.isArray(parsed.sessions) && parsed.sessions.length) {
+            set({ sessions: parsed.sessions, currentId: parsed.sessions.some((s) => s.id === parsed.currentId) ? parsed.currentId : parsed.sessions[0].id });
+            return;
+          }
         }
-      }
-    } catch {
-      // 历史损坏时直接开新会话，不阻塞启动
-    }
-    const s = newSessionObj();
-    set({ sessions: [s], currentId: s.id });
-  },
+      } catch { /* 历史损坏时开新会话。 */ }
+      const session = newSessionObj();
+      set({ sessions: [session], currentId: session.id });
+    },
+    persist: () => {
+      if (draftSaveTimer) { clearTimeout(draftSaveTimer); draftSaveTimer = null; }
+      const { sessions, currentId } = get();
+      const value = JSON.stringify({ sessions, currentId });
+      persistenceQueue = persistenceQueue.catch(() => undefined).then(() => api.saveState("sessions", value)).catch((err) => {
+        toast.error(`对话保存失败：${(err as Error).message}`);
+      });
+      return persistenceQueue;
+    },
+    newSession: () => {
+      const s = newSessionObj();
+      set({ sessions: [s, ...get().sessions], currentId: s.id });
+      void get().persist();
+    },
+    selectSession: (id) => {
+      if (!get().sessions.some((s) => s.id === id)) return;
+      set({ currentId: id });
+      void get().persist();
+    },
+    deleteSession: (id) => {
+      get().stop(id);
+      const rest = get().sessions.filter((s) => s.id !== id);
+      const sessions = rest.length ? rest : [newSessionObj()];
+      set({ sessions, currentId: get().currentId === id ? sessions[0].id : get().currentId });
+      void get().persist();
+    },
+    renameSession: (id, title) => {
+      set({ sessions: get().sessions.map((s) => s.id === id ? { ...s, title } : s) });
+      void get().persist();
+    },
+    current: () => get().sessions.find((s) => s.id === get().currentId) ?? null,
+    stop: (id) => {
+      const sessionId = id ?? get().currentId;
+      if (!sessionId) return;
+      get().runs[sessionId]?.cancel?.();
+    },
+    send: async (text, attachments) => {
+      const session = get().current();
+      if (!session || get().runs[session.id]) return;
+      if (!channelReady("chat")) { toast.error("请先配置对话模型"); return; }
+      const userMsg: ChatMessage = { id: uid("m"), role: "user", content: text, attachments, createdAt: Date.now() };
+      set({ sessions: get().sessions.map((s) => s.id === session.id ? {
+        ...s, title: s.messages.length ? s.title : text.trim().slice(0, 24) || "图片对话",
+        messages: [...s.messages, userMsg], draftText: "", draftAtts: [], updatedAt: Date.now(),
+      } : s) });
+      void get().persist();
+      await runTurn(session.id, set, get);
+    },
+    regenerate: async () => {
+      const session = get().current();
+      if (!session || get().runs[session.id] || !channelReady("chat")) return;
+      const msgs = [...session.messages];
+      while (msgs.length && msgs[msgs.length - 1].role !== "user") msgs.pop();
+      if (!msgs.length) return;
+      set({ sessions: get().sessions.map((s) => s.id === session.id ? { ...s, messages: msgs, updatedAt: Date.now() } : s) });
+      await runTurn(session.id, set, get);
+    },
+  };
+});
 
-  persist: async () => {
-    const { sessions, currentId } = get();
-    try {
-      await api.saveState("sessions", JSON.stringify({ sessions, currentId }));
-    } catch {
-      // 持久化失败不影响当前会话继续用
-    }
-  },
+type Setter = (partial: Partial<SessionState> | ((state: SessionState) => Partial<SessionState>)) => void;
 
-  newSession: () => {
-    const s = newSessionObj();
-    set({ sessions: [s, ...get().sessions], currentId: s.id });
-    void get().persist();
-  },
-
-  selectSession: (id) => {
-    set({ currentId: id });
-    void get().persist();
-  },
-
-  deleteSession: (id) => {
-    const rest = get().sessions.filter((s) => s.id !== id);
-    const sessions = rest.length ? rest : [newSessionObj()];
-    set({ sessions, currentId: sessions[0].id });
-    void get().persist();
-  },
-
-  renameSession: (id, title) => {
-    set({
-      sessions: get().sessions.map((s) => (s.id === id ? { ...s, title } : s)),
-    });
-    void get().persist();
-  },
-
-  current: () => {
-    const { sessions, currentId } = get();
-    return sessions.find((s) => s.id === currentId) ?? null;
-  },
-
-  stop: () => {
-    get().cancelRef?.();
-    set({ busy: false, toolNote: "", streaming: null, cancelRef: null });
-  },
-
-  send: async (text, attachments) => {
-    const cfg = useConfig.getState().config;
-    if (!cfg) return;
-    if (!channelReady("chat")) {
-      toast.error("请先在「设置」里配置对话模型（Base URL / API Key / 模型名）");
-      return;
-    }
-
-    const session = get().current();
-    if (!session) return;
-
-    const userMsg: ChatMessage = {
-      id: uid("m"),
-      role: "user",
-      content: text,
-      attachments,
-      createdAt: Date.now(),
-    };
-
-    const title =
-      session.messages.length === 0 && text.trim()
-        ? text.trim().slice(0, 24)
-        : session.title;
-
-    set({
-      draftAtts: [],
-      sessions: get().sessions.map((s) =>
-        s.id === session.id
-          ? { ...s, title, messages: [...s.messages, userMsg], updatedAt: Date.now() }
-          : s,
-      ),
-    });
-    void get().persist();
-
-    await runTurn(session.id, set, get);
-  },
-
-  regenerate: async () => {
-    const session = get().current();
-    if (!session) return;
-    // 删掉最后一条 assistant（及其后续 tool 消息）后重跑
-    const msgs = [...session.messages];
-    while (msgs.length && msgs[msgs.length - 1].role !== "user") msgs.pop();
-    if (!msgs.length) return;
-    set({
-      sessions: get().sessions.map((s) =>
-        s.id === session.id ? { ...s, messages: msgs, updatedAt: Date.now() } : s,
-      ),
-    });
-    await runTurn(session.id, set, get);
-  },
-}));
-
-type Setter = (
-  partial:
-    | Partial<SessionState>
-    | ((state: SessionState) => Partial<SessionState>),
-) => void;
-
-/** 跑一轮（可能含多轮工具调用）对话。 */
 async function runTurn(sessionId: string, set: Setter, get: () => SessionState): Promise<void> {
-  const cfg0 = useConfig.getState().config;
-  if (!cfg0) return;
-
-  set({ busy: true, toolNote: "", streaming: null });
-
-  const readSession = () => get().sessions.find((s) => s.id === sessionId) ?? null;
-
-  const appendMessage = (msg: ChatMessage) => {
-    set((state) => ({
-      sessions: state.sessions.map((s) =>
-        s.id === sessionId ? { ...s, messages: [...s.messages, msg], updatedAt: Date.now() } : s,
-      ),
-    }));
+  const cfg = useConfig.getState().config;
+  if (!cfg || get().runs[sessionId]) return;
+  const runId = uid("run");
+  let stopped = false;
+  let abort: (() => void) | null = null;
+  const cancel = () => { stopped = true; abort?.(); };
+  set((state) => ({ runs: { ...state.runs, [sessionId]: { runId, streaming: null, toolNote: "", cancel } } }));
+  const active = () => !stopped && get().runs[sessionId]?.runId === runId && get().sessions.some((s) => s.id === sessionId);
+  const patchRun = (patch: Partial<SessionRun>) => {
+    if (get().runs[sessionId]?.runId !== runId) return;
+    set((state) => ({ runs: { ...state.runs, [sessionId]: { ...state.runs[sessionId], ...patch } } }));
   };
-
-  const updateMessage = (id: string, patch: Partial<ChatMessage>) => {
-    set((state) => ({
-      sessions: state.sessions.map((s) =>
-        s.id === sessionId
-          ? { ...s, messages: s.messages.map((m) => (m.id === id ? { ...m, ...patch } : m)) }
-          : s,
-      ),
-    }));
-  };
-
+  const readSession = () => get().sessions.find((s) => s.id === sessionId);
+  const append = (msg: ChatMessage) => set((state) => ({ sessions: state.sessions.map((s) => s.id === sessionId ? { ...s, messages: [...s.messages, msg], updatedAt: Date.now() } : s) }));
+  const update = (id: string, patch: Partial<ChatMessage>) => set((state) => ({ sessions: state.sessions.map((s) => s.id === sessionId ? { ...s, messages: s.messages.map((m) => m.id === id ? { ...m, ...patch } : m) } : s) }));
   try {
-    for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {
-      const cfg = useConfig.getState().config;
-      if (!cfg) break;
-
+    for (let round = 0; round <= MAX_TOOL_ROUNDS && active(); round += 1) {
       const session = readSession();
       if (!session) break;
-
-      const useTools = cfg.linkage.enabled && cfg.linkage.useTools;
-      const apiMessages: unknown[] = [
-        ...(cfg.chat.systemPrompt.trim()
-          ? [{ role: "system", content: cfg.chat.systemPrompt }]
-          : []),
-        ...session.messages.flatMap(toApiMessages),
-      ];
-
+      const useTools = cfg.linkage.enabled && cfg.linkage.useTools && round < MAX_TOOL_ROUNDS;
+      const history = conversationMessages(session.messages);
       const messageId = uid("m");
-      set({
-        streaming: { messageId, content: "", reasoning: "", toolCalls: [] },
-        toolNote: round > 0 ? "模型正在根据图像结果继续回答…" : "",
-      });
-
+      patchRun({ streaming: { messageId, content: "", reasoning: "", toolCalls: [] }, toolNote: round ? "正在检查图像结果…" : "" });
       const final = await new Promise<{ ok: boolean; error?: string }>((resolve) => {
         let settled = false;
-        const finish = (r: { ok: boolean; error?: string }) => {
+        const finish = (result: { ok: boolean; error?: string }) => {
           if (settled) return;
           settled = true;
           clearTimeout(guard);
-          resolve(r);
+          abort = null;
+          resolve(result);
         };
-        // 兜底：Rust 侧正常一定会发 done/error，但万一通道断了也要让 UI 解锁
-        const guard = setTimeout(
-          () => finish({ ok: false, error: "等待响应超时，已中断" }),
-          (cfg.chat.timeoutSecs + 60) * 1000,
-        );
-
-        const { cancel } = api.chatStream(
-          {
-            baseUrl: cfg.chat.baseUrl,
-            apiKey: cfg.chat.apiKey,
-            model: cfg.chat.model,
-            messages: apiMessages,
-            temperature: cfg.chat.temperature,
-            maxTokens: cfg.chat.maxTokens,
-            tools: useTools ? imageTools() : null,
-            timeoutSecs: cfg.chat.timeoutSecs,
-          },
-          (ev) => {
-            const cur = get().streaming;
-            if (!cur) return;
-            switch (ev.type) {
-              case "delta":
-                set({ streaming: { ...cur, content: cur.content + ev.text } });
-                break;
-              case "reasoning":
-                set({ streaming: { ...cur, reasoning: cur.reasoning + ev.text } });
-                break;
-              case "toolCalls":
-                set({ streaming: { ...cur, toolCalls: ev.calls } });
-                break;
-              case "error":
-                finish({ ok: false, error: ev.message });
-                break;
-              case "done":
-                finish({ ok: true });
-                break;
-              default:
-                break;
-            }
-          },
-        );
-        set({ cancelRef: cancel });
-      });
-
-      const streamed = get().streaming;
-      set({ streaming: null, cancelRef: null });
-      if (!streamed) break;
-
-      const assistantMsg: ChatMessage = {
-        id: messageId,
-        role: "assistant",
-        content: streamed.content.trim(),
-        reasoning: streamed.reasoning.trim() || undefined,
-        toolCalls: streamed.toolCalls.length ? streamed.toolCalls : undefined,
-        model: cfg.chat.model,
-        createdAt: Date.now(),
-        ...(final.ok ? {} : { error: final.error }),
-      };
-      appendMessage(assistantMsg);
-
-      if (!final.ok) {
-        void get().persist();
-        break;
-      }
-
-      if (!streamed.toolCalls.length) {
-        void get().persist();
-        break;
-      }
-
-      // ---- 执行图像工具 ----
-      const conv = readSession();
-      const source = conv ? latestImage(conv.messages) : null;
-      let executed = 0;
-
-      for (const call of streamed.toolCalls) {
-        let args: Record<string, unknown> = {};
-        try {
-          args = call.arguments.trim() ? JSON.parse(call.arguments) : {};
-        } catch {
-          args = {};
-        }
-
-        const toolMsgId = uid("m");
-        appendMessage({
-          id: toolMsgId,
-          role: "tool",
-          content: "",
-          toolCallId: call.id,
-          pending: true,
-          createdAt: Date.now(),
+        const guard = setTimeout(() => { stream.cancel(); finish({ ok: false, error: "等待响应超时" }); }, (cfg.chat.timeoutSecs + 60) * 1000);
+        const stream = api.chatStream({
+          protocol: cfg.chat.protocol, stream: cfg.chat.stream,
+          baseUrl: cfg.chat.baseUrl, apiKey: cfg.chat.apiKey, model: cfg.chat.model,
+          messages: [
+            ...(cfg.chat.systemPrompt.trim() ? [{ role: "system", content: cfg.chat.systemPrompt }] : []),
+            ...(cfg.linkage.enabled && cfg.linkage.useTools ? [{ role: "system", content: imageToolInstructions(session.messages) }] : []),
+            ...history,
+          ],
+          temperature: cfg.chat.temperature, maxTokens: cfg.chat.maxTokens,
+          tools: useTools ? imageTools() : null, timeoutSecs: cfg.chat.timeoutSecs,
+        }, (event) => {
+          if (settled || !active()) return;
+          const cur = get().runs[sessionId]?.streaming;
+          if (!cur || cur.messageId !== messageId) return;
+          if (event.type === "delta") patchRun({ streaming: { ...cur, content: cur.content + event.text } });
+          else if (event.type === "reasoning") patchRun({ streaming: { ...cur, reasoning: cur.reasoning + event.text } });
+          else if (event.type === "toolCalls") patchRun({ streaming: { ...cur, toolCalls: event.calls } });
+          else if (event.type === "error") finish({ ok: false, error: event.message });
+          else if (event.type === "done") finish({ ok: true });
         });
-
+        abort = () => { stream.cancel(); finish({ ok: false, error: "已停止" }); };
+        if (stopped) abort();
+      });
+      const streamed = get().runs[sessionId]?.streaming;
+      patchRun({ streaming: null });
+      if (!streamed) break;
+      // 停止时保留已生成文字，丢弃未执行的工具调用。
+      append({ id: messageId, role: "assistant", content: streamed.content.trim(), reasoning: streamed.reasoning.trim() || undefined,
+        toolCalls: final.ok && streamed.toolCalls.length ? streamed.toolCalls : undefined,
+        model: cfg.chat.model, createdAt: Date.now(), ...(final.ok ? {} : { error: final.error }) });
+      if (!final.ok || !active() || !streamed.toolCalls.length) break;
+      const conv = readSession();
+      if (!conv) break;
+      const original = [...conv.messages].reverse().find((m) => m.role === "user")?.content ?? "";
+      for (const call of streamed.toolCalls) {
+        const toolId = uid("m");
+        append({ id: toolId, role: "tool", content: "", toolCallId: call.id, pending: true, createdAt: Date.now() });
         try {
-          if (call.name === "generate_image") {
-            const prompt = String(args.prompt ?? "").trim();
-            if (!prompt) throw new Error("模型没有给出提示词");
-            const count = Math.min(Math.max(Number(args.n ?? 1) || 1, 1), 4);
-            set({
-              toolNote: `正在调用图像模型生成：${prompt.slice(0, 60)}${
-                prompt.length > 60 ? "…" : ""
-              }`,
-            });
-            const imgCfg = useConfig.getState().config!.image;
-            const sizeArg = typeof args.size === "string" && args.size !== "auto" ? args.size : undefined;
-            const items = await api.generateImage({
-              baseUrl: imgCfg.baseUrl,
-              apiKey: imgCfg.apiKey,
-              model: imgCfg.model,
-              apiMode: imgCfg.apiMode,
-              prompt,
-              n: count,
-              size: sizeArg ?? (imgCfg.size === "auto" ? undefined : imgCfg.size),
-              quality: imgCfg.quality,
-              background: imgCfg.background,
-              outputFormat: imgCfg.outputFormat,
-              timeoutSecs: imgCfg.timeoutSecs,
-            });
-            useGallery.getState().add(items);
-            executed += 1;
-            updateMessage(toolMsgId, {
-              pending: false,
-              content: `已生成 ${items.length} 张图片。`,
-              images: items.map((it) => ({
-                galleryId: it.id,
-                path: it.path,
-                dataUrl: it.dataUrl ?? undefined,
-                prompt,
-                size: it.size,
-                model: it.model,
-              })),
-            });
-          } else if (call.name === "edit_image") {
-            const prompt = String(args.prompt ?? "").trim();
-            if (!prompt) throw new Error("模型没有给出编辑指令");
-            if (!source?.dataUrl) {
-              throw new Error("当前对话里还没有可作为编辑对象的图片");
-            }
-            set({ toolNote: `正在按指令修改图像：${prompt.slice(0, 60)}` });
-            const imgCfg = useConfig.getState().config!.image;
-            const items = await api.generateImage(
-              {
-                baseUrl: imgCfg.baseUrl,
-                apiKey: imgCfg.apiKey,
-                model: imgCfg.model,
-                apiMode: imgCfg.apiMode,
-                prompt,
-                images: [source.dataUrl],
-                n: 1,
-                size: imgCfg.size === "auto" ? undefined : imgCfg.size,
-                quality: imgCfg.quality,
-                background: imgCfg.background,
-                outputFormat: imgCfg.outputFormat,
-                timeoutSecs: imgCfg.timeoutSecs,
-              },
-              source.galleryId ?? null,
-            );
-            useGallery.getState().add(items);
-            executed += 1;
-            updateMessage(toolMsgId, {
-              pending: false,
-              content: `已按指令修改图像。`,
-              images: items.map((it) => ({
-                galleryId: it.id,
-                path: it.path,
-                dataUrl: it.dataUrl ?? undefined,
-                prompt,
-                size: it.size,
-                model: it.model,
-              })),
-            });
-          } else {
-            updateMessage(toolMsgId, {
-              pending: false,
-              content: `未知工具：${call.name}`,
-            });
-          }
+          if (!active()) throw new Error("已停止");
+          if (call.name !== "generate_image" && call.name !== "edit_image") throw new Error(`未知工具：${call.name}`);
+          const args = JSON.parse(call.arguments || "{}") as Record<string, unknown>;
+          const prompt = String(args.prompt ?? "").trim();
+          if (!prompt) throw new Error("模型没有给出图像指令");
+          const sources = call.name === "edit_image" ? selectImageSources(conv.messages, args.source_image_ids) :
+            args.source_image_ids !== undefined ? selectImageSources(conv.messages, args.source_image_ids) : [];
+          if (call.name === "edit_image" && !sources.length) throw new Error("没有选择可用的参考图片");
+          const images = await Promise.all(sources.map((image) => image.dataUrl || (image.path ? api.readImageDataUrl(image.path) : Promise.reject(new Error("参考图片无法读取")))));
+          if (!active()) throw new Error("已停止");
+          patchRun({ toolNote: `${sources.length ? `正在使用 ${sources.length} 张素材编辑` : "正在生成图片"}：${prompt.slice(0, 60)}` });
+          const imgCfg = cfg.image;
+          const request = api.cancellableImage({
+            baseUrl: imgCfg.baseUrl, apiKey: imgCfg.apiKey, model: imgCfg.model, apiMode: imgCfg.apiMode,
+            prompt: `${prompt}\n\n用户原始要求（必须保留文字、数量、构图、素材对应关系与禁止项）：\n${original}`,
+            images, imageLabels: sources.map((source) => source.label),
+            n: Math.min(Math.max(Math.floor(Number(args.n ?? 1)) || 1, 1), 4),
+            size: typeof args.size === "string" && args.size !== "auto" ? args.size : imgCfg.size === "auto" ? undefined : imgCfg.size,
+            quality: imgCfg.quality, background: imgCfg.background, outputFormat: imgCfg.outputFormat, timeoutSecs: imgCfg.timeoutSecs,
+          }, sources[0]?.galleryId);
+          abort = request.cancel;
+          if (stopped) abort();
+          const items = await request.promise;
+          abort = null;
+          useGallery.getState().add(items);
+          update(toolId, { pending: false, content: `已生成 ${items.length} 张图片。`, images: items.map((item) => ({
+            galleryId: item.id, path: item.path, dataUrl: item.dataUrl ?? undefined, prompt: item.prompt, size: item.size, model: item.model,
+          })) });
         } catch (err) {
-          updateMessage(toolMsgId, {
-            pending: false,
-            content: `执行失败：${(err as Error).message}`,
-          });
-          toast.error((err as Error).message);
+          abort = null;
+          const error = stopped ? "已停止" : (err as Error).message;
+          update(toolId, { pending: false, content: `执行失败：${error}` });
+          if (!stopped) toast.error(error);
         }
       }
-
       void get().persist();
-
-      if (executed === 0) break; // 全部失败就不再追问，避免死循环
-      // 有成功结果 -> 回到循环，把图片结果告诉模型让它继续说话
     }
   } catch (err) {
-    toast.error((err as Error).message);
+    if (!stopped) toast.error((err as Error).message);
   } finally {
-    set({ busy: false, toolNote: "", streaming: null, cancelRef: null });
+    if (get().runs[sessionId]?.runId === runId) {
+      set((state) => { const runs = { ...state.runs }; delete runs[sessionId]; return { runs }; });
+    }
     void get().persist();
   }
 }

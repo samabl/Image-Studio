@@ -55,10 +55,12 @@ export default function App() {
           const paths = payload.paths ?? [];
           const images = paths.filter((p) => /\.(png|jpe?g|webp|gif|bmp)$/i.test(p));
           if (images.length === 0) return;
+          const targetTab = useConfig.getState().tab;
+          const targetSession = useSessions.getState().currentId;
           void (async () => {
             try {
               const atts = await Promise.all(
-                images.slice(0, 8).map(async (p, i) => {
+                images.map(async (p, i) => {
                   const dataUrl = await importImageFile(p);
                   return {
                     id: `drop_${Date.now()}_${i}`,
@@ -68,9 +70,9 @@ export default function App() {
                 }),
               );
               // 按当前页面决定落点：对话页进输入框附件，其余进图像工作室参考图
-              const current = useConfig.getState().tab;
+              const current = targetTab;
               if (current === "chat") {
-                useSessions.getState().addDraftAtts(atts);
+                useSessions.getState().addDraftAtts(atts, targetSession ?? undefined);
                 useToast
                   .getState()
                   .push("success", `已添加 ${atts.length} 张图片，发消息时会一起送给模型`);
@@ -101,11 +103,13 @@ export default function App() {
         f.type.startsWith("image/"),
       );
       if (!files.length) return;
+      const targetTab = useConfig.getState().tab;
+      const targetSession = useSessions.getState().currentId;
       void (async () => {
         const atts = [];
-        for (const f of files.slice(0, 4)) atts.push(await fileToAttachment(f));
-        if (useConfig.getState().tab === "chat") {
-          useSessions.getState().addDraftAtts(atts);
+        for (const f of files) atts.push(await fileToAttachment(f));
+        if (targetTab === "chat") {
+          useSessions.getState().addDraftAtts(atts, targetSession ?? undefined);
           useToast.getState().push("success", "已从剪贴板添加图片到对话");
         } else {
           useStudio.getState().addRefs(atts);

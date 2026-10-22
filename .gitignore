@@ -4,6 +4,7 @@ dist-ssr/
 *.local
 .DS_Store
 .vite/
+__pycache__/
 
 # Rust / Tauri
 src-tauri/target/
@@ -13,6 +14,7 @@ src-tauri/gen/
 *.secret.json
 .env
 .env.local
+test api.md
 
 # 编辑器
 .vscode/*

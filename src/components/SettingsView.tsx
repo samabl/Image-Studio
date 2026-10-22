@@ -1,9 +1,11 @@
 import { useState } from "react";
 import { Field, Switch } from "./ui";
+import { ModelPicker } from "./ModelPicker";
 import { useConfig, useGallery, useToast } from "../lib/store";
 import { listModels } from "../lib/api";
 import { openLocalPath } from "../lib/shell";
 import { isDesktop } from "../lib/platform";
+import type { ChatProtocol } from "../types";
 
 export function SettingsView() {
   const cfg = useConfig((s) => s.config);
@@ -21,7 +23,7 @@ export function SettingsView() {
     }
     setLoading(kind);
     try {
-      const models = await listModels(ch.baseUrl, ch.apiKey);
+      const models = await listModels(ch.baseUrl, ch.apiKey, kind === "chat" ? cfg.chat.protocol : cfg.image.apiMode === "gemini" ? "gemini" : "openai");
       if (models.length === 0) {
         note("error", "接口没有返回任何模型");
       } else {
@@ -46,9 +48,17 @@ export function SettingsView() {
             <span className="tag">用于聊天、看图、优化提示词</span>
           </div>
           <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+            <Field label="接口协议">
+              <select className="input" value={cfg.chat.protocol ?? "openai"}
+                onChange={(e) => patchChat({ protocol: e.target.value as ChatProtocol, models: [] })}>
+                <option value="openai">OpenAI 兼容 · Chat Completions</option>
+                <option value="anthropic">Anthropic · Messages</option>
+                <option value="gemini">Gemini 原生 · Generate Content</option>
+              </select>
+            </Field>
             <Field
               label="Base URL"
-              hint="填到 /v1 或不填都可以：http://host:3000、http://host:3000/v1、或完整端点都能识别。"
+              hint={cfg.chat.protocol === "gemini" ? "填写 Gemini 服务地址，如 https://generativelanguage.googleapis.com/v1beta，支持兼容的原生网关。" : cfg.chat.protocol === "anthropic" ? "填写 Anthropic 服务地址，如 https://api.anthropic.com；请求 /v1/messages。" : "填到 /v1 或不填都可以，也支持完整 /chat/completions 端点。"}
             >
               <input
                 className="input"
@@ -81,19 +91,8 @@ export function SettingsView() {
                 </button>
               }
             >
-              <input
-                className="input"
-                list="chat-models"
-                value={cfg.chat.model}
-                placeholder="gpt-5.6-luna"
-                onChange={(e) => patchChat({ model: e.target.value })}
-                onBlur={() => void flush()}
-              />
-              <datalist id="chat-models">
-                {cfg.chat.models.map((m) => (
-                  <option key={m} value={m} />
-                ))}
-              </datalist>
+              <ModelPicker value={cfg.chat.model} models={cfg.chat.models}
+                onChange={(model) => patchChat({ model })} onBlur={() => void flush()} />
             </Field>
 
             <Field label="系统提示词" hint="决定助手的角色与行为。留空则不发送 system 消息。">
@@ -189,7 +188,7 @@ export function SettingsView() {
           </div>
           <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
             <div className="grid-2">
-              <Field label="Base URL" hint="可以和对话模型不同，完全独立配置。">
+              <Field label="Base URL" hint={cfg.image.apiMode === "gemini" ? "Gemini 原生地址，如 https://generativelanguage.googleapis.com/v1beta。" : "可以和对话模型不同，完全独立配置。"}>
                 <input
                   className="input"
                   value={cfg.image.baseUrl}
@@ -223,19 +222,8 @@ export function SettingsView() {
                 </button>
               }
             >
-              <input
-                className="input"
-                list="image-models"
-                value={cfg.image.model}
-                placeholder="gpt-image-2"
-                onChange={(e) => patchImage({ model: e.target.value })}
-                onBlur={() => void flush()}
-              />
-              <datalist id="image-models">
-                {cfg.image.models.map((m) => (
-                  <option key={m} value={m} />
-                ))}
-              </datalist>
+              <ModelPicker value={cfg.image.model} models={cfg.image.models}
+                onChange={(model) => patchImage({ model })} onBlur={() => void flush()} />
             </Field>
 
             <Field
@@ -251,6 +239,7 @@ export function SettingsView() {
                 }}
               >
                 <option value="images">images —— 标准图像接口</option>
+                <option value="gemini">Gemini 原生 · Generate Content</option>
                 <option value="chat">chat —— 多模态对话出图</option>
               </select>
             </Field>

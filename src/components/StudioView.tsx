@@ -5,8 +5,8 @@ import { showImage } from "./Overlays";
 import { useConfig, useStudio, useToast, channelReady } from "../lib/store";
 import { fileToAttachment } from "../lib/image";
 import { copyText } from "../lib/shell";
-import { galleryExport, readImageDataUrl } from "../lib/api";
-import { save } from "@tauri-apps/plugin-dialog";
+import { readImageDataUrl } from "../lib/api";
+import { SaveImageButton } from "./SaveImageButton";
 import { isDesktop } from "../lib/platform";
 import type { GalleryItem } from "../types";
 
@@ -41,7 +41,7 @@ export function StudioView() {
     if (!files?.length) return;
     try {
       const next = [];
-      for (const f of Array.from(files).slice(0, 8)) {
+      for (const f of Array.from(files)) {
         if (!f.type.startsWith("image/")) continue;
         next.push(await fileToAttachment(f));
       }
@@ -105,6 +105,7 @@ export function StudioView() {
         {/* 参考图 */}
         <Field
           label={studio.mode === "generate" ? "参考图（可选，加上即变图生图）" : "参考图"}
+          hint="按展示顺序编号；可在提示词里写「素材 1」「素材 2」。第一张是编辑基底，蒙版应用于第一张。"
           right={
             hasRef ? (
               <button
@@ -133,12 +134,18 @@ export function StudioView() {
           />
           {hasRef ? (
             <div className="ref-list">
-              {studio.refs.map((r) => (
+              {studio.refs.map((r, index) => (
                 <div className="ref-item" key={r.id}>
-                  <img src={r.dataUrl} alt={r.name ?? ""} />
+                  <img src={r.dataUrl} alt={r.name ?? ""} onClick={() => showImage({ dataUrl: r.dataUrl, title: r.name })} />
+                  <span className="ref-number" title={r.name}>素材 {index + 1}</span>
+                  <div className="ref-order">
+                    <button type="button" disabled={busy || index === 0} title="前移素材" onClick={() => studio.moveRef(r.id, -1)}>←</button>
+                    <button type="button" disabled={busy || index === studio.refs.length - 1} title="后移素材" onClick={() => studio.moveRef(r.id, 1)}>→</button>
+                  </div>
                   <button
                     type="button"
                     className="kill"
+                    disabled={busy}
                     onClick={() => studio.removeRef(r.id)}
                     title="移除"
                   >
@@ -192,8 +199,9 @@ export function StudioView() {
           <>
             <Switch
               checked={studio.maskEnabled}
+              disabled={busy || cfg?.image.apiMode !== "images"}
               onChange={studio.setMaskEnabled}
-              label="局部重绘（只改涂抹区域）"
+              label={cfg?.image.apiMode === "images" ? "局部重绘（只改涂抹区域）" : "局部重绘需使用 images 协议"}
             />
             {studio.maskEnabled && (
               <>
@@ -346,6 +354,7 @@ export function StudioView() {
           )}
         </button>
 
+        {busy && <button type="button" className="btn danger" onClick={() => studio.stop()}>■ 停止任务</button>}
         {cfg?.linkage.autoOptimizePrompt && (
           <div className="chip accent" style={{ alignSelf: "flex-start" }}>
             已开启：出图前自动用对话模型优化提示词
@@ -430,29 +439,7 @@ function ResultCard({ item }: { item: GalleryItem }) {
         >
           ⧉ 复制提示词
         </button>
-        {isDesktop && (
-          <button
-            type="button"
-            className="btn sm ghost"
-            onClick={() => {
-              void (async () => {
-                try {
-                  const picked = await save({
-                    defaultPath: item.fileName,
-                    filters: [{ name: "图片", extensions: ["png", "jpg", "jpeg", "webp"] }],
-                  });
-                  if (!picked) return;
-                  const saved = await galleryExport(item.id, picked);
-                  note("success", `已导出到 ${saved}`);
-                } catch (err) {
-                  note("error", (err as Error).message);
-                }
-              })();
-            }}
-          >
-            ⤓ 导出
-          </button>
-        )}
+        <SaveImageButton image={{ item, path: item.path, dataUrl: item.dataUrl }} />
       </div>
       {item.revisedPrompt && (
         <div className="result-meta" style={{ paddingTop: 0 }}>
