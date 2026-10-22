@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
 import ts from "typescript";
 
 const compile = async (path, imports = {}) => {
@@ -51,7 +52,15 @@ async function harness() {
   const imageCalls = [];
   const textCalls = [];
   const saves = [];
+  const backgroundTasks = [];
+  const backgroundState = { enabled: false };
   const api = {
+    startBackgroundTask: () => {
+      if (!backgroundState.enabled) return null;
+      const task = { finished: false, ready: Promise.resolve(), finish: async () => { task.finished = true; } };
+      backgroundTasks.push(task);
+      return task;
+    },
     loadState: async () => null,
     saveState: async (_key, value) => { saves.push(JSON.parse(value)); },
     chatStream: (request, onEvent) => {
@@ -86,7 +95,7 @@ async function harness() {
     linkage: { enabled: true, useTools: true, autoOptimizePrompt: false, visionModel: "", optimizeSystemPrompt: "优化", reverseSystemPrompt: "反推" }, ui: { sendOnEnter: true },
   } });
   await store.useSessions.getState().init();
-  return { ...store, streams, imageCalls, textCalls, saves, api };
+  return { ...store, streams, imageCalls, textCalls, saves, api, backgroundTasks, backgroundState };
 }
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
@@ -171,6 +180,46 @@ test("停止图像工具中断其请求，不触发后续对话循环", async ()
   assert.equal(sessions().current().messages.at(-1).pending, false);
 });
 
+test("Android 后台任务跨越生图和回图检查，并隔离并发会话及取消", async () => {
+  const h = await harness(); h.backgroundState.enabled = true;
+  const sessions = h.useSessions.getState;
+  const first = sessions().currentId;
+  const p1 = sessions().send("生成苹果", []); await tick();
+  assert.equal(h.backgroundTasks.length, 1);
+  h.streams[0].onEvent({ type: "toolCalls", calls: [{ id: "generate", name: "generate_image", arguments: '{"prompt":"红苹果"}' }] });
+  complete(h.streams[0], "正在**生成图片**"); await tick();
+  assert.equal(h.backgroundTasks[0].finished, false);
+  sessions().newSession();
+  const second = sessions().currentId;
+  const p2 = sessions().send("第二个后台任务", []); await tick();
+  assert.equal(h.backgroundTasks.length, 2);
+  sessions().stop(second); await p2;
+  assert.equal(h.backgroundTasks[1].finished, true);
+  assert.equal(h.backgroundTasks[0].finished, false);
+  h.imageCalls[0].resolve([{ id: "g", path: "g.png", dataUrl: attachment("g").dataUrl, prompt: "红苹果", model: "image", size: "1024x1024" }]);
+  await tick();
+  assert.equal(h.backgroundTasks[0].finished, false);
+  assert.equal(h.backgroundTasks.length, 2, "检查阶段复用同一个后台任务，避免重新从后台启动服务");
+  complete(h.streams[2], "**检查完成**：图片正确。"); await p1;
+  assert.equal(h.backgroundTasks[0].finished, true);
+  assert.equal(sessions().sessions.find((s) => s.id === first).messages.at(-1).content, "**检查完成**：图片正确。");
+});
+
+test("Android 工作室取消和启动服务失败时清理任务，避免继续出图", async () => {
+  const h = await harness(); h.backgroundState.enabled = true;
+  h.useStudio.getState().setPrompt("画一个苹果");
+  const pending = h.useStudio.getState().run(); await tick();
+  h.useStudio.getState().stop(); await pending;
+  assert.equal(h.backgroundTasks[0].finished, true);
+  assert.equal(h.useStudio.getState().busy, false);
+  h.api.startBackgroundTask = () => ({ ready: Promise.reject(new Error("服务启动被拒绝")), finish: async () => {} });
+  const calls = h.imageCalls.length;
+  await h.useSessions.getState().send("生图", []);
+  assert.equal(h.streams.length, 0);
+  assert.equal(h.imageCalls.length, calls);
+  assert.deepEqual(h.useSessions.getState().runs, {});
+});
+
 test("优化提示词读取全部参考图，并要求保留原始约束", async () => {
   const h = await harness();
   await h.optimizePromptText("两个人，素材 1 的人物，素材 2 的背景", [attachment("a"), attachment("b")]);
@@ -195,6 +244,36 @@ test("模型列表不按已选 GPT 名称筛选，显示所有提供方", async 
   const { ModelPicker } = await import(url);
   const markup = renderToStaticMarkup(createElement(ModelPicker, { value: "gpt-test", models: ["gpt-test", "claude-test", "gemini-test", "deepseek-test"], onChange() {}, onBlur() {} }));
   for (const model of ["claude-test", "gemini-test", "deepseek-test"]) assert.ok(markup.includes(model));
+});
+
+test("生图说明和回图检查中的粗体、斜体及流式片段能完成渲染", async () => {
+  const shell = `data:text/javascript,${encodeURIComponent("export async function copyText() {}; export async function openExternal() {};")}`;
+  const url = await compile("src/components/Markdown.tsx", {
+    react: import.meta.resolve("react"), "react/jsx-runtime": import.meta.resolve("react/jsx-runtime"), "../lib/shell": shell,
+  });
+  // 在子进程验证，回归死循环时超时失败，避免耗尽测试进程/CI 的内存。
+  const script = `
+    import assert from "node:assert/strict";
+    import React from "react";
+    import { renderToStaticMarkup } from "react-dom/server";
+    const { Markdown } = await import(${JSON.stringify(url)});
+    const render = (source) => renderToStaticMarkup(React.createElement(Markdown, { source }));
+    assert.equal(render("正在**生成图像**，随后*检查结果*。"), '<div class="md"><p>正在<strong>生成图像</strong>，随后<em>检查结果</em>。</p></div>');
+    assert.equal(render("**检查 _两张素材_ 的顺序**"), '<div class="md"><p><strong>检查 <em>两张素材</em> 的顺序</strong></p></div>');
+    assert.equal(render("__保留文字__ 和 _构图_，**数量**正确"), '<div class="md"><p><strong>保留文字</strong> 和 <em>构图</em>，<strong>数量</strong>正确</p></div>');
+    const response = "## **图像检查**\\n- **文字**：正确\\n- *构图*：符合要求\\n\\n| 项目 | 结果 |\\n| --- | --- |\\n| **素材顺序** | __正确__ |\\n\\n> **完成**，不再重复生图。";
+    const html = render(response);
+    assert.ok(html.includes('<h2><strong>图像检查</strong></h2>'));
+    assert.ok(html.includes('<td><strong>素材顺序</strong></td>'));
+    assert.ok(html.includes('<blockquote><strong>完成</strong>，不再重复生图。</blockquote>'));
+    for (let i = 1; i <= response.length; i += 1) render(response.slice(0, i));
+    assert.ok(render('**文字 <script>alert(1)</script>**').includes('&lt;script&gt;'));
+  `;
+  const child = spawnSync(process.execPath, ["--max-old-space-size=96", "--input-type=module", "-"], {
+    input: script, encoding: "utf8", timeout: 5000, maxBuffer: 16384,
+  });
+  assert.equal(child.error, undefined, child.error?.message);
+  assert.equal(child.status, 0, child.stderr || `Renderer exited with ${child.signal}`);
 });
 
 test("保存图像支持原图、历史文件与 Android URI；取消不会写文件", async () => {

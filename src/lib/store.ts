@@ -341,7 +341,10 @@ export const useStudio = create<StudioState>((set, get) => ({
 
     studioStopped = false;
     set({ busy: true, error: null, note: "正在提交请求…", results: [] });
+    const background = api.startBackgroundTask();
     try {
+      if (background) await background.ready;
+      if (studioStopped) return;
       // 联动：出图前先用对话模型把提示词打磨一遍
       if (cfg.linkage.enabled && cfg.linkage.autoOptimizePrompt && channelReady("chat")) {
         set({ note: "正在用对话模型优化提示词…" });
@@ -393,6 +396,7 @@ export const useStudio = create<StudioState>((set, get) => ({
       set({ error: message, note: "" });
       toast.error(message);
     } finally {
+      await background?.finish();
       studioCancel = null;
       set({ busy: false });
     }
@@ -414,7 +418,10 @@ export const useStudio = create<StudioState>((set, get) => ({
     }
     studioStopped = false;
     set({ busy: true, note: "正在优化提示词…" });
+    const background = api.startBackgroundTask();
     try {
+      if (background) await background.ready;
+      if (studioStopped) return;
       const text = await optimizePromptText(
         instruction ? `${instruction}\n\n原始描述：${current || "（无）"}` : current,
         get().refs,
@@ -428,6 +435,7 @@ export const useStudio = create<StudioState>((set, get) => ({
       toast.error((err as Error).message);
       set({ note: "" });
     } finally {
+      await background?.finish();
       studioCancel = null;
       set({ busy: false, note: "" });
     }
@@ -447,7 +455,10 @@ export const useStudio = create<StudioState>((set, get) => ({
     }
     studioStopped = false;
     set({ busy: true, note: "正在反推提示词…" });
+    const background = api.startBackgroundTask();
     try {
+      if (background) await background.ready;
+      if (studioStopped) return;
       const text = await reversePromptText(source, (cancel) => { studioCancel = cancel; });
       if (studioStopped) return;
       set({ prompt: text, note: "" });
@@ -457,6 +468,7 @@ export const useStudio = create<StudioState>((set, get) => ({
       toast.error((err as Error).message);
       set({ note: "" });
     } finally {
+      await background?.finish();
       studioCancel = null;
       set({ busy: false, note: "" });
     }
@@ -751,7 +763,9 @@ async function runTurn(sessionId: string, set: Setter, get: () => SessionState):
   const readSession = () => get().sessions.find((s) => s.id === sessionId);
   const append = (msg: ChatMessage) => set((state) => ({ sessions: state.sessions.map((s) => s.id === sessionId ? { ...s, messages: [...s.messages, msg], updatedAt: Date.now() } : s) }));
   const update = (id: string, patch: Partial<ChatMessage>) => set((state) => ({ sessions: state.sessions.map((s) => s.id === sessionId ? { ...s, messages: s.messages.map((m) => m.id === id ? { ...m, ...patch } : m) } : s) }));
+  const background = api.startBackgroundTask();
   try {
+    if (background) await background.ready;
     for (let round = 0; round <= MAX_TOOL_ROUNDS && active(); round += 1) {
       const session = readSession();
       if (!session) break;
@@ -847,6 +861,7 @@ async function runTurn(sessionId: string, set: Setter, get: () => SessionState):
   } catch (err) {
     if (!stopped) toast.error((err as Error).message);
   } finally {
+    await background?.finish();
     if (get().runs[sessionId]?.runId === runId) {
       set((state) => { const runs = { ...state.runs }; delete runs[sessionId]; return { runs }; });
     }

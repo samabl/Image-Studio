@@ -1,5 +1,6 @@
 // 模块对外可见，便于 `tests/live_gateway.rs` 直接对真实网关做联调测试
 pub mod ai;
+mod background;
 pub mod config;
 pub mod error;
 pub mod gallery;
@@ -166,6 +167,26 @@ async fn chat_once(request: ChatRequest) -> AppResult<String> {
     ai::chat_once(request).await
 }
 
+#[tauri::command]
+async fn background_task_start(app: AppHandle, task_id: String) -> AppResult<()> {
+    background::start(&app, task_id).await
+}
+
+#[tauri::command]
+async fn background_task_finish(app: AppHandle, task_id: String) -> AppResult<()> {
+    background::finish(&app, task_id).await
+}
+
+#[tauri::command]
+async fn background_task_status(app: AppHandle) -> AppResult<background::BackgroundStatus> {
+    background::status(&app).await
+}
+
+#[tauri::command]
+async fn background_task_configure(app: AppHandle) -> AppResult<()> {
+    background::configure(&app).await
+}
+
 // ---------------------------------------------------------------------------
 // 图像
 // ---------------------------------------------------------------------------
@@ -314,6 +335,9 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init());
 
+    #[cfg(target_os = "android")]
+    let builder = builder.plugin(background::init());
+
     // 桌面端：第二次启动时不再开新进程，而是把已有窗口叫到前面。
     // 没有这层保护的话，两个实例会同时读写 config.json / sessions.json，互相覆盖。
     #[cfg(desktop)]
@@ -340,6 +364,10 @@ pub fn run() {
             chat_stream,
             chat_cancel,
             chat_once,
+            background_task_start,
+            background_task_finish,
+            background_task_status,
+            background_task_configure,
             generate_image,
             gallery_list,
             gallery_delete,

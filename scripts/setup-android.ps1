@@ -3,12 +3,13 @@
     一键生成并配置 Tauri Android 工程（Windows / Linux / macOS 通用，CI 与本地共用）。
 
 .DESCRIPTION
-    做四件事：
+    做五件事：
       1. 校验 JAVA_HOME / ANDROID_HOME / NDK_HOME，缺什么给出具体安装命令；
       2. 补齐 Rust 交叉编译目标；
       3. 调用 `pnpm tauri android init` 生成 src-tauri/gen/android；
       4. 生成 network_security_config.xml 并注入 AndroidManifest.xml
          —— 内网 http:// 网关在 Android 9+ 上默认被拦截，这一步是必须的。
+      5. 安装原生系统栏、刘海与键盘安全区域处理。
 
     签名**不在这里做**。Tauri 的 Gradle 模板用的是 `getByName("release") { ... }`
     这类 Kotlin DSL 写法，靠正则去改它非常脆（实测因为匹配不到 release 块而静默产出
@@ -39,6 +40,8 @@ Set-Location $root
 # AndroidManifest 的补丁逻辑单独成文件，便于单元测试
 # （见 scripts/test-android-manifest.ps1）
 . (Join-Path $PSScriptRoot "lib/android-manifest.ps1")
+. (Join-Path $PSScriptRoot "lib/android-activity.ps1")
+. (Join-Path $PSScriptRoot "lib/android-background.ps1")
 
 $onWindows = $IsWindows -or ($PSVersionTable.PSEdition -eq "Desktop")
 # 统一以「UTF-8 无 BOM」写 XML：带 BOM 会让 Gradle 的 ManifestMerger 解析失败。
@@ -49,7 +52,7 @@ function Ok($m)   { Write-Host "  [ok] $m" -ForegroundColor Green }
 function Warn($m) { Write-Host "  [!] $m" -ForegroundColor Yellow }
 function Fail($m) { Write-Host "  [x] $m" -ForegroundColor Red; exit 1 }
 
-Write-Host "`n=== 1/4 检查构建环境 ===" -ForegroundColor White
+Write-Host "`n=== 1/5 检查构建环境 ===" -ForegroundColor White
 
 # --- Java ---
 $javaHome = $env:JAVA_HOME
@@ -102,7 +105,7 @@ $env:NDK_HOME = $ndk
 Ok "NDK_HOME = $ndk"
 
 # --- Rust 交叉目标 ---
-Write-Host "`n=== 2/4 检查 Rust 交叉编译目标 ===" -ForegroundColor White
+Write-Host "`n=== 2/5 检查 Rust 交叉编译目标 ===" -ForegroundColor White
 $targets = @(
     "aarch64-linux-android",
     "armv7-linux-androideabi",
@@ -122,7 +125,7 @@ foreach ($t in $targets) {
 }
 
 # --- 生成工程 ---
-Write-Host "`n=== 3/4 生成 Android 工程 ===" -ForegroundColor White
+Write-Host "`n=== 3/5 生成 Android 工程 ===" -ForegroundColor White
 $manifest = Join-Path $root "src-tauri/gen/android/app/src/main/AndroidManifest.xml"
 
 if ($SkipInit) {
@@ -141,7 +144,7 @@ if ($SkipInit) {
 if (-not (Test-Path $manifest)) { Fail "找不到 AndroidManifest.xml：$manifest" }
 
 # --- 明文 HTTP 放行 ---
-Write-Host "`n=== 4/4 配置明文 HTTP 放行 ===" -ForegroundColor White
+Write-Host "`n=== 4/5 配置明文 HTTP 放行 ===" -ForegroundColor White
 
 $resXmlDir = Join-Path $root "src-tauri/gen/android/app/src/main/res/xml"
 $nsFile = Join-Path $resXmlDir "network_security_config.xml"
@@ -216,6 +219,16 @@ if ($changed) {
     [IO.File]::WriteAllText($manifest, $content, $utf8NoBom)
     Ok "AndroidManifest.xml 已更新"
 }
+
+Write-Host "`n=== 5/5 配置 Android 安全区域 ===" -ForegroundColor White
+Install-AndroidActivityInsets `
+    -JavaRoot (Join-Path $root 'src-tauri/gen/android/app/src/main/java') `
+    -TemplatePath (Join-Path $root 'src-tauri/android/MainActivity.kt')
+Ok '已安装 Android 原生安全区域处理'
+Install-AndroidBackgroundTasks `
+    -AndroidRoot (Join-Path $root 'src-tauri/gen/android') `
+    -SourceRoot (Join-Path $root 'src-tauri/android')
+Ok '已安装 Android 后台任务服务与所需权限'
 
 Write-Host "`n完成。`n" -ForegroundColor Green
 Write-Host @"

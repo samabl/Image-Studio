@@ -27,10 +27,11 @@ function renderInline(text: string, keyBase: string): React.ReactNode[] {
   const out: React.ReactNode[] = [];
   let last = 0;
   let idx = 0;
-  INLINE.lastIndex = 0;
+  // 递归渲染粗体/斜体时，每层必须独占匹配位置；共享 lastIndex 会无限重复外层 token。
+  const inline = new RegExp(INLINE.source, INLINE.flags);
   let m: RegExpExecArray | null;
 
-  while ((m = INLINE.exec(text)) !== null) {
+  while ((m = inline.exec(text)) !== null) {
     if (m.index > last) out.push(text.slice(last, m.index));
     const tok = m[0];
     const key = `${keyBase}-${idx++}`;

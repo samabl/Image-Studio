@@ -1,4 +1,5 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
+import { isAndroid } from "./platform";
 import type {
   AppConfig,
   ChatProtocol,
@@ -29,6 +30,20 @@ export const dataDir = () => call<string>("data_dir");
 
 export const loadState = (key: string) => call<string | null>("load_state", { key });
 export const saveState = (key: string, value: string) => call<void>("save_state", { key, value });
+
+/** Android 用同一个原生任务覆盖整个工作流，生图与回图检查之间也保持运行。 */
+export function startBackgroundTask() {
+  if (!isAndroid) return null;
+  const taskId = `task_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  const ready = call<void>("background_task_start", { taskId });
+  return {
+    ready,
+    finish: () => ready.then(() => call<void>("background_task_finish", { taskId })).catch(() => undefined),
+  };
+}
+
+export const backgroundTaskStatus = () => call<{ batteryOptimizationIgnored: boolean; notificationsEnabled: boolean }>("background_task_status");
+export const configureBackgroundTasks = () => call<void>("background_task_configure");
 
 // --- 模型 -----------------------------------------------------------------
 

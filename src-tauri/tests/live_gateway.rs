@@ -254,6 +254,70 @@ async fn tool_calling_roundtrip() {
     }
 }
 
+/// 明确启用时只出一张图，验证对话工具调用 -> 生图 -> 回图检查的完整闭环。
+#[tokio::test]
+async fn chat_image_review_roundtrip() {
+    if std::env::var("GIS_TEST_REVIEW").as_deref() != Ok("1") {
+        eprintln!("跳过：GIS_TEST_REVIEW=1 才会启用付费生图闭环");
+        return;
+    }
+    let cfg = cfg_or_skip!();
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::<ChatEvent>::new()));
+    let sink = events.clone();
+    let channel = tauri::ipc::Channel::new(move |body| {
+        if let tauri::ipc::InvokeResponseBody::Json(body) = body {
+            sink.lock().unwrap().push(serde_json::from_str(&body)?);
+        }
+        Ok(())
+    });
+    let mut req = chat_req(&cfg, "请调用 generate_image 生成一张白色背景、单个红苹果的图片。调用前用包含粗体的简短中文说明，完成后检查实际图片，勿重复生图。");
+    req.max_tokens = Some(2048);
+    req.tool_choice = Some(serde_json::json!({ "type": "function", "function": { "name": "generate_image" } }));
+    req.tools = Some(vec![serde_json::json!({ "type": "function", "function": {
+        "name": "generate_image", "description": "根据用户要求生成图片", "parameters": {
+            "type": "object", "properties": { "prompt": { "type": "string" } }, "required": ["prompt"]
+        }
+    } })]);
+    ai::chat_stream(req.clone(), channel, std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
+        .await.expect("对话工具调用失败");
+    let (explanation, calls) = {
+        let events = events.lock().unwrap();
+        let explanation: String = events.iter().filter_map(|ev| if let ChatEvent::Delta { text } = ev { Some(text.as_str()) } else { None }).collect();
+        let calls: Vec<ai::ToolCall> = events.iter().filter_map(|ev| if let ChatEvent::ToolCalls { calls } = ev { Some(calls.clone()) } else { None }).flatten().collect();
+        (explanation, calls)
+    };
+    assert_eq!(calls.len(), 1, "预期只调用一次生图工具");
+    assert_eq!(calls[0].name, "generate_image");
+    let args: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
+    let image_req: ImageRequest = serde_json::from_value(serde_json::json!({
+        "baseUrl": cfg.base, "apiKey": cfg.key, "model": cfg.image_model,
+        "apiMode": std::env::var("GIS_TEST_IMAGE_MODE").unwrap_or_else(|_| "images".into()),
+        "prompt": args["prompt"], "images": [], "n": 1, "size": "1024x1024", "timeoutSecs": 600
+    })).unwrap();
+    let images = ai::run_image_request(&image_req).await.expect("生图失败");
+    assert_eq!(images.len(), 1);
+    assert!(images[0].bytes.len() > 1024);
+    req.messages.extend([
+        serde_json::json!({ "role": "assistant", "content": explanation, "tool_calls": [{
+            "id": calls[0].id, "type": "function", "function": { "name": calls[0].name, "arguments": calls[0].arguments }
+        }] }),
+        serde_json::json!({ "role": "tool", "tool_call_id": calls[0].id, "content": "已生成 1 张图片。" }),
+        serde_json::json!({ "role": "user", "content": [
+            { "type": "text", "text": "以下是图像工具实际输出，请检查是否满足我的要求。用粗体标出检查项，简短回复。" },
+            { "type": "image_url", "image_url": { "url": ai::to_data_url(&images[0].mime, &images[0].bytes) } }
+        ] }),
+    ]);
+    req.tools = None;
+    req.tool_choice = None;
+    req.max_tokens = Some(2048);
+    let review = ai::chat_once(req).await.expect("回图检查失败");
+    assert!(!review.trim().is_empty());
+    let output = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/live-image-review");
+    std::fs::create_dir_all(&output).unwrap();
+    std::fs::write(output.join("responses.json"), serde_json::to_vec(&serde_json::json!({ "explanation": explanation, "review": review })).unwrap()).unwrap();
+    println!("{} -> {} -> 回图检查完成；图片 {} bytes，检查文本 {} chars", cfg.chat_model, cfg.image_model, images[0].bytes.len(), review.chars().count());
+}
+
 /// 兼容性兜底：故意发一个模型不支持的参数，请求应当自动降级并成功。
 #[tokio::test]
 async fn unsupported_parameter_is_retried() {

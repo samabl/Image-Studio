@@ -76,7 +76,9 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path dist-artifacts | Out-Null
           Copy-Item src-tauri/target/release/gpt-image-studio.exe dist-artifacts/ -ErrorAction Stop
-          Copy-Item src-tauri/target/release/bundle/nsis/*.exe dist-artifacts/ -ErrorAction Stop
+          $bundleConfig = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+          $installer = "src-tauri/target/release/bundle/nsis/$($bundleConfig.productName)_$($bundleConfig.version)_x64-setup.exe"
+          Copy-Item -LiteralPath $installer -Destination dist-artifacts/ -ErrorAction Stop
           Get-ChildItem dist-artifacts | Format-Table Name, Length
 
       - name: 上传产物
@@ -234,6 +236,14 @@ jobs:
       - name: 校验 AndroidManifest 补丁逻辑
         shell: pwsh
         run: pwsh -File scripts/test-android-manifest.ps1
+
+      - name: 校验 Android 安全区域安装
+        shell: pwsh
+        run: pwsh -File scripts/test-android-activity.ps1
+
+      - name: 校验 Android 后台服务安装
+        shell: pwsh
+        run: pwsh -File scripts/test-android-background.ps1
 
       # 准备签名材料。没配 secrets 就生成一把一次性 keystore，
       # 保证产物可安装（代价是每次构建签名不同、无法覆盖安装）。

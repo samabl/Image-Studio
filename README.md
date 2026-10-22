@@ -271,7 +271,7 @@ cargo test --manifest-path src-tauri/Cargo.toml --test live_gateway list_models 
 pnpm tauri:build
 ```
 
-- 安装包（NSIS）：`src-tauri/target/release/bundle/nsis/GPT Image Studio_0.2.0_x64-setup.exe`
+- 安装包（NSIS）：`src-tauri/target/release/bundle/nsis/GPT Image Studio_0.2.1_x64-setup.exe`
 - 免安装可执行文件：`src-tauri/target/release/gpt-image-studio.exe`（前端已内嵌，双击即用）
 - 安装模式为 `currentUser`（免管理员），语言含简体中文
 - 若目标机器缺少 WebView2，安装包会走 `downloadBootstrapper` 自动下载
@@ -323,13 +323,16 @@ pnpm tauri android build --ci       # 产出 AAB（上架 Google Play 用）
 pnpm android:dev
 ```
 
-`scripts/setup-android.ps1` 会自动完成四件事：
+`scripts/setup-android.ps1` 会自动完成五件事：
 
 1. 校验 `JAVA_HOME` / `ANDROID_HOME` / `NDK_HOME`，缺什么就给出具体的安装命令；
 2. 补齐四个 Rust 交叉编译目标（`aarch64` / `armv7` / `i686` / `x86_64-linux-android`）；
 3. 调用 `pnpm tauri android init` 生成 `src-tauri/gen/android/`；
 4. 生成 `network_security_config.xml` 并注入 `AndroidManifest.xml`
    —— **内网 `http://` 网关在 Android 9+ 上默认被拦截，这一步是必须的**。
+5. 从 `src-tauri/android/` 安装原生安全区域及后台任务服务，避开状态栏、刘海、导航栏和软键盘；生成工程的 package 自动保留。浏览器/iOS 页面另由 CSS `safe-area-inset` 处理。后台服务的通知、唤醒锁和数据同步权限自动加入生成的 Manifest。
+
+Android 的「设置 → 后台与锁屏任务」可查看电池优化及通知权限，并打开系统授权页面。完整的对话、生图、回图检查共用一个后台任务，完成或取消后结束；并发会话分别计数。锁屏运行需允许应用忽略电池优化，任务通知也建议开启。
 
 脚本可重复执行，已打过的补丁不会重复写入。
 
@@ -540,4 +543,4 @@ Android 侧已按 Tauri 2 规范完成全部工程级配置（`tauri.conf.json` 
 - 多图组合（一次传多张参考图）依赖网关支持 `image[]` 字段，部分网关只接受单张。
 - 原生 Gemini 和兼容 Chat 出图不支持蒙版参数，局部重绘请使用 `images` 协议。Gemini 的数量参数通过多次请求实现；兼容 Chat 的数量由模型决定。
 
-本次功能的离线回归：`pnpm test:frontend` 与 `cargo test --manifest-path src-tauri/Cargo.toml --test protocols`。原生协议联调使用 `tests/native_gateway.rs`，分别设置 `GIS_TEST_NATIVE=1` 或 `GIS_TEST_MULTI_IMAGE=1` 后运行；多图出图可通过 `GIS_TEST_IMAGE_MODE=images|gemini` 选择。项目内的 `test api.md` 已加入 Git 忽略列表。
+本次功能的离线回归：`pnpm test:frontend`、`pnpm test:android` 与 `cargo test --manifest-path src-tauri/Cargo.toml --test protocols`。Markdown 粗体/斜体及逐字流式渲染在限时子进程中验证，防止死循环耗尽内存。原生协议联调使用 `tests/native_gateway.rs`，分别设置 `GIS_TEST_NATIVE=1` 或 `GIS_TEST_MULTI_IMAGE=1` 后运行；多图出图可通过 `GIS_TEST_IMAGE_MODE=images|gemini` 选择。`GIS_TEST_REVIEW=1` 可启用 `tests/live_gateway.rs` 的 `chat_image_review_roundtrip`，验证对话工具调用、生图和实际回图检查（会产生 API 费用）。项目内的 `test api.md` 已加入 Git 忽略列表。

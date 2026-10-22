@@ -80,6 +80,9 @@ select {
 .app {
   display: flex;
   height: 100%;
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-left: env(safe-area-inset-left, 0px);
+  padding-right: env(safe-area-inset-right, 0px);
   overflow: hidden;
 }
 
@@ -1076,7 +1079,7 @@ select.input {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  padding: 24px;
+  padding: calc(24px + env(safe-area-inset-top, 0px)) calc(24px + env(safe-area-inset-right, 0px)) calc(24px + env(safe-area-inset-bottom, 0px)) calc(24px + env(safe-area-inset-left, 0px));
   gap: 14px;
 }
 
@@ -1097,8 +1100,8 @@ select.input {
 
 .lightbox-close {
   position: absolute;
-  top: 16px;
-  right: 18px;
+  top: calc(16px + env(safe-area-inset-top, 0px));
+  right: calc(18px + env(safe-area-inset-right, 0px));
 }
 
 .toasts {

@@ -1,10 +1,10 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Field, Switch } from "./ui";
 import { ModelPicker } from "./ModelPicker";
 import { useConfig, useGallery, useToast } from "../lib/store";
-import { listModels } from "../lib/api";
+import { backgroundTaskStatus, configureBackgroundTasks, listModels } from "../lib/api";
 import { openLocalPath } from "../lib/shell";
-import { isDesktop } from "../lib/platform";
+import { isAndroid, isDesktop } from "../lib/platform";
 import type { ChatProtocol } from "../types";
 
 export function SettingsView() {
@@ -12,6 +12,20 @@ export function SettingsView() {
   const { patchChat, patchImage, patchLinkage, patchUi, flush, resetAll, dir } = useConfig();
   const note = useToast((s) => s.push);
   const [loading, setLoading] = useState<"chat" | "image" | null>(null);
+  const [background, setBackground] = useState<Awaited<ReturnType<typeof backgroundTaskStatus>> | null>(null);
+  useEffect(() => {
+    if (!isAndroid) return;
+    let mounted = true;
+    const refresh = () => { void backgroundTaskStatus().then((status) => { if (mounted) setBackground(status); }).catch(() => undefined); };
+    refresh();
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", refresh);
+    return () => {
+      mounted = false;
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", refresh);
+    };
+  }, []);
 
   if (!cfg) return null;
 
@@ -41,6 +55,21 @@ export function SettingsView() {
   return (
     <div className="settings">
       <div className="settings-inner">
+        {isAndroid && (
+          <div className="card">
+            <div className="card-title">后台与锁屏任务</div>
+            <div className="hint" style={{ marginBottom: 10 }}>
+              对话、生图和回图检查运行期间会显示任务通知。为减少熄屏后网络被系统暂停，请允许应用忽略电池优化，并开启任务通知。
+            </div>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
+              <span className="chip">锁屏运行：{background ? background.batteryOptimizationIgnored ? "已允许" : "待允许" : "读取中"}</span>
+              <span className="chip">任务通知：{background ? background.notificationsEnabled ? "已开启" : "未开启" : "读取中"}</span>
+            </div>
+            <button type="button" className="btn" onClick={() => void configureBackgroundTasks().catch((err: Error) => note("error", err.message))}>
+              {!background?.batteryOptimizationIgnored ? "允许锁屏继续运行" : !background.notificationsEnabled ? "开启任务通知" : "后台权限设置"}
+            </button>
+          </div>
+        )}
         {/* ---------------- 对话模型 ---------------- */}
         <div className="card">
           <div className="card-title">
