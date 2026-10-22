@@ -5,6 +5,10 @@ import android.app.Activity
 import android.content.Intent
 import android.content.ContentValues
 import android.content.pm.PackageManager
+import android.content.res.Configuration
+import android.graphics.Color
+import android.view.ViewGroup
+import androidx.core.view.WindowInsetsControllerCompat
 import android.net.Uri
 import android.os.Build
 import android.os.PowerManager
@@ -40,8 +44,56 @@ class AlbumArgs {
   lateinit var fileName: String
 }
 
+@InvokeArg
+class ThemeArgs {
+  lateinit var theme: String
+  lateinit var mode: String
+}
+
 @TauriPlugin(permissions = [Permission(strings = [Manifest.permission.WRITE_EXTERNAL_STORAGE], alias = "legacyAlbum")])
 class BackgroundTasksPlugin(private val activity: Activity) : Plugin(activity) {
+  companion object {
+    fun resolvedTheme(activity: Activity): String {
+      val saved = activity.getSharedPreferences("image-studio-ui", Activity.MODE_PRIVATE).getString("mode", "system")
+      if (saved == "light" || saved == "dark") return saved
+      return if ((activity.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES) "dark" else "light"
+    }
+
+    fun backgroundColor(activity: Activity): Int =
+      if (resolvedTheme(activity) == "light") Color.rgb(246, 250, 248) else Color.rgb(10, 12, 19)
+
+    @Suppress("DEPRECATION")
+    fun applyTheme(activity: Activity, theme: String) {
+      val light = theme == "light"
+      val color = if (light) Color.rgb(246, 250, 248) else Color.rgb(10, 12, 19)
+      val window = activity.window
+      WindowInsetsControllerCompat(window, window.decorView).apply {
+        isAppearanceLightStatusBars = light
+        isAppearanceLightNavigationBars = light
+      }
+      window.navigationBarColor = color
+      window.decorView.setBackgroundColor(color)
+      val content = activity.findViewById<ViewGroup>(android.R.id.content)
+      content?.setBackgroundColor(color)
+      content?.getChildAt(0)?.setBackgroundColor(color)
+    }
+  }
+
+  @Command
+  fun setTheme(invoke: Invoke) {
+    try {
+      val args = invoke.parseArgs(ThemeArgs::class.java)
+      val theme = args.theme
+      require(theme == "light" || theme == "dark") { "不支持的主题" }
+      require(args.mode in listOf("light", "dark", "system")) { "不支持的主题模式" }
+      activity.runOnUiThread {
+        activity.getSharedPreferences("image-studio-ui", Activity.MODE_PRIVATE).edit().putString("mode", args.mode).apply()
+        applyTheme(activity, theme)
+        invoke.resolve()
+      }
+    } catch (error: Exception) { invoke.reject(error.message ?: "主题切换失败") }
+  }
+
   @Command
   fun saveToAlbum(invoke: Invoke) {
     if (Build.VERSION.SDK_INT < 29 && getPermissionState("legacyAlbum") != PermissionState.GRANTED) {

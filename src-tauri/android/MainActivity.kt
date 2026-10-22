@@ -11,10 +11,12 @@ import androidx.activity.OnBackPressedCallback
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import app.imagestudio.background.BackgroundTasksPlugin
 
 class MainActivity : TauriActivity() {
   override fun onWebViewCreate(webView: WebView) {
     super.onWebViewCreate(webView)
+    webView.setBackgroundColor(BackgroundTasksPlugin.backgroundColor(this))
     onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
       override fun handleOnBackPressed() {
         if (ViewCompat.getRootWindowInsets(webView)?.isVisible(WindowInsetsCompat.Type.ime()) == true) {
@@ -36,6 +38,7 @@ class MainActivity : TauriActivity() {
       navigationBarStyle = SystemBarStyle.dark(Color.rgb(10, 12, 19))
     )
     super.onCreate(savedInstanceState)
+    BackgroundTasksPlugin.applyTheme(this, BackgroundTasksPlugin.resolvedTheme(this))
   }
 
   override fun setContentView(view: View?) {
@@ -46,7 +49,7 @@ class MainActivity : TauriActivity() {
     // WebView 的 safe-area-inset 在部分 Android 版本上为零。原生容器先避开
     // 状态栏、刘海、导航栏和键盘，让页面与全屏预览始终位于可用区域。
     val content = FrameLayout(this).apply {
-      setBackgroundColor(Color.rgb(10, 12, 19))
+      setBackgroundColor(BackgroundTasksPlugin.backgroundColor(this@MainActivity))
       addView(view, FrameLayout.LayoutParams(
         FrameLayout.LayoutParams.MATCH_PARENT,
         FrameLayout.LayoutParams.MATCH_PARENT

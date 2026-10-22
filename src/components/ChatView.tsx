@@ -7,7 +7,9 @@ import { fileToAttachment } from "../lib/image";
 import { SaveImageButton } from "./SaveImageButton";
 import { ImageToolDetails } from "./ImageToolDetails";
 import { configuredImageModels } from "../lib/imageModels";
-import type { ChatAttachment, ChatMessage, GeneratedRef } from "../types";
+import { GOAL_LEVELS, goalSettings } from "../lib/goal";
+import { GoalReport } from "./GoalReport";
+import type { ChatAttachment, ChatMessage, GeneratedRef, GoalLevel } from "../types";
 
 const SUGGESTIONS = [
   "帮我画一只在雨夜街头的赛博朋克猫，霓虹灯反射在积水上",
@@ -64,6 +66,8 @@ export function ChatView() {
   const ready = channelReady("chat");
   const imageModels = cfg ? configuredImageModels(cfg.image) : [];
   const selectedImageModel = session?.imageModel ?? "";
+  const goal = goalSettings(session?.goal);
+  const toolsReady = !!cfg?.linkage.enabled && !!cfg.linkage.useTools;
 
   const submit = () => {
     const value = text.trim();
@@ -133,6 +137,23 @@ export function ChatView() {
           <button type="button" className="btn sm ghost" onClick={() => useConfig.getState().setTab("settings")}>配置模型池</button>
         </div>
       )}
+
+      {session && <div className="chat-goal">
+        <button type="button" role="switch" aria-checked={goal.enabled} className={`btn sm goal-toggle${goal.enabled ? " active" : ""}`}
+          disabled={busy || (!toolsReady && !goal.enabled)}
+          onClick={() => useSessions.getState().setGoal({ enabled: !goal.enabled })}>Goal 自动修正</button>
+        {goal.enabled && <>
+          <label>验收等级<select className="input" aria-label="Goal 验收等级" disabled={busy} value={goal.level}
+            onChange={(e) => { const level = e.target.value as GoalLevel; useSessions.getState().setGoal({ level, maxCorrections: GOAL_LEVELS[level].corrections }); }}>
+            {Object.entries(GOAL_LEVELS).map(([value, entry]) => <option key={value} value={value}>{entry.label}</option>)}
+          </select></label>
+          <label>最多修正<input className="input" type="number" min={0} max={20} aria-label="Goal 最多修正次数" disabled={busy} value={goal.maxCorrections}
+            onChange={(e) => useSessions.getState().setGoal({ maxCorrections: e.target.valueAsNumber })} /></label>
+          <span className="hint" title={GOAL_LEVELS[goal.level].description}>检查实际回图后自主修正；失败时由 Chat 决定重试或换模型。</span>
+        </>}
+        {!toolsReady && <span className="hint">请先在设置中启用图像联动和工具调用。</span>}
+      </div>}
+      {run?.goalProgress && <div className="goal-running"><GoalReport progress={run.goalProgress} /></div>}
 
       {showSessions && (
         <div
@@ -368,13 +389,13 @@ function MessageRow({ message, live }: { message: ChatMessage; live?: boolean })
         <div className="avatar ai">🖼</div>
         <div className="bubble">
           <div className="bubble-head">
-            <span className="who">图像工具</span>
+            <span className="who">{message.goalReview ? "Goal 验收" : "图像工具"}</span>
             {message.pending && <Spinner />}
           </div>
           <div className="bubble-body">
             {message.pending ? (
               <span style={{ color: "var(--text-dim)" }}>正在调用图像模型…</span>
-            ) : (
+            ) : message.goalReview ? <GoalReport review={message.goalReview} /> : (
               <Markdown source={message.content} />
             )}
             {imgs.length > 0 && <GeneratedImages images={imgs} />}
@@ -414,7 +435,8 @@ function MessageRow({ message, live }: { message: ChatMessage; live?: boolean })
             </details>
           )}
 
-          {message.content ? (
+          {message.goalProgress && <GoalReport progress={message.goalProgress} />}
+          {message.content && !message.goalProgress ? (
             <div className={live && !message.content.endsWith("\n") ? "cursor" : undefined}>
               <Markdown source={message.content} />
             </div>
@@ -426,7 +448,7 @@ function MessageRow({ message, live }: { message: ChatMessage; live?: boolean })
 
           {message.toolCalls && message.toolCalls.length > 0 && !live && (
             <div className="image-tool-list">
-              {message.toolCalls.map((tc) => (
+              {message.toolCalls.filter((tc) => tc.name !== "review_goal").map((tc) => (
                 <ImageToolDetails key={tc.id} call={tc} labels={tc.sourceLabels} sentPrompt={tc.sentPrompt} />
               ))}
             </div>

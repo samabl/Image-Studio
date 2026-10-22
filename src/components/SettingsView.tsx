@@ -7,7 +7,8 @@ import { useConfig, useGallery, useToast } from "../lib/store";
 import { backgroundTaskStatus, configureBackgroundTasks, listModels } from "../lib/api";
 import { openLocalPath } from "../lib/shell";
 import { isAndroid, isDesktop } from "../lib/platform";
-import type { ChatProtocol, ImageApiMode } from "../types";
+import type { ChatProtocol, ImageApiMode, ThemeMode } from "../types";
+import { normalizeTheme, THEME_LABELS } from "../lib/theme";
 
 export function SettingsView() {
   const cfg = useConfig((s) => s.config);
@@ -387,6 +388,12 @@ export function SettingsView() {
         <div className="card">
           <div className="card-title">🖥 界面</div>
           <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+            <Field label="主题" hint="跟随系统会随设备外观自动切换；顶部也可快速切换。">
+              <select className="input" aria-label="界面主题" value={normalizeTheme(cfg.ui.theme)}
+                onChange={(e) => { patchUi({ theme: e.target.value as ThemeMode }); void flush(); }}>
+                {Object.entries(THEME_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+              </select>
+            </Field>
             <Switch
               checked={cfg.ui.sendOnEnter}
               onChange={(v) => {

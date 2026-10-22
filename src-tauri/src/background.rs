@@ -97,6 +97,27 @@ pub async fn configure(app: &AppHandle) -> AppResult<()> {
     Ok(())
 }
 
+pub async fn set_theme(app: &AppHandle, theme: String, mode: String) -> AppResult<()> {
+    if !matches!(theme.as_str(), "light" | "dark") || !matches!(mode.as_str(), "light" | "dark" | "system") {
+        return Err(crate::error::AppError::other("不支持的主题"));
+    }
+    #[cfg(target_os = "android")]
+    {
+        use tauri::Manager;
+        let handle = app.state::<BackgroundTasks<tauri::Wry>>().0.clone();
+        handle
+            .run_mobile_plugin_async::<serde_json::Value>(
+                "setTheme",
+                serde_json::json!({ "theme": theme, "mode": mode }),
+            )
+            .await
+            .map_err(|e| crate::error::AppError::other(e.to_string()))?;
+    }
+    #[cfg(not(target_os = "android"))]
+    let _ = app;
+    Ok(())
+}
+
 pub async fn save_to_album(
     app: &AppHandle,
     data_url: String,

@@ -8,6 +8,7 @@ import type {
   GalleryItem,
   ImageRequest,
   SaveMeta,
+  ThemeMode,
 } from "../types";
 
 /** 统一的调用错误：把 Rust 侧字符串错误包成 Error，便于 `catch (e) { e.message }`。 */
@@ -24,6 +25,7 @@ export async function call<T>(cmd: string, args?: Record<string, unknown>): Prom
 export const getConfig = () => call<AppConfig>("get_config");
 export const saveConfig = (config: AppConfig) => call<AppConfig>("save_config", { config });
 export const resetConfig = () => call<AppConfig>("reset_config");
+export const setNativeTheme = (theme: "light" | "dark", mode: ThemeMode) => call<void>("set_native_theme", { theme, mode });
 export const dataDir = () => call<string>("data_dir");
 
 // --- 状态存取 -------------------------------------------------------------

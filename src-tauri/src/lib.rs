@@ -196,6 +196,11 @@ async fn save_image_to_album(
     background::save_to_album(&app, data_url, file_name).await
 }
 
+#[tauri::command]
+async fn set_native_theme(app: AppHandle, theme: String, mode: String) -> AppResult<()> {
+    background::set_theme(&app, theme, mode).await
+}
+
 // ---------------------------------------------------------------------------
 // 图像
 // ---------------------------------------------------------------------------
@@ -378,6 +383,7 @@ pub fn run() {
             background_task_status,
             background_task_configure,
             save_image_to_album,
+            set_native_theme,
             generate_image,
             gallery_list,
             gallery_delete,

@@ -166,6 +166,7 @@ impl Default for LinkageConfig {
 pub struct UiConfig {
     pub language: String,
     pub send_on_enter: bool,
+    pub theme: String,
 }
 
 impl Default for UiConfig {
@@ -173,6 +174,7 @@ impl Default for UiConfig {
         Self {
             language: "zh".into(),
             send_on_enter: true,
+            theme: "system".into(),
         }
     }
 }
@@ -243,4 +245,26 @@ pub fn save_config(app: &AppHandle, cfg: &AppConfig) -> AppResult<()> {
     fs::write(&tmp, data)?;
     fs::rename(&tmp, &path)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppConfig;
+
+    #[test]
+    fn old_config_keeps_connections_and_new_theme_survives_serialization() {
+        let mut old = serde_json::to_value(AppConfig::default()).unwrap();
+        old["ui"].as_object_mut().unwrap().remove("theme");
+        old["chat"]["model"] = "existing-chat-model".into();
+        old["chat"]["apiKey"] = "test-key".into();
+        let mut config: AppConfig = serde_json::from_value(old).unwrap();
+        assert_eq!(config.ui.theme, "system");
+        assert_eq!(config.chat.model, "existing-chat-model");
+        assert_eq!(config.chat.api_key, "test-key");
+        config.ui.theme = "light".into();
+        let saved = serde_json::to_string(&config).unwrap();
+        let restored: AppConfig = serde_json::from_str(&saved).unwrap();
+        assert_eq!(restored.ui.theme, "light");
+        assert_eq!(restored.chat.api_key, "test-key");
+    }
 }

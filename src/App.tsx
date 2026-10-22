@@ -16,10 +16,11 @@ import {
   channelReady,
   type TabKey,
 } from "./lib/store";
-import { importImageFile } from "./lib/api";
+import { importImageFile, setNativeTheme } from "./lib/api";
 import { fileToAttachment } from "./lib/image";
 import { isAndroid, supportsFileDrop } from "./lib/platform";
 import { createBackHandler } from "./lib/androidBack";
+import { cachedTheme, nextTheme, normalizeTheme, THEME_LABELS, watchTheme } from "./lib/theme";
 
 const NAV: { key: TabKey; icon: string; label: string; title: string; sub: string }[] = [
   { key: "chat", icon: "💬", label: "对话", title: "AI 对话", sub: "多轮聊天 · 看图 · 驱动图像模型" },
@@ -35,6 +36,12 @@ export default function App() {
   const cfg = useConfig((s) => s.config);
   const [bootError, setBootError] = useState<string | null>(null);
   const [dropping, setDropping] = useState(false);
+  const theme = cfg ? normalizeTheme(cfg.ui.theme) : cachedTheme();
+  const next = nextTheme(theme);
+
+  useEffect(() => watchTheme(theme, (resolved) => {
+    if (isAndroid) void setNativeTheme(resolved, theme).catch(() => undefined);
+  }), [theme]);
 
   useEffect(() => {
     bootstrap().catch((err) => setBootError((err as Error).message));
@@ -212,6 +219,13 @@ export default function App() {
           </div>
           <div className="sub">{active.sub}</div>
           <div className="topbar-right">
+            <button type="button" className="btn sm ghost theme-toggle"
+              aria-label={`主题：${THEME_LABELS[theme]}，切换为${THEME_LABELS[next]}`}
+              title={`当前：${THEME_LABELS[theme]}；点击切换为${THEME_LABELS[next]}`}
+              onClick={() => { useConfig.getState().patchUi({ theme: next }); void useConfig.getState().flush(); }}>
+              <span aria-hidden="true">{theme === "light" ? "☀" : theme === "dark" ? "☾" : "◐"}</span>
+              <span className="theme-toggle-label">{THEME_LABELS[theme]}</span>
+            </button>
             {tab === "gallery" && (
               <button
                 type="button"

@@ -4,6 +4,7 @@ import { renderMask, uid, type Stroke } from "./image";
 import { attachmentLabel, conversationMessages, imageToolInstructions, selectImageSources, userImageContent } from "./chat";
 import { canEditImageModel, configuredImageModels, defaultImageConnection, imageModelConnection, imageModelInstructions, selectImageModel } from "./imageModels";
 import { imageToolSize } from "./imageSize";
+import { goalInstructions, goalReviewTool, goalSettings, imageFailureMessage, parseGoalReview } from "./goal";
 import type {
   AppConfig,
   ChatAttachment,
@@ -16,6 +17,9 @@ import type {
   LinkageConfig,
   ToolCall,
   UiConfig,
+  GoalProgress,
+  GoalSettings,
+  ImageRequest,
 } from "../types";
 
 // ---------------------------------------------------------------------------
@@ -556,6 +560,7 @@ export interface SessionRun {
   streaming: StreamingState | null;
   toolNote: string;
   cancel: (() => void) | null;
+  goalProgress?: GoalProgress;
 }
 
 interface SessionState {
@@ -575,6 +580,7 @@ interface SessionState {
   moveDraftAtt: (id: string, offset: number) => void;
   clearDraftAtts: () => void;
   setImageModel: (model: string) => void;
+  setGoal: (patch: Partial<GoalSettings>) => void;
   send: (text: string, attachments: ChatAttachment[]) => Promise<void>;
   stop: (sessionId?: string) => void;
   regenerate: () => Promise<void>;
@@ -655,6 +661,21 @@ export function imageTools(config?: ImageConfig, pinned = ""): unknown[] {
         },
       },
     }] : []),
+    {
+      type: "function",
+      function: {
+        name: "retry_image",
+        description: "由 Chat 决定重试失败的生图/编辑调用，或改用其他已启用模型。自动保留失败请求的完整指令、全部素材和顺序、尺寸及输出参数。只接受当前轮实际失败的调用 ID。",
+        parameters: {
+          type: "object",
+          properties: {
+            failed_call_id: { type: "string", description: "失败工具响应中给出的 failed_call_id。" },
+            model: modelParameter,
+          },
+          required: ["failed_call_id", "model"],
+        },
+      },
+    },
   ];
 }
 
@@ -683,6 +704,10 @@ export const useSessions = create<SessionState>((set, get) => {
     clearDraftAtts: () => draft({ draftAtts: [] }),
     setImageModel: (imageModel) => {
       if (get().currentId && !get().runs[get().currentId!]) draft({ imageModel });
+    },
+    setGoal: (patch) => {
+      const session = get().current();
+      if (session && !get().runs[session.id]) draft({ goal: goalSettings({ ...goalSettings(session.goal), ...patch }) });
     },
     init: async () => {
       try {
@@ -738,6 +763,9 @@ export const useSessions = create<SessionState>((set, get) => {
       const session = get().current();
       if (!session || get().runs[session.id]) return;
       if (!channelReady("chat")) { toast.error("请先配置对话模型"); return; }
+      if (goalSettings(session.goal).enabled && (!useConfig.getState().config?.linkage.enabled || !useConfig.getState().config?.linkage.useTools)) {
+        toast.error("Goal 模式需要在设置中启用图像联动和工具调用"); return;
+      }
       const userMsg: ChatMessage = { id: uid("m"), role: "user", content: text, attachments, createdAt: Date.now() };
       set({ sessions: get().sessions.map((s) => s.id === session.id ? {
         ...s, title: s.messages.length ? s.title : text.trim().slice(0, 24) || "图片对话",
@@ -764,11 +792,23 @@ async function runTurn(sessionId: string, set: Setter, get: () => SessionState):
   const cfg = useConfig.getState().config;
   if (!cfg || get().runs[sessionId]) return;
   const runId = uid("run");
-  const pinnedImageModel = get().sessions.find((session) => session.id === sessionId)?.imageModel ?? "";
+  const initialSession = get().sessions.find((session) => session.id === sessionId);
+  const pinnedImageModel = initialSession?.imageModel ?? "";
+  const goal = goalSettings(initialSession?.goal);
+  const original = [...(initialSession?.messages ?? [])].reverse().find((m) => m.role === "user")?.content ?? "";
+  const maxRounds = goal.enabled ? 6 + goal.maxCorrections * 3 : MAX_TOOL_ROUNDS;
+  const maxImageCalls = goal.enabled ? 4 + goal.maxCorrections * 4 : 16;
+  const progress: GoalProgress = { status: "working", level: goal.level, maxCorrections: goal.maxCorrections, corrections: 0, attempts: 0 };
+  type PreparedImage = { request: ImageRequest; sourceLabels: string[]; sourceGalleryId?: string; stage: "asset" | "final"; retryOf?: string };
+  const failedRequests = new Map<string, PreparedImage>();
+  let lastFinalIds: string[] = [];
+  let inCorrection = false;
+  let terminal = false;
+  let continuation = "";
   let stopped = false;
   let abort: (() => void) | null = null;
   const cancel = () => { stopped = true; abort?.(); };
-  set((state) => ({ runs: { ...state.runs, [sessionId]: { runId, streaming: null, toolNote: "", cancel } } }));
+  set((state) => ({ runs: { ...state.runs, [sessionId]: { runId, streaming: null, toolNote: "", cancel, ...(goal.enabled ? { goalProgress: { ...progress } } : {}) } } }));
   const active = () => !stopped && get().runs[sessionId]?.runId === runId && get().sessions.some((s) => s.id === sessionId);
   const patchRun = (patch: Partial<SessionRun>) => {
     if (get().runs[sessionId]?.runId !== runId) return;
@@ -777,13 +817,16 @@ async function runTurn(sessionId: string, set: Setter, get: () => SessionState):
   const readSession = () => get().sessions.find((s) => s.id === sessionId);
   const append = (msg: ChatMessage) => set((state) => ({ sessions: state.sessions.map((s) => s.id === sessionId ? { ...s, messages: [...s.messages, msg], updatedAt: Date.now() } : s) }));
   const update = (id: string, patch: Partial<ChatMessage>) => set((state) => ({ sessions: state.sessions.map((s) => s.id === sessionId ? { ...s, messages: s.messages.map((m) => m.id === id ? { ...m, ...patch } : m) } : s) }));
+  const syncGoal = () => { if (goal.enabled) patchRun({ goalProgress: { ...progress } }); };
+  const endGoal = (status: GoalProgress["status"], summary: string) => { progress.status = status; progress.summary = summary; terminal = true; syncGoal(); };
   const background = api.startBackgroundTask();
   try {
     if (background) await background.ready;
-    for (let round = 0; round <= MAX_TOOL_ROUNDS && active(); round += 1) {
+    for (let round = 0; round <= maxRounds && active(); round += 1) {
       const session = readSession();
       if (!session) break;
-      const useTools = cfg.linkage.enabled && cfg.linkage.useTools && round < MAX_TOOL_ROUNDS;
+      if (goal.enabled && !terminal && round === maxRounds) endGoal("limit", "已达到自动执行轮次上限，目标尚未完成验收。");
+      const useTools = cfg.linkage.enabled && cfg.linkage.useTools && round < maxRounds && !terminal;
       const history = conversationMessages(session.messages);
       const messageId = uid("m");
       patchRun({ streaming: { messageId, content: "", reasoning: "", toolCalls: [] }, toolNote: round ? "正在检查图像结果…" : "" });
@@ -803,10 +846,12 @@ async function runTurn(sessionId: string, set: Setter, get: () => SessionState):
           messages: [
             ...(cfg.chat.systemPrompt.trim() ? [{ role: "system", content: cfg.chat.systemPrompt }] : []),
             ...(cfg.linkage.enabled && cfg.linkage.useTools ? [{ role: "system", content: `${imageToolInstructions(session.messages)}\n\n${imageModelInstructions(cfg.image, pinnedImageModel)}` }] : []),
+            ...(goal.enabled ? [{ role: "system", content: `${goalInstructions(goal, progress.corrections)}${terminal ? `\n自动执行已结束：${progress.summary}。诚实总结已完成成果和未解决问题，不再调用工具。` : ""}` }] : []),
             ...history,
+            ...(continuation ? [{ role: "user", content: continuation }] : []),
           ],
           temperature: cfg.chat.temperature, maxTokens: cfg.chat.maxTokens,
-          tools: useTools ? imageTools(cfg.image, pinnedImageModel) : null, timeoutSecs: cfg.chat.timeoutSecs,
+          tools: useTools ? [...imageTools(cfg.image, pinnedImageModel), ...(goal.enabled ? [goalReviewTool] : [])] : null, timeoutSecs: cfg.chat.timeoutSecs,
         }, (event) => {
           if (settled || !active()) return;
           const cur = get().runs[sessionId]?.streaming;
@@ -824,71 +869,117 @@ async function runTurn(sessionId: string, set: Setter, get: () => SessionState):
       if (!streamed) break;
       // 停止时保留已生成文字，丢弃未执行的工具调用。
       const assistant: ChatMessage = { id: messageId, role: "assistant", content: streamed.content.trim(), reasoning: streamed.reasoning.trim() || undefined,
-        toolCalls: final.ok && streamed.toolCalls.length ? streamed.toolCalls : undefined,
+        toolCalls: final.ok && useTools && streamed.toolCalls.length ? streamed.toolCalls : undefined,
         model: cfg.chat.model, createdAt: Date.now(), ...(final.ok ? {} : { error: final.error }) };
       // 以同一个 key 原子替换流式消息，避免消息短暂消失或折叠状态被重置。
       set((state) => ({
         sessions: state.sessions.map((s) => s.id === sessionId ? { ...s, messages: [...s.messages, assistant], updatedAt: Date.now() } : s),
         runs: state.runs[sessionId]?.runId === runId ? { ...state.runs, [sessionId]: { ...state.runs[sessionId], streaming: null } } : state.runs,
       }));
-      if (!final.ok || !active() || !streamed.toolCalls.length) break;
+      if (!final.ok || !active()) {
+        if (goal.enabled && !terminal && !stopped) endGoal("error", final.error || "对话请求未完成");
+        break;
+      }
+      if (!useTools) break;
+      if (!streamed.toolCalls.length) {
+        if (!goal.enabled || terminal) break;
+        continuation = "Goal 仍在运行。请检查实际成果并调用 review_goal 逐项验收；不满足则自主修正，遇到不能解决的障碍则用 blocked 说明。不能只用文字声称已经满足。";
+        continue;
+      }
+      continuation = "";
       const conv = readSession();
       if (!conv) break;
-      const original = [...conv.messages].reverse().find((m) => m.role === "user")?.content ?? "";
       for (const call of streamed.toolCalls) {
         const toolId = uid("m");
         append({ id: toolId, role: "tool", content: "", toolCallId: call.id, pending: true, createdAt: Date.now() });
+        let prepared: PreparedImage | undefined;
         try {
           if (!active()) throw new Error("已停止");
-          if (call.name !== "generate_image" && call.name !== "edit_image") throw new Error(`未知工具：${call.name}`);
+          if (terminal) { update(toolId, { pending: false, content: "Goal 自动执行已经结束，此调用未执行。" }); continue; }
           const args = JSON.parse(call.arguments || "{}") as Record<string, unknown>;
-          const prompt = String(args.prompt ?? "").trim();
-          if (!prompt) throw new Error("模型没有给出图像指令");
-          const imageModel = selectImageModel(cfg.image, args.model, pinnedImageModel);
-          const connection = imageModelConnection(cfg.image, imageModel);
-          if (!connection.baseUrl || !connection.apiKey) throw new Error(`请先配置生图模型 ${imageModel.id} 的服务地址和 API Key`);
-          const sources = call.name === "edit_image" ? selectImageSources(conv.messages, args.source_image_ids) :
-            args.source_image_ids !== undefined ? selectImageSources(conv.messages, args.source_image_ids) : [];
-          if ((call.name === "edit_image" || sources.length) && !canEditImageModel(imageModel)) throw new Error(`生图模型 ${imageModel.id} 已设为仅文生图，请选择支持参考图/合成的模型`);
-          if (call.name === "edit_image" && !sources.length) throw new Error("没有选择可用的参考图片");
-          const images = await Promise.all(sources.map((image) => image.dataUrl || (image.path ? api.readImageDataUrl(image.path) : Promise.reject(new Error("参考图片无法读取")))));
-          if (!active()) throw new Error("已停止");
-          const sourceLabels = sources.map((source) => source.label);
-          const imageStage = args.stage === "asset" ? "asset" : "final";
-          const outputSize = imageToolSize(args.size, cfg.image.size);
-          const sentPrompt = `${prompt}\n\n${imageStage === "asset" ? "整体任务背景（本次仅生成上面指令指定的中间素材，不执行其他模型的步骤或提前合成；保留与本素材有关的文字、数量、对应关系与禁止项）：" : "用户原始要求（必须保留文字、数量、构图、素材对应关系与禁止项）："}\n${original}`;
-          update(messageId, { toolCalls: readSession()?.messages.find((m) => m.id === messageId)?.toolCalls?.map((tc) => tc.id === call.id ? { ...tc, sourceLabels, sentPrompt, imageModel: connection.model, imageApiMode: connection.apiMode, imageStage } : tc) });
-          patchRun({ toolNote: `${connection.model} · ${sources.length ? `正在使用 ${sources.length} 张素材编辑图像…` : "正在生成图片…"}` });
-          const imgCfg = cfg.image;
-          const request = api.cancellableImage({
-            ...connection,
-            prompt: sentPrompt,
-            images, imageLabels: sourceLabels,
-            n: Math.min(Math.max(Math.floor(Number(args.n ?? 1)) || 1, 1), 4),
-            size: outputSize,
-            quality: imgCfg.quality, background: imgCfg.background, outputFormat: imgCfg.outputFormat, timeoutSecs: imgCfg.timeoutSecs,
-          }, sources[0]?.galleryId);
+          if (call.name === "review_goal") {
+            if (!goal.enabled) throw new Error("当前会话未开启 Goal 模式");
+            const review = parseGoalReview(args);
+            if (review.status === "satisfied" && progress.attempts > 0 && !lastFinalIds.length) throw new Error("本 Goal 已请求图像，但尚未返回实际最终图片，不能宣称图像任务已满足");
+            if (review.imageIds.length) selectImageSources(readSession()?.messages ?? [], review.imageIds);
+            if (lastFinalIds.some((id) => !review.imageIds.includes(id))) throw new Error("Goal 检查必须包含本次最新的全部最终图片，不能以旧图代替");
+            progress.checks = review.checks; progress.summary = review.summary;
+            update(toolId, { pending: false, content: `Goal 检查：${review.status}\n${review.summary}\n${JSON.stringify(review.checks)}${review.answer ? `\n最终答案：${review.answer}` : ""}`, goalReview: review });
+            if (review.status === "satisfied") endGoal("satisfied", review.summary);
+            else if (review.status === "blocked") endGoal("blocked", review.summary);
+            else if (progress.corrections >= goal.maxCorrections) endGoal("limit", `已达到 ${goal.maxCorrections} 次修正上限，仍有未通过项：${review.summary}`);
+            else if (!review.imageIds.length) { progress.corrections += 1; syncGoal(); }
+            else syncGoal();
+            continue;
+          }
+          if (call.name === "retry_image") {
+            if (typeof args.failed_call_id !== "string") throw new Error("必须指定实际失败的调用 ID");
+            const previous = failedRequests.get(args.failed_call_id);
+            if (!previous) throw new Error("该调用不是当前轮可重试的失败请求");
+            const imageModel = selectImageModel(cfg.image, args.model ?? previous.request.model, pinnedImageModel);
+            if (previous.request.images?.length && !canEditImageModel(imageModel)) throw new Error(`生图模型 ${imageModel.id} 已设为仅文生图，不能重试参考图编辑请求`);
+            prepared = { ...previous, request: { ...previous.request, ...imageModelConnection(cfg.image, imageModel) }, retryOf: args.failed_call_id };
+          } else {
+            if (call.name !== "generate_image" && call.name !== "edit_image") throw new Error(`未知工具：${call.name}`);
+            const prompt = String(args.prompt ?? "").trim();
+            if (!prompt) throw new Error("模型没有给出图像指令");
+            const imageModel = selectImageModel(cfg.image, args.model, pinnedImageModel);
+            const connection = imageModelConnection(cfg.image, imageModel);
+            const sources = call.name === "edit_image" ? selectImageSources(conv.messages, args.source_image_ids) :
+              args.source_image_ids !== undefined ? selectImageSources(conv.messages, args.source_image_ids) : [];
+            if ((call.name === "edit_image" || sources.length) && !canEditImageModel(imageModel)) throw new Error(`生图模型 ${imageModel.id} 已设为仅文生图，请选择支持参考图/合成的模型`);
+            if (call.name === "edit_image" && !sources.length) throw new Error("没有选择可用的参考图片");
+            const images = await Promise.all(sources.map((image) => image.dataUrl || (image.path ? api.readImageDataUrl(image.path) : Promise.reject(new Error("参考图片无法读取")))));
+            if (!active()) throw new Error("已停止");
+            const sourceLabels = sources.map((source) => source.label);
+            const stage = args.stage === "asset" ? "asset" : "final";
+            const sentPrompt = `${prompt}\n\n${stage === "asset" ? "整体任务背景（本次仅生成上面指令指定的中间素材，不执行其他模型的步骤或提前合成；保留与本素材有关的文字、数量、对应关系与禁止项）：" : "用户原始要求（必须保留文字、数量、构图、素材对应关系与禁止项）："}\n${original}`;
+            prepared = { request: { ...connection, prompt: sentPrompt, images, imageLabels: sourceLabels,
+              n: Math.min(Math.max(Math.floor(Number(args.n ?? 1)) || 1, 1), 4), size: imageToolSize(args.size, cfg.image.size),
+              quality: cfg.image.quality, background: cfg.image.background, outputFormat: cfg.image.outputFormat }, sourceLabels, sourceGalleryId: sources[0]?.galleryId, stage };
+          }
+          const { request: imageRequest, sourceLabels, stage: imageStage } = prepared;
+          if (!imageRequest.baseUrl || !imageRequest.apiKey) throw new Error(`请先配置生图模型 ${imageRequest.model} 的服务地址和 API Key`);
+          update(messageId, { toolCalls: readSession()?.messages.find((m) => m.id === messageId)?.toolCalls?.map((tc) => tc.id === call.id ? { ...tc, sourceLabels, sentPrompt: imageRequest.prompt, imageModel: imageRequest.model, imageApiMode: imageRequest.apiMode as ToolCall["imageApiMode"], imageStage, retryOf: prepared?.retryOf, requestedSize: imageRequest.size ?? "auto" } : tc) });
+          if (progress.attempts >= maxImageCalls) { if (goal.enabled) endGoal("limit", "已达到图像调用保护上限，停止自动执行。"); throw new Error("已达到本轮图像调用上限"); }
+          if (goal.enabled && lastFinalIds.length && !inCorrection) {
+            if (progress.corrections >= goal.maxCorrections) { endGoal("limit", "已达到修正上限，未执行新的图像请求。"); throw new Error("已达到 Goal 修正上限"); }
+            progress.corrections += 1; inCorrection = true;
+          }
+          progress.attempts += 1; syncGoal();
+          patchRun({ toolNote: `${imageRequest.model} · ${prepared.retryOf ? "正在重试图像请求…" : imageRequest.images?.length ? `正在使用 ${imageRequest.images.length} 张素材编辑图像…` : "正在生成图片…"}` });
+          const request = api.cancellableImage(imageRequest, prepared.sourceGalleryId);
           abort = request.cancel;
           if (stopped) abort();
           const items = await request.promise;
           abort = null;
+          if (!items.length) throw new Error("服务没有返回图片");
+          if (imageStage === "final") { lastFinalIds = items.map((item) => `image_${item.id}`); inCorrection = false; }
           useGallery.getState().add(items);
           update(toolId, { pending: false, content: `已生成 ${items.length} 张${imageStage === "asset" ? "中间素材，请继续剩余生成/合成步骤" : "图片"}。`, images: items.map((item) => ({
             galleryId: item.id, path: item.path, dataUrl: item.dataUrl ?? undefined, prompt: item.prompt, size: item.size, model: item.model,
           })) });
         } catch (err) {
           abort = null;
-          const error = stopped ? "已停止" : (err as Error).message;
-          update(toolId, { pending: false, content: `执行失败：${error}` });
+          const error = stopped ? "已停止" : imageFailureMessage(err, cfg.image);
+          if (prepared && !stopped && !terminal) failedRequests.set(call.id, prepared);
+          update(toolId, { pending: false, content: `执行失败：${error}${!stopped && !terminal && call.name !== "review_goal" ? `\n${JSON.stringify({ failed_call_id: call.id, model: prepared?.request.model, retry_available: !!prepared, enabled_models: configuredImageModels(cfg.image).map((model) => model.id), decision: "由 Chat 分析错误，决定使用 retry_image 重试同一模型、选择其他启用模型，或说明无法继续；不能丢失原始要求和素材。" })}` : ""}` });
           if (!stopped) toast.error(error);
         }
       }
+      if (terminal) continuation = `自动执行已结束：${progress.summary}。请简洁总结实际成果和未解决问题，不再调用工具。`;
       void get().persist();
     }
   } catch (err) {
     if (!stopped) toast.error((err as Error).message);
+    if (goal.enabled && !terminal && !stopped) endGoal("error", imageFailureMessage(err, cfg.image));
   } finally {
     await background?.finish();
+    if (goal.enabled && readSession()) {
+      if (stopped && !terminal) { progress.status = "stopped"; progress.summary = "用户已停止 Goal 自动执行。"; }
+      else if (!terminal) { progress.status = "limit"; progress.summary = "自动执行已停止，目标尚未完成验收。"; }
+      append({ id: uid("m"), role: "assistant", content: `Goal ${progress.status}：${progress.summary ?? ""}`, goalProgress: { ...progress }, createdAt: Date.now() });
+    }
     if (get().runs[sessionId]?.runId === runId) {
       set((state) => { const runs = { ...state.runs }; delete runs[sessionId]; return { runs }; });
     }

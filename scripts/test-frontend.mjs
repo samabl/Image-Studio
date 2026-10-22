@@ -16,6 +16,7 @@ const chat = await import(chatUrl);
 const imageModelsUrl = await compile("src/lib/imageModels.ts");
 const imageModels = await import(imageModelsUrl);
 const imageSizeUrl = await compile("src/lib/imageSize.ts");
+const goalUrl = await compile("src/lib/goal.ts");
 const attachment = (id) => ({ id, dataUrl: `data:image/png;base64,${Buffer.from(id).toString("base64")}`, name: `${id}.png` });
 const message = (role, extra = {}) => ({ id: `${role}_${Math.random()}`, role, content: "", createdAt: 1, ...extra });
 
@@ -90,7 +91,7 @@ async function harness() {
   globalThis.__studioTestApi = api;
   const apiUrl = `data:text/javascript,${encodeURIComponent(Object.keys(api).map((name) => `export const ${name} = (...args) => globalThis.__studioTestApi.${name}(...args);`).join("\n"))}`;
   const imageUrl = await compile("src/lib/image.ts");
-  const storeUrl = await compile("src/lib/store.ts", { zustand: import.meta.resolve("zustand"), "./api": apiUrl, "./image": imageUrl, "./chat": chatUrl, "./imageModels": imageModelsUrl, "./imageSize": imageSizeUrl });
+  const storeUrl = await compile("src/lib/store.ts", { zustand: import.meta.resolve("zustand"), "./api": apiUrl, "./image": imageUrl, "./chat": chatUrl, "./imageModels": imageModelsUrl, "./imageSize": imageSizeUrl, "./goal": goalUrl });
   const store = await import(`${storeUrl}#${++harnessId}`);
   store.useConfig.setState({ ready: true, config: {
     chat: { protocol: "openai", baseUrl: "https://example.test", apiKey: "test-key", model: "test-model", systemPrompt: "测试", maxTokens: 4096, temperature: null, timeoutSecs: 30, stream: true, models: [] },
@@ -413,7 +414,7 @@ test("图像工具枚举限制启用模型，合成只提供可编辑模型", as
   assert.deepEqual(tools[0].function.parameters.properties.model.enum, ["A", "C"]);
   assert.deepEqual(tools[1].function.parameters.properties.model.enum, ["C"]);
   assert.ok(tools[0].function.parameters.required.includes("model"));
-  assert.equal(h.imageTools(pool, "A").length, 1);
+  assert.deepEqual(h.imageTools(pool, "A").map((tool) => tool.function.name), ["generate_image", "retry_image"]);
   assert.deepEqual(h.imageTools(pool, "C")[0].function.parameters.properties.model.enum, ["C"]);
   assert.throws(() => imageModels.selectImageModel(pool, "not-enabled"), /未启用/);
   assert.throws(() => imageModels.selectImageModel(pool, "C", "A"), /指定/);
@@ -421,9 +422,129 @@ test("图像工具枚举限制启用模型，合成只提供可编辑模型", as
 
 const generated = (id, model) => ({ id, path: `${id}.png`, dataUrl: attachment(id).dataUrl, prompt: `来自 ${model}`, model, size: "auto" });
 const callTool = (stream, calls) => {
-  stream.onEvent({ type: "toolCalls", calls: calls.map((call, i) => ({ id: `call-${i}-${Math.random()}`, name: call.name ?? "generate_image", arguments: JSON.stringify(call.args) })) });
+  const toolCalls = calls.map((call, i) => ({ id: `call-${i}-${Math.random()}`, name: call.name ?? "generate_image", arguments: JSON.stringify(call.args) }));
+  stream.onEvent({ type: "toolCalls", calls: toolCalls });
   stream.onEvent({ type: "done", finishReason: "tool_calls" });
+  return toolCalls;
 };
+
+const goalCheck = (status, imageIds, passed = status === "satisfied") => ({ status, summary: passed ? "逐项符合要求" : "需要修正人物数量", image_ids: imageIds, checks: [{ requirement: "恰好两个人", passed, details: passed ? "实际图片包含两个人" : "实际图片只有一个人" }] });
+
+test("Goal 自动检查实际回图、修正后重新验收，达标才结束并保存记录", async () => {
+  const h = await harness(); const sessions = h.useSessions.getState;
+  sessions().setGoal({ enabled: true, level: "strict", maxCorrections: 2 });
+  const pending = sessions().send("恰好两个人，文字保持你好", []);
+  assert.ok(h.streams[0].request.tools.some((tool) => tool.function.name === "review_goal"));
+  assert.ok(h.streams[0].request.messages.some((message) => typeof message.content === "string" && message.content.includes("验收等级：严格")));
+  sessions().setGoal({ level: "relaxed" }); assert.equal(sessions().current().goal.level, "strict");
+  callTool(h.streams[0], [{ args: { prompt: "两个人" } }]); await tick();
+  h.imageCalls[0].resolve([generated("initial", "image-test")]); await tick();
+  assert.ok(JSON.stringify(h.streams[1].request.messages).includes(attachment("initial").dataUrl));
+  callTool(h.streams[1], [{ name: "review_goal", args: goalCheck("needs_revision", ["image_initial"]) }]); await tick();
+  callTool(h.streams[2], [{ name: "edit_image", args: { prompt: "补齐第二个人，保留文字", source_image_ids: ["image_initial"] } }]); await tick();
+  assert.deepEqual(h.imageCalls[1].request.images, [attachment("initial").dataUrl]);
+  assert.ok(h.imageCalls[1].request.prompt.includes("文字保持你好"));
+  h.imageCalls[1].resolve([generated("fixed", "image-test")]); await tick();
+  callTool(h.streams[3], [{ name: "review_goal", args: goalCheck("satisfied", ["image_initial"]) }]); await tick();
+  assert.ok(sessions().current().messages.at(-1).content.includes("不能以旧图代替"));
+  callTool(h.streams[4], [{ name: "review_goal", args: goalCheck("satisfied", ["image_fixed"]) }]); await tick();
+  assert.equal(h.streams[5].request.tools, null);
+  complete(h.streams[5], "已修正并满足要求"); await pending;
+  const report = sessions().current().messages.at(-1).goalProgress;
+  assert.equal(report.status, "satisfied"); assert.equal(report.corrections, 1); assert.equal(report.attempts, 2);
+  await sessions().persist(); assert.equal(h.saves.at(-1).sessions[0].messages.at(-1).goalProgress.status, "satisfied");
+  assert.equal(h.imageCalls.length, 2);
+});
+
+test("Goal 不能用文字宣称完成、旧图或未通过检查代替最新实际回图", async () => {
+  const h = await harness(); const sessions = h.useSessions.getState;
+  sessions().setGoal({ enabled: true, maxCorrections: 1 });
+  const pending = sessions().send("生成两个人", []);
+  complete(h.streams[0], "已经完成"); await tick();
+  assert.equal(h.streams.length, 2); assert.ok(h.streams[1].request.messages.at(-1).content.includes("不能只用文字"));
+  callTool(h.streams[1], [{ args: { prompt: "两个人" } }]); await tick();
+  h.imageCalls[0].resolve([generated("current", "image-test")]); await tick();
+  callTool(h.streams[2], [{ name: "review_goal", args: goalCheck("satisfied", ["image_missing"]) }]); await tick();
+  assert.ok(sessions().current().messages.at(-1).content.includes("找不到图片"));
+  callTool(h.streams[3], [{ name: "review_goal", args: goalCheck("satisfied", ["image_current"], false) }]); await tick();
+  assert.ok(sessions().current().messages.at(-1).content.includes("不能判定"));
+  callTool(h.streams[4], [{ name: "review_goal", args: goalCheck("blocked", ["image_current"]) }]); await tick();
+  complete(h.streams[5], "当前模型无法满足"); await pending;
+  assert.equal(sessions().current().messages.at(-1).goalProgress.status, "blocked");
+});
+
+test("文字 Goal 通过完整答案验收，图像请求失败不能用空回图宣称完成", async () => {
+  const h = await harness(); const sessions = h.useSessions.getState;
+  sessions().setGoal({enabled:true,maxCorrections:1});
+  const text=sessions().send("写一个标题",[]);
+  callTool(h.streams[0],[{name:"review_goal",args:{status:"satisfied",summary:"标题符合要求",answer:"清新图像工作台",checks:[{requirement:"简短中文标题",passed:true,details:"使用七字中文标题"}]}}]); await tick();
+  complete(h.streams[1]); await text;
+  assert.equal(sessions().current().messages.at(-1).goalProgress.status,"satisfied");
+  assert.ok(sessions().current().messages.some(m=>m.goalReview?.answer==="清新图像工作台"));
+  const image=sessions().send("生成图片",[]);
+  callTool(h.streams[2],[{args:{prompt:"生成图片"}}]); await tick(); h.imageCalls[0].reject(new Error("服务不可用")); await tick();
+  callTool(h.streams[3],[{name:"review_goal",args:{...goalCheck("satisfied",[]),answer:"已生成"}}]); await tick();
+  assert.ok(sessions().current().messages.at(-1).content.includes("尚未返回实际最终图片"));
+  callTool(h.streams[4],[{name:"review_goal",args:goalCheck("blocked",[])}]); await tick(); complete(h.streams[5]); await image;
+  assert.equal(sessions().current().messages.at(-1).goalProgress.status,"blocked");
+});
+
+test("Goal 达到修正上限后拒绝更多生图，停止会取消请求并保留停止状态", async () => {
+  const h = await harness(); const sessions = h.useSessions.getState;
+  sessions().setGoal({ enabled: true, maxCorrections: 0 });
+  const pending = sessions().send("两个人", []);
+  callTool(h.streams[0], [{ args: { prompt: "两个人" } }]); await tick();
+  h.imageCalls[0].resolve([generated("initial", "image-test")]); await tick();
+  callTool(h.streams[1], [{ name: "edit_image", args: { prompt: "修正", source_image_ids: ["image_initial"] } }]); await tick();
+  assert.equal(h.imageCalls.length, 1); assert.equal(h.streams[2].request.tools, null);
+  complete(h.streams[2], "已达到上限"); await pending;
+  assert.equal(sessions().current().messages.at(-1).goalProgress.status, "limit");
+  sessions().setGoal({ maxCorrections: 3 }); h.backgroundState.enabled = true;
+  const next = sessions().send("继续修正", []);
+  await tick();
+  callTool(h.streams[3], [{ args: { prompt: "新图" } }]); await tick();
+  sessions().stop(); await next;
+  assert.equal(h.imageCalls[1].canceled, true); assert.equal(h.backgroundTasks.at(-1).finished, true);
+  assert.equal(sessions().current().messages.at(-1).goalProgress.status, "stopped");
+});
+
+test("生图失败仅由 Chat 决定重试或切换，保留完整请求且不泄露连接信息", async () => {
+  const h = await harness(); const sessions = h.useSessions.getState; const cfg = h.useConfig.getState().config;
+  h.useConfig.setState({config:{...cfg,image:{...cfg.image,modelPool:[{id:"A",apiMode:"images"},{id:"B",apiMode:"chat",baseUrl:"https://backup.example.test/v1",apiKey:"backup-test-key"}]}}});
+  const pending = sessions().send("组合素材，保留你好", [attachment("a"), attachment("b")]);
+  const [initial] = callTool(h.streams[0], [{name:"edit_image",args:{model:"A",prompt:"保留文字，组合",size:"1536x1024",source_image_ids:["b","a"]}}]); await tick();
+  h.imageCalls[0].reject(new Error(`服务错误 ${cfg.image.apiKey} ${cfg.image.baseUrl}`)); await tick();
+  assert.equal(h.imageCalls.length,1,"应用不会自行发起下一次生图");
+  const failure = sessions().current().messages.at(-1).content;
+  assert.ok(failure.includes(initial.id)); assert.ok(!failure.includes(cfg.image.apiKey)); assert.ok(!failure.includes(cfg.image.baseUrl));
+  const [retry] = callTool(h.streams[1],[{name:"retry_image",args:{failed_call_id:initial.id,model:"A"}}]); await tick();
+  assert.deepEqual(h.imageCalls[1].request,h.imageCalls[0].request);
+  h.imageCalls[1].reject(new Error("模型繁忙")); await tick();
+  callTool(h.streams[2],[{name:"retry_image",args:{failed_call_id:retry.id,model:"B"}}]); await tick();
+  const alternate=h.imageCalls[2].request;
+  assert.equal(alternate.model,"B"); assert.equal(alternate.apiMode,"chat"); assert.equal(alternate.apiKey,"backup-test-key");
+  assert.equal(alternate.prompt,h.imageCalls[0].request.prompt); assert.equal(alternate.size,"1536x1024");
+  assert.deepEqual(alternate.images,[attachment("b").dataUrl,attachment("a").dataUrl]);
+  h.imageCalls[2].resolve([generated("fixed","B")]); await tick(); complete(h.streams[3]); await pending;
+  const retried=sessions().current().messages.flatMap(message=>message.toolCalls??[]).at(-1);
+  assert.equal(retried.retryOf,retry.id); assert.equal(retried.requestedSize,"1536x1024");
+});
+
+test("重试不能切换用户固定模型，Goal 设置和停止在并发会话间隔离", async () => {
+  const h = await harness(); const sessions = h.useSessions.getState; const cfg=h.useConfig.getState().config;
+  h.useConfig.setState({config:{...cfg,image:{...cfg.image,modelPool:[{id:"A",apiMode:"images"},{id:"B",apiMode:"chat"}]}}});
+  sessions().setImageModel("A"); sessions().setGoal({enabled:true,level:"strict",maxCorrections:2});
+  const first=sessions().currentId; const p1=sessions().send("第一目标",[]);
+  const [failed]=callTool(h.streams[0],[{args:{model:"A",prompt:"目标"}}]); await tick(); h.imageCalls[0].reject(new Error("繁忙")); await tick();
+  sessions().newSession(); const second=sessions().currentId; const p2=sessions().send("普通会话",[]);
+  assert.equal(sessions().current().goal,undefined); complete(h.streams[2]); await p2;
+  callTool(h.streams[1],[{name:"retry_image",args:{failed_call_id:failed.id,model:"B"}}]); await tick();
+  assert.equal(h.imageCalls.length,1);
+  assert.ok(sessions().sessions.find(s=>s.id===first).messages.at(-1).content.includes("指定"));
+  sessions().stop(first); await p1;
+  assert.equal(sessions().sessions.find(s=>s.id===first).messages.at(-1).goalProgress.status,"stopped");
+  assert.equal(sessions().currentId,second);
+});
 
 test("Chat 分别调用 A、B 生成中间素材，再把实际结果图交给 C 合成和回图检查", async () => {
   const h = await harness(); const sessions = h.useSessions.getState;

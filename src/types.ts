@@ -57,9 +57,12 @@ export interface LinkageConfig {
   reverseSystemPrompt: string;
 }
 
+export type ThemeMode = "system" | "light" | "dark";
+
 export interface UiConfig {
   language: string;
   sendOnEnter: boolean;
+  theme?: ThemeMode;
 }
 
 export interface AppConfig {
@@ -109,6 +112,8 @@ export interface ToolCall {
   imageModel?: string;
   imageApiMode?: ResolvedImageApiMode;
   imageStage?: "asset" | "final";
+  retryOf?: string;
+  requestedSize?: string;
 }
 
 export interface ChatAttachment {
@@ -130,6 +135,30 @@ export interface GeneratedRef {
 
 export type ChatRole = "user" | "assistant" | "tool";
 
+export type GoalLevel = "relaxed" | "standard" | "strict";
+export interface GoalSettings {
+  enabled: boolean;
+  level: GoalLevel;
+  maxCorrections: number;
+}
+export interface GoalCheck { requirement: string; passed: boolean; details: string; }
+export interface GoalReview {
+  status: "satisfied" | "needs_revision" | "blocked";
+  summary: string;
+  checks: GoalCheck[];
+  imageIds: string[];
+  answer?: string;
+}
+export interface GoalProgress {
+  status: "working" | "satisfied" | "blocked" | "limit" | "stopped" | "error";
+  level: GoalLevel;
+  maxCorrections: number;
+  corrections: number;
+  attempts: number;
+  summary?: string;
+  checks?: GoalCheck[];
+}
+
 export interface ChatMessage {
   id: string;
   role: ChatRole;
@@ -145,6 +174,8 @@ export interface ChatMessage {
   createdAt: number;
   model?: string;
   usage?: Record<string, unknown> | null;
+  goalReview?: GoalReview;
+  goalProgress?: GoalProgress;
 }
 
 export interface ChatSession {
@@ -157,6 +188,7 @@ export interface ChatSession {
   draftAtts?: ChatAttachment[];
   /** 空值表示让 Chat 从已启用的模型池中选择。 */
   imageModel?: string;
+  goal?: GoalSettings;
 }
 
 // ---------------------------------------------------------------------------
