@@ -3,13 +3,33 @@ package __APP_PACKAGE__
 import android.graphics.Color
 import android.os.Bundle
 import android.view.View
+import android.webkit.WebView
 import android.widget.FrameLayout
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.SystemBarStyle
+import androidx.activity.OnBackPressedCallback
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 
 class MainActivity : TauriActivity() {
+  override fun onWebViewCreate(webView: WebView) {
+    super.onWebViewCreate(webView)
+    onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+      override fun handleOnBackPressed() {
+        if (ViewCompat.getRootWindowInsets(webView)?.isVisible(WindowInsetsCompat.Type.ime()) == true) {
+          WindowInsetsControllerCompat(window, webView).hide(WindowInsetsCompat.Type.ime())
+          return
+        }
+        // 前端逐层关闭预览/菜单或返回首页。只有首页再次返回才移到后台，
+        // 不 finish Activity，以保留正在运行的生图与回图检查。
+        webView.evaluateJavascript("window.__imageStudioBack ? window.__imageStudioBack() : 'handled'") { result ->
+          if (result == "\"exit\"") moveTaskToBack(true)
+        }
+      }
+    })
+  }
+
   override fun onCreate(savedInstanceState: Bundle?) {
     enableEdgeToEdge(
       statusBarStyle = SystemBarStyle.dark(Color.TRANSPARENT),

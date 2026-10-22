@@ -640,23 +640,74 @@ pub fn build_image_body(req: &ImageRequest) -> AppResult<Value> {
         parts.push(json!({ "inlineData": { "mimeType": mime, "data": STANDARD.encode(bytes) } }));
     }
     let mut body = json!({ "contents": [{ "role": "user", "parts": parts }], "generationConfig": { "responseModalities": ["TEXT", "IMAGE"] } });
-    if let Some(size) = req.size.as_deref().filter(|s| *s != "auto") {
-        let ratio = match size {
-            "1024x1024" | "512x512" => Some("1:1"),
-            "1536x1024" => Some("3:2"),
-            "1024x1536" => Some("2:3"),
-            "768x1024" => Some("3:4"),
-            "1024x768" => Some("4:3"),
-            "1024x1792" => Some("9:16"),
-            "1792x1024" => Some("16:9"),
-            _ => None,
-        };
-        if let Some(ratio) = ratio {
-            body["generationConfig"]["imageConfig"] = json!({ "aspectRatio": ratio });
+    if let Some((ratio, resolution)) = image_dimensions(req.size.as_deref())? {
+        let mut config = json!({ "aspectRatio": ratio });
+        if let Some(resolution) = resolution {
+            config["imageSize"] = json!(resolution);
         }
+        body["generationConfig"]["imageConfig"] = config;
     }
     merge_extra(&mut body, &req.extra_body);
     Ok(body)
+}
+
+/// 原生/兼容 Gemini 使用比例与分辨率档位，无法保证逐像素尺寸。
+pub fn image_dimensions(
+    size: Option<&str>,
+) -> AppResult<Option<(&'static str, Option<&'static str>)>> {
+    let Some(size) = size
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "auto")
+    else {
+        return Ok(None);
+    };
+    let size = size.to_ascii_lowercase().replace('×', "x");
+    let (width, height) = size
+        .split_once('x')
+        .ok_or_else(|| AppError::config("图像尺寸应为宽x高"))?;
+    let width = width
+        .parse::<u32>()
+        .ok()
+        .filter(|v| *v > 0 && *v <= 99999)
+        .ok_or_else(|| AppError::config("图像宽度无效"))?;
+    let height = height
+        .parse::<u32>()
+        .ok()
+        .filter(|v| *v > 0 && *v <= 99999)
+        .ok_or_else(|| AppError::config("图像高度无效"))?;
+    let desired = width as f64 / height as f64;
+    let ratios = [
+        ("1:1", 1.0),
+        ("2:3", 2.0 / 3.0),
+        ("3:2", 3.0 / 2.0),
+        ("3:4", 3.0 / 4.0),
+        ("4:3", 4.0 / 3.0),
+        ("4:5", 4.0 / 5.0),
+        ("5:4", 5.0 / 4.0),
+        ("9:16", 9.0 / 16.0),
+        ("16:9", 16.0 / 9.0),
+        ("21:9", 21.0 / 9.0),
+    ];
+    let ratio = ratios
+        .iter()
+        .min_by(|a, b| {
+            (a.1 / desired)
+                .ln()
+                .abs()
+                .total_cmp(&(b.1 / desired).ln().abs())
+        })
+        .unwrap()
+        .0;
+    let pixels = width as u64 * height as u64;
+    // 常规 1K 使用模型默认档位，避免旧模型拒绝 imageSize。
+    let resolution = if pixels >= 7_000_000 {
+        Some("4K")
+    } else if pixels >= 3_000_000 {
+        Some("2K")
+    } else {
+        None
+    };
+    Ok(Some((ratio, resolution)))
 }
 
 pub fn parse_images(value: &Value) -> AppResult<Vec<RawImage>> {

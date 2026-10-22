@@ -187,6 +187,15 @@ async fn background_task_configure(app: AppHandle) -> AppResult<()> {
     background::configure(&app).await
 }
 
+#[tauri::command]
+async fn save_image_to_album(
+    app: AppHandle,
+    data_url: String,
+    file_name: String,
+) -> AppResult<String> {
+    background::save_to_album(&app, data_url, file_name).await
+}
+
 // ---------------------------------------------------------------------------
 // 图像
 // ---------------------------------------------------------------------------
@@ -368,6 +377,7 @@ pub fn run() {
             background_task_finish,
             background_task_status,
             background_task_configure,
+            save_image_to_album,
             generate_image,
             gallery_list,
             gallery_delete,

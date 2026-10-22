@@ -667,7 +667,7 @@ pub struct ImageRequest {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
-    /// `images` | `chat`
+    /// `auto` | `images` | `chat` | `gemini`
     #[serde(default)]
     pub api_mode: Option<String>,
     pub prompt: String,
@@ -906,6 +906,13 @@ async fn generate_via_chat(
         json!([{ "role": "user", "content": content }]),
     );
     body.insert("modalities".into(), json!(["image", "text"]));
+    if let Some((ratio, resolution)) = crate::native::image_dimensions(req.size.as_deref())? {
+        let mut config = json!({ "aspect_ratio": ratio });
+        if let Some(resolution) = resolution {
+            config["image_size"] = json!(resolution);
+        }
+        body.insert("image_config".into(), config);
+    }
     if let Some(Value::Object(extra)) = &req.extra_body {
         for (k, v) in extra {
             if v.is_null() || v.as_str() == Some("") {
@@ -1062,10 +1069,63 @@ async fn edit_via_images(req: &ImageRequest, client: &reqwest::Client) -> AppRes
     Ok(out)
 }
 
+/// 模型 ID 只用于预判。网关别名与不同路由允许显式覆盖，不试发生图请求。
+pub fn resolve_image_api_mode(
+    model: &str,
+    base_url: &str,
+    configured: Option<&str>,
+) -> AppResult<&'static str> {
+    match configured.unwrap_or("auto") {
+        "images" => return Ok("images"),
+        "chat" => return Ok("chat"),
+        "gemini" => return Ok("gemini"),
+        "auto" | "" => {}
+        mode => return Err(AppError::config(format!("不支持的图像接口类型：{mode}"))),
+    }
+    let id = model.trim().to_ascii_lowercase();
+    if ["gpt-image", "gpt_image", "dall-e", "dall_e", "dalle"]
+        .iter()
+        .any(|part| id.contains(part))
+    {
+        return Ok("images");
+    }
+    if let Ok(url) = reqwest::Url::parse(base_url) {
+        let path = url.path().to_ascii_lowercase();
+        if url.host_str() == Some("generativelanguage.googleapis.com")
+            || path.ends_with(":generatecontent")
+        {
+            return Ok("gemini");
+        }
+        let path = path.trim_end_matches('/');
+        if path.ends_with("/chat/completions") {
+            return Ok("chat");
+        }
+        if path.ends_with("/images/generations") || path.ends_with("/images/edits") {
+            return Ok("images");
+        }
+    }
+    Ok(
+        if [
+            "gemini",
+            "nano-banana",
+            "nano_banana",
+            "nano banana",
+            "nanobanana",
+        ]
+        .iter()
+        .any(|part| id.contains(part))
+        {
+            "chat"
+        } else {
+            "images"
+        },
+    )
+}
+
 /// 统一入口：按 apiMode 与是否带参考图自动选择端点。
 pub async fn run_image_request(req: &ImageRequest) -> AppResult<Vec<RawImage>> {
     let client = client(req.timeout_secs.unwrap_or(600))?;
-    let mode = req.api_mode.as_deref().unwrap_or("images");
+    let mode = resolve_image_api_mode(&req.model, &req.base_url, req.api_mode.as_deref())?;
     if mode != "images" && req.mask.as_ref().is_some_and(|mask| !mask.is_empty()) {
         return Err(AppError::config(
             "当前图像协议不支持蒙版，请使用 images 协议进行局部重绘",

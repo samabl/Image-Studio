@@ -4,7 +4,7 @@ import { ChatView } from "./components/ChatView";
 import { StudioView } from "./components/StudioView";
 import { GalleryView } from "./components/GalleryView";
 import { SettingsView } from "./components/SettingsView";
-import { Lightbox, Toasts } from "./components/Overlays";
+import { Lightbox, Toasts, useLightbox } from "./components/Overlays";
 import { Spinner } from "./components/ui";
 import {
   bootstrap,
@@ -18,7 +18,8 @@ import {
 } from "./lib/store";
 import { importImageFile } from "./lib/api";
 import { fileToAttachment } from "./lib/image";
-import { supportsFileDrop } from "./lib/platform";
+import { isAndroid, supportsFileDrop } from "./lib/platform";
+import { createBackHandler } from "./lib/androidBack";
 
 const NAV: { key: TabKey; icon: string; label: string; title: string; sub: string }[] = [
   { key: "chat", icon: "💬", label: "对话", title: "AI 对话", sub: "多轮聊天 · 看图 · 驱动图像模型" },
@@ -37,6 +38,26 @@ export default function App() {
 
   useEffect(() => {
     bootstrap().catch((err) => setBootError((err as Error).message));
+  }, []);
+
+  useEffect(() => {
+    if (!isAndroid) return;
+    const target = window as Window & { __imageStudioBack?: () => string };
+    target.__imageStudioBack = createBackHandler({
+      closePreview: () => { if (!useLightbox.getState().image) return false; useLightbox.getState().hide(); return true; },
+      closePanel: () => {
+        if (!window.dispatchEvent(new Event("image-studio-back", { cancelable: true }))) return true;
+        const opened = Array.from(document.querySelectorAll<HTMLDetailsElement>("details[open]"))
+          .filter((element) => element.getClientRects().length);
+        const last = opened[opened.length - 1];
+        if (last) { last.open = false; return true; }
+        return false;
+      },
+      returnHome: () => { if (useConfig.getState().tab === "chat") return false; useConfig.getState().setTab("chat"); return true; },
+      notify: () => useToast.getState().push("info", "再按一次返回键回到桌面，运行中的任务会继续"),
+      persist: () => { void useSessions.getState().persist(); void useConfig.getState().flush(); },
+    });
+    return () => { delete target.__imageStudioBack; };
   }, []);
 
   // 桌面端：把图片文件拖进窗口直接导入到当前页面
@@ -149,7 +170,7 @@ export default function App() {
     <div className="app">
       <nav className="sidebar">
         <div className="brand">
-          <div className="brand-mark">🎨</div>
+          <img className="brand-mark" src="/app-icon.png" alt="Image Studio" />
           <div className="brand-text">
             <strong>GPT Image Studio</strong>
             <span>对话 · 文生图 · 图生图 · 编辑</span>

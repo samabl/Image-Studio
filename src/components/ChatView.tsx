@@ -6,6 +6,7 @@ import { useConfig, useSessions, useStudio, useToast, channelReady } from "../li
 import { fileToAttachment } from "../lib/image";
 import { SaveImageButton } from "./SaveImageButton";
 import { ImageToolDetails } from "./ImageToolDetails";
+import { configuredImageModels } from "../lib/imageModels";
 import type { ChatAttachment, ChatMessage, GeneratedRef } from "../types";
 
 const SUGGESTIONS = [
@@ -36,6 +37,11 @@ export function ChatView() {
   const text = session?.draftText ?? "";
   const atts = session?.draftAtts ?? [];
   const setText = (value: string) => useSessions.getState().setDraftText(value);
+  useEffect(() => {
+    const back = (event: Event) => { if (showSessions) { event.preventDefault(); setShowSessions(false); } };
+    window.addEventListener("image-studio-back", back);
+    return () => window.removeEventListener("image-studio-back", back);
+  }, [showSessions]);
 
   // 新消息 / 流式增量时贴底
   useEffect(() => {
@@ -56,6 +62,8 @@ export function ChatView() {
   }, [text]);
 
   const ready = channelReady("chat");
+  const imageModels = cfg ? configuredImageModels(cfg.image) : [];
+  const selectedImageModel = session?.imageModel ?? "";
 
   const submit = () => {
     const value = text.trim();
@@ -112,6 +120,19 @@ export function ChatView() {
           </span>
         )}
       </div>
+
+      {cfg?.linkage.enabled && cfg.linkage.useTools && (
+        <div className="chat-image-model">
+          <label htmlFor="chat-image-model">生图模型</label>
+          <select id="chat-image-model" className="input" value={selectedImageModel} disabled={busy}
+            onChange={(e) => useSessions.getState().setImageModel(e.target.value)}>
+            <option value="">自动 · Chat 从 {imageModels.length} 个模型中选择</option>
+            {selectedImageModel && !imageModels.some((model) => model.id === selectedImageModel) && <option value={selectedImageModel}>{selectedImageModel}（已从模型池移除，请重选）</option>}
+            {imageModels.map((model) => <option key={model.id} value={model.id}>{model.id}</option>)}
+          </select>
+          <button type="button" className="btn sm ghost" onClick={() => useConfig.getState().setTab("settings")}>配置模型池</button>
+        </div>
+      )}
 
       {showSessions && (
         <div

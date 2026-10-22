@@ -8,6 +8,7 @@ import { copyText } from "../lib/shell";
 import { readImageDataUrl } from "../lib/api";
 import { SaveImageButton } from "./SaveImageButton";
 import { isDesktop } from "../lib/platform";
+import { defaultImageConnection } from "../lib/imageModels";
 import type { GalleryItem } from "../types";
 
 const SIZES = [
@@ -31,6 +32,7 @@ export function StudioView() {
 
   const ready = channelReady("image");
   const hasRef = studio.refs.length > 0;
+  const supportsMask = cfg ? defaultImageConnection(cfg.image).apiMode === "images" : false;
 
   // 参考图变化时自动切到编辑模式，符合直觉
   useEffect(() => {
@@ -199,9 +201,9 @@ export function StudioView() {
           <>
             <Switch
               checked={studio.maskEnabled}
-              disabled={busy || cfg?.image.apiMode !== "images"}
+              disabled={busy || !supportsMask}
               onChange={studio.setMaskEnabled}
-              label={cfg?.image.apiMode === "images" ? "局部重绘（只改涂抹区域）" : "局部重绘需使用 images 协议"}
+              label={supportsMask ? "局部重绘（只改涂抹区域）" : "局部重绘需使用 images 协议"}
             />
             {studio.maskEnabled && (
               <>

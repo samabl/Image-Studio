@@ -13,6 +13,9 @@ const compile = async (path, imports = {}) => {
 };
 const chatUrl = await compile("src/lib/chat.ts");
 const chat = await import(chatUrl);
+const imageModelsUrl = await compile("src/lib/imageModels.ts");
+const imageModels = await import(imageModelsUrl);
+const imageSizeUrl = await compile("src/lib/imageSize.ts");
 const attachment = (id) => ({ id, dataUrl: `data:image/png;base64,${Buffer.from(id).toString("base64")}`, name: `${id}.png` });
 const message = (role, extra = {}) => ({ id: `${role}_${Math.random()}`, role, content: "", createdAt: 1, ...extra });
 
@@ -87,7 +90,7 @@ async function harness() {
   globalThis.__studioTestApi = api;
   const apiUrl = `data:text/javascript,${encodeURIComponent(Object.keys(api).map((name) => `export const ${name} = (...args) => globalThis.__studioTestApi.${name}(...args);`).join("\n"))}`;
   const imageUrl = await compile("src/lib/image.ts");
-  const storeUrl = await compile("src/lib/store.ts", { zustand: import.meta.resolve("zustand"), "./api": apiUrl, "./image": imageUrl, "./chat": chatUrl });
+  const storeUrl = await compile("src/lib/store.ts", { zustand: import.meta.resolve("zustand"), "./api": apiUrl, "./image": imageUrl, "./chat": chatUrl, "./imageModels": imageModelsUrl, "./imageSize": imageSizeUrl });
   const store = await import(`${storeUrl}#${++harnessId}`);
   store.useConfig.setState({ ready: true, config: {
     chat: { protocol: "openai", baseUrl: "https://example.test", apiKey: "test-key", model: "test-model", systemPrompt: "测试", maxTokens: 4096, temperature: null, timeoutSecs: 30, stream: true, models: [] },
@@ -239,7 +242,7 @@ test("完整 AI 指令和文字跨生图、回图检查及下一轮保存，流�
   assert.equal(JSON.parse(before.toolCalls[0].arguments).prompt, prompt);
   assert.equal(before.toolCalls[0].sentPrompt, h.imageCalls[0].request.prompt);
   assert.equal(before.toolCalls[0].sourceLabels[0], "素材 1：original.png（图片 ID：original）");
-  assert.equal(sessions().runs[sessions().currentId].toolNote, "正在使用 1 张素材编辑图像…");
+  assert.equal(sessions().runs[sessions().currentId].toolNote, "image-test · 正在使用 1 张素材编辑图像…");
   h.imageCalls[0].resolve([{ id: "g", path: "g.png", dataUrl: attachment("g").dataUrl, prompt, model: "image", size: "1024x1024" }]);
   await tick(); complete(h.streams[1], "**检查完成**：手臂已修正。"); await pending;
   const after = sessions().current().messages.find((m) => m.id === before.id);
@@ -256,7 +259,7 @@ test("旧历史与新消息中的完整 AI 指令可展示、复制，不依赖�
   const { renderToStaticMarkup } = await import("react-dom/server");
   const shell = `data:text/javascript,${encodeURIComponent("export async function copyText() {};")}`;
   const store = `data:text/javascript,${encodeURIComponent("export const useToast = { getState: () => ({push(){}}) };")}`;
-  const url = await compile("src/components/ImageToolDetails.tsx", { "../lib/shell": shell, "../lib/store": store, "react/jsx-runtime": import.meta.resolve("react/jsx-runtime") });
+  const url = await compile("src/components/ImageToolDetails.tsx", { "../lib/shell": shell, "../lib/store": store, "../lib/imageModels": imageModelsUrl, "react/jsx-runtime": import.meta.resolve("react/jsx-runtime") });
   const { ImageToolDetails } = await import(url);
   const prompt = "修正手臂。\n" + "不要改变构图和场景。".repeat(50) + "完整提示词结尾";
   const call = {id:"edit", name:"edit_image", arguments:JSON.stringify({prompt,source_image_ids:["result","original"]})};
@@ -332,9 +335,10 @@ test("保存图像支持原图、历史文件与 Android URI；取消不会写�
   const state = globalThis.__saveTest;
   const dialog = `data:text/javascript,${encodeURIComponent("export async function save(options) { globalThis.__saveTest.options.push(options); return globalThis.__saveTest.target; }")}`;
   const fs = `data:text/javascript,${encodeURIComponent("export async function writeFile(path, bytes) { globalThis.__saveTest.writes.push({path, bytes}); }")}`;
-  const api = `data:text/javascript,${encodeURIComponent("export async function readImageDataUrl(path) { globalThis.__saveTest.reads.push(path); return 'data:image/jpeg;base64,YQ=='; }")}`;
+  const api = `data:text/javascript,${encodeURIComponent("export async function readImageDataUrl(path) { globalThis.__saveTest.reads.push(path); return 'data:image/jpeg;base64,YQ=='; }; export async function saveImageToAlbum() { throw new Error('unexpected album save'); }")}`;
   const image = await compile("src/lib/image.ts");
-  const url = await compile("src/lib/save.ts", { "@tauri-apps/plugin-dialog": dialog, "@tauri-apps/plugin-fs": fs, "./api": api, "./image": image });
+  const platform = `data:text/javascript,${encodeURIComponent("export const isAndroid=false;")}`;
+  const url = await compile("src/lib/save.ts", { "@tauri-apps/plugin-dialog": dialog, "@tauri-apps/plugin-fs": fs, "./api": api, "./image": image, "./platform": platform });
   const { saveImage } = await import(url);
   assert.equal(await saveImage({ dataUrl: "data:image/png;base64,YQ==" }), state.target);
   assert.equal(state.writes[0].path, "content://documents/image.png");
@@ -371,4 +375,184 @@ test("自动优化使用所有素材，并把原始要求保留在出图请求�
   assert.ok(h.imageCalls[0].request.prompt.includes("恰好两个人，保留文字你好"));
   assert.deepEqual(h.imageCalls[0].request.images, [attachment("a").dataUrl, attachment("b").dataUrl]);
   h.imageCalls[0].resolve([{ id: "g", path: "g.png", prompt: "", model: "", size: "" }]); await pending;
+});
+
+test("模型 ID 自适应接口与手动覆盖遵循同一套路由样例", async () => {
+  const fixtures = JSON.parse(await readFile(new URL("./fixtures/image-routing.json", import.meta.url), "utf8"));
+  for (const { model, baseUrl, mode, expected } of fixtures) assert.equal(imageModels.resolveImageApiMode(mode, model, baseUrl), expected, `${model} ${baseUrl} ${mode}`);
+  assert.throws(() => imageModels.resolveImageApiMode("unsupported", "alias", "https://example.test"), /不支持/);
+});
+
+test("模型池兼容旧配置，独立连接不继承其他服务的密钥", async () => {
+  const h = await harness(); const cfg = h.useConfig.getState().config.image;
+  assert.deepEqual(imageModels.configuredImageModels(cfg), [{ id: "image-test", apiMode: "images" }]);
+  const custom = { id: "gemini-image", apiMode: "auto", baseUrl: "https://native.example.test/v1beta" };
+  assert.equal(imageModels.imageModelConnection(cfg, custom).apiKey, "");
+  assert.equal(imageModels.imageModelConnection(cfg, { ...custom, baseUrl: "https://example.test/v1" }).apiKey, "test-key");
+  assert.equal(imageModels.imageModelConnection(cfg, { ...custom, apiKey: "native-test-key" }).apiKey, "native-test-key");
+  const pool = { ...cfg, modelPool: [{ id: " model-A ", apiMode: "auto" }, { id: "model-A", apiMode: "chat" }] };
+  assert.deepEqual(imageModels.configuredImageModels(pool).map((entry) => entry.id), ["model-A"]);
+  assert.equal(imageModels.selectImageModel(pool).id, "model-A");
+});
+
+test("图像工具枚举限制启用模型，合成只提供可编辑模型", async () => {
+  const h = await harness(); const cfg = h.useConfig.getState().config.image;
+  const pool = { ...cfg, modelPool: [{ id: "A", apiMode: "auto", supportsEditing: false }, { id: "C", apiMode: "chat", supportsEditing: true }] };
+  const tools = h.imageTools(pool);
+  assert.deepEqual(tools[0].function.parameters.properties.model.enum, ["A", "C"]);
+  assert.deepEqual(tools[1].function.parameters.properties.model.enum, ["C"]);
+  assert.ok(tools[0].function.parameters.required.includes("model"));
+  assert.equal(h.imageTools(pool, "A").length, 1);
+  assert.deepEqual(h.imageTools(pool, "C")[0].function.parameters.properties.model.enum, ["C"]);
+  assert.throws(() => imageModels.selectImageModel(pool, "not-enabled"), /未启用/);
+  assert.throws(() => imageModels.selectImageModel(pool, "C", "A"), /指定/);
+});
+
+const generated = (id, model) => ({ id, path: `${id}.png`, dataUrl: attachment(id).dataUrl, prompt: `来自 ${model}`, model, size: "auto" });
+const callTool = (stream, calls) => {
+  stream.onEvent({ type: "toolCalls", calls: calls.map((call, i) => ({ id: `call-${i}-${Math.random()}`, name: call.name ?? "generate_image", arguments: JSON.stringify(call.args) })) });
+  stream.onEvent({ type: "done", finishReason: "tool_calls" });
+};
+
+test("Chat 分别调用 A、B 生成中间素材，再把实际结果图交给 C 合成和回图检查", async () => {
+  const h = await harness(); const sessions = h.useSessions.getState;
+  const cfg = h.useConfig.getState().config;
+  h.useConfig.setState({ config: { ...cfg, image: { ...cfg.image, modelPool: [
+    { id: "model-A", apiMode: "images", supportsEditing: false, description: "人物素材" },
+    { id: "gemini-model-B", apiMode: "auto", description: "背景素材" },
+    { id: "model-C", apiMode: "gemini", baseUrl: "https://native.example.test/v1beta", apiKey: "C-test-key", description: "最终合成" },
+  ] } } });
+  const pending = sessions().send("A 生成猫，B 生成背景，再由 C 组合", []);
+  assert.ok(h.streams[0].request.messages[1].content.includes("最终合成"));
+  assert.ok(h.streams[0].request.messages[1].content.includes("不能编造"));
+  callTool(h.streams[0], [{ args: { model: "model-A", prompt: "只生成猫素材", stage: "asset" } }]);
+  await tick();
+  assert.equal(h.imageCalls[0].request.model, "model-A");
+  assert.equal(h.imageCalls[0].request.apiMode, "images");
+  assert.ok(h.imageCalls[0].request.prompt.includes("不执行其他模型的步骤或提前合成"));
+  h.imageCalls[0].resolve([generated("cat", "model-A")]); await tick();
+  callTool(h.streams[1], [{ args: { model: "gemini-model-B", prompt: "只生成背景素材", stage: "asset" } }]); await tick();
+  assert.equal(h.imageCalls[1].request.apiMode, "chat");
+  h.imageCalls[1].resolve([generated("background", "gemini-model-B")]); await tick();
+  callTool(h.streams[2], [{ name: "edit_image", args: { model: "model-C", prompt: "将猫放入背景", stage: "final", source_image_ids: ["image_background", "image_cat"] } }]); await tick();
+  const combined = h.imageCalls[2].request;
+  assert.equal(combined.model, "model-C");
+  assert.equal(combined.apiMode, "gemini");
+  assert.equal(combined.baseUrl, "https://native.example.test/v1beta");
+  assert.equal(combined.apiKey, "C-test-key");
+  assert.deepEqual(combined.images, [attachment("background").dataUrl, attachment("cat").dataUrl]);
+  assert.equal(h.imageCalls[2].parentId, "background");
+  const calls = sessions().current().messages.flatMap((message) => message.toolCalls ?? []);
+  assert.deepEqual(calls.map((call) => call.imageModel), ["model-A", "gemini-model-B", "model-C"]);
+  assert.deepEqual(calls.map((call) => call.imageStage), ["asset", "asset", "final"]);
+  h.imageCalls[2].resolve([generated("final", "model-C")]); await tick();
+  assert.ok(JSON.stringify(h.streams[3].request.messages).includes(attachment("final").dataUrl));
+  complete(h.streams[3], "猫与背景合成完成，检查符合要求"); await pending;
+  await sessions().persist();
+  assert.equal(h.saves.at(-1).sessions[0].messages.at(-1).content, "猫与背景合成完成，检查符合要求");
+});
+
+test("同轮的 A、B 工具结果全部回传后才向 C 提供组合素材", async () => {
+  const h = await harness(); const cfg = h.useConfig.getState().config;
+  h.useConfig.setState({ config: { ...cfg, image: { ...cfg.image, modelPool: ["A", "B", "C"].map((id) => ({ id, apiMode: "auto" })) } } });
+  const pending = h.useSessions.getState().send("分别生成再组合", []);
+  callTool(h.streams[0], [{ args: { model: "A", prompt: "主体", stage: "asset" } }, { args: { model: "B", prompt: "背景", stage: "asset" } }]); await tick();
+  h.imageCalls[0].resolve([generated("a", "A")]); await tick();
+  assert.equal(h.streams.length, 1);
+  h.imageCalls[1].resolve([generated("b", "B")]); await tick();
+  assert.deepEqual(h.streams[1].request.messages.slice(-5).map((message) => message.role), ["assistant", "tool", "tool", "user", "user"]);
+  callTool(h.streams[1], [{ name: "edit_image", args: { model: "C", prompt: "组合", source_image_ids: ["image_a", "image_b"] } }]); await tick();
+  assert.deepEqual(h.imageCalls[2].request.images, [attachment("a").dataUrl, attachment("b").dataUrl]);
+  h.imageCalls[2].resolve([generated("c", "C")]); await tick(); complete(h.streams[2]); await pending;
+});
+
+test("每个并发会话保留独立指定模型，工具省略模型也遵守该选择", async () => {
+  const h = await harness(); const cfg = h.useConfig.getState().config; const sessions = h.useSessions.getState;
+  h.useConfig.setState({ config: { ...cfg, image: { ...cfg.image, modelPool: ["A", "B"].map((id) => ({ id, apiMode: "auto" })) } } });
+  const first = sessions().currentId;
+  sessions().setImageModel("A"); const p1 = sessions().send("第一张", []);
+  sessions().setImageModel("B"); assert.equal(sessions().current().imageModel, "A", "运行中的模型不能被改变");
+  sessions().newSession(); sessions().setImageModel("B"); const p2 = sessions().send("第二张", []);
+  callTool(h.streams[0], [{ args: { prompt: "主体" } }]); await tick();
+  callTool(h.streams[1], [{ args: { prompt: "背景" } }]); await tick();
+  assert.deepEqual(h.imageCalls.map((call) => call.request.model), ["A", "B"]);
+  h.imageCalls[0].resolve([generated("a", "A")]); await tick(); complete(h.streams[2]); await p1;
+  h.imageCalls[1].resolve([generated("b", "B")]); await tick(); complete(h.streams[3]); await p2;
+  await sessions().persist();
+  assert.equal(h.saves.at(-1).sessions.find((session) => session.id === first).imageModel, "A");
+});
+
+test("未启用模型与仅文生图模型的编辑不会发起图像请求", async () => {
+  const h = await harness(); const cfg = h.useConfig.getState().config;
+  h.useConfig.setState({ config: { ...cfg, image: { ...cfg.image, modelPool: [{ id: "A", apiMode: "auto", supportsEditing: false }] } } });
+  const pending = h.useSessions.getState().send("组合参考图", [attachment("ref")]);
+  callTool(h.streams[0], [{ args: { model: "unknown", prompt: "生成" } }, { name: "edit_image", args: { model: "A", prompt: "编辑", source_image_ids: ["ref"] } }]); await tick();
+  assert.equal(h.imageCalls.length, 0);
+  const failures = h.useSessions.getState().current().messages.filter((message) => message.role === "tool").map((message) => message.content);
+  assert.ok(failures[0].includes("未启用")); assert.ok(failures[1].includes("仅文生图"));
+  complete(h.streams[1], "请配置可合成的模型"); await pending;
+});
+
+test("模型池多选界面展示全部模型与逐模型协议、能力和连接设置", async () => {
+  const { createElement } = await import("react"); const { renderToStaticMarkup } = await import("react-dom/server");
+  const ui = `data:text/javascript,${encodeURIComponent("export const Field = ({children}) => children;")}`;
+  const url = await compile("src/components/ImageModelPool.tsx", { react: import.meta.resolve("react"), "react/jsx-runtime": import.meta.resolve("react/jsx-runtime"), "./ui": ui, "../lib/imageModels": imageModelsUrl });
+  const { ImageModelPool } = await import(url); const h = await harness();
+  const config = { ...h.useConfig.getState().config.image, models: ["A", "gemini-B", "flux-C"], modelPool: [{ id: "A", apiMode: "auto" }, { id: "gemini-B", apiMode: "chat" }] };
+  const html = renderToStaticMarkup(createElement(ImageModelPool, { config, onChange() {}, onBlur() {} }));
+  assert.equal((html.match(/type="checkbox"/g) ?? []).length, 3);
+  assert.equal((html.match(/checked=""/g) ?? []).length, 2);
+  assert.ok(html.includes("完成选择")); assert.ok(html.includes("gemini-B 接口类型"));
+  assert.ok(html.includes("A 模型能力")); assert.ok(html.includes("A API Key"));
+});
+
+test("Android 返回键逐层关闭界面，首页连续两次才返回桌面并保存状态", async () => {
+  const { createBackHandler } = await import(await compile("src/lib/androidBack.ts"));
+  const calls = []; let preview = true; let panel = true; let otherTab = true; let now = 0;
+  const back = createBackHandler({
+    closePreview: () => { calls.push("preview"); if (preview) { preview = false; return true; } return false; },
+    closePanel: () => { calls.push("panel"); if (panel) { panel = false; return true; } return false; },
+    returnHome: () => { calls.push("home"); if (otherTab) { otherTab = false; return true; } return false; },
+    notify: () => calls.push("notify"), persist: () => calls.push("persist"),
+  }, () => now);
+  assert.equal(back(), "handled"); assert.deepEqual(calls, ["preview"]);
+  assert.equal(back(), "handled"); assert.deepEqual(calls.slice(-2), ["preview", "panel"]);
+  assert.equal(back(), "handled"); assert.equal(calls.at(-1), "home");
+  assert.equal(back(), "handled"); assert.equal(calls.at(-1), "notify");
+  now = 2100; assert.equal(back(), "handled"); assert.equal(calls.at(-1), "notify");
+  preview = true; assert.equal(back(), "handled");
+  assert.equal(back(), "handled", "关闭预览后重置两次返回计时");
+  now += 500; assert.equal(back(), "exit"); assert.equal(calls.at(-1), "persist");
+});
+
+test("Android 保存原图默认调用相册，另存为仍可选择系统文档目录", async () => {
+  const state = globalThis.__albumSaveTest = { album: [], writes: [], dialogs: 0, reads: [], fail: false };
+  const api = `data:text/javascript,${encodeURIComponent("export async function readImageDataUrl(path) { globalThis.__albumSaveTest.reads.push(path); return 'data:image/png;base64,YQ=='; } export async function saveImageToAlbum(dataUrl,fileName) { const s=globalThis.__albumSaveTest; s.album.push({dataUrl,fileName}); if(s.fail) throw new Error('album failed'); return 'content://media/external/images/42'; }")}`;
+  const dialog = `data:text/javascript,${encodeURIComponent("export async function save() { globalThis.__albumSaveTest.dialogs++; return 'content://documents/custom.png'; }")}`;
+  const fs = `data:text/javascript,${encodeURIComponent("export async function writeFile(path,bytes) { globalThis.__albumSaveTest.writes.push({path,bytes}); }")}`;
+  const platform = `data:text/javascript,${encodeURIComponent("export const isAndroid=true;")}`;
+  const image = await compile("src/lib/image.ts");
+  const { saveImage } = await import(await compile("src/lib/save.ts", { "./api": api, "./image": image, "./platform": platform, "@tauri-apps/plugin-dialog": dialog, "@tauri-apps/plugin-fs": fs }));
+  assert.equal(await saveImage({path:'history.png'}),'content://media/external/images/42');
+  assert.equal(state.album[0].dataUrl,'data:image/png;base64,YQ==');
+  assert.equal(state.dialogs,0); assert.equal(state.writes.length,0);
+  await saveImage({dataUrl:'data:image/png;base64,YQ=='},'file');
+  assert.equal(state.dialogs,1); assert.equal(state.writes[0].path,'content://documents/custom.png');
+  state.fail=true; await assert.rejects(saveImage({dataUrl:'data:image/png;base64,YQ=='}),/album failed/);
+  assert.equal(state.dialogs,1,"相册失败不能悄悄改为文件保存");
+});
+
+test("Chat 控制编辑/合成尺寸，省略沿用设置，显式 auto 不强制默认尺寸", async () => {
+  const { imageToolSize } = await import(imageSizeUrl);
+  assert.equal(imageToolSize(undefined, "1536x1024"), "1536x1024");
+  assert.equal(imageToolSize("auto", "1536x1024"), undefined);
+  assert.equal(imageToolSize("2048×2048", "auto"), "2048x2048");
+  assert.throws(() => imageToolSize("invalid", "auto"), /尺寸格式/);
+  const h=await harness();const cfg=h.useConfig.getState().config;
+  h.useConfig.setState({config:{...cfg,image:{...cfg.image,size:"1024x1024"}}});
+  assert.ok(h.imageTools(cfg.image)[1].function.parameters.properties.size);
+  const pending=h.useSessions.getState().send("合成输出 2048x2048",[attachment("ref")]);
+  callTool(h.streams[0],[{name:"edit_image",args:{prompt:"组合",size:"2048x2048",source_image_ids:["ref"]}}]);await tick();
+  assert.equal(h.imageCalls[0].request.size,"2048x2048");
+  h.imageCalls[0].resolve([generated("g","image-test")]);await tick();complete(h.streams[1]);await pending;
 });

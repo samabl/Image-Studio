@@ -2,6 +2,8 @@ import { create } from "zustand";
 import * as api from "./api";
 import { renderMask, uid, type Stroke } from "./image";
 import { attachmentLabel, conversationMessages, imageToolInstructions, selectImageSources, userImageContent } from "./chat";
+import { canEditImageModel, configuredImageModels, defaultImageConnection, imageModelConnection, imageModelInstructions, selectImageModel } from "./imageModels";
+import { imageToolSize } from "./imageSize";
 import type {
   AppConfig,
   ChatAttachment,
@@ -136,7 +138,9 @@ export const useConfig = create<ConfigState>((set, get) => {
 export function channelReady(kind: "chat" | "image"): boolean {
   const cfg = useConfig.getState().config;
   if (!cfg) return false;
-  const ch = kind === "chat" ? cfg.chat : cfg.image;
+  let ch;
+  try { ch = kind === "chat" ? cfg.chat : defaultImageConnection(cfg.image); }
+  catch { return false; }
   return Boolean(ch.baseUrl.trim() && ch.apiKey.trim() && ch.model.trim());
 }
 
@@ -244,14 +248,7 @@ interface StudioState {
 function imageRequestBase() {
   const cfg = useConfig.getState().config;
   if (!cfg) throw new Error("配置尚未加载");
-  const img = cfg.image;
-  return {
-    baseUrl: img.baseUrl,
-    apiKey: img.apiKey,
-    model: img.model,
-    apiMode: img.apiMode,
-    timeoutSecs: img.timeoutSecs,
-  };
+  return defaultImageConnection(cfg.image);
 }
 
 let studioCancel: (() => void) | null = null;
@@ -577,6 +574,7 @@ interface SessionState {
   removeDraftAtt: (id: string) => void;
   moveDraftAtt: (id: string, offset: number) => void;
   clearDraftAtts: () => void;
+  setImageModel: (model: string) => void;
   send: (text: string, attachments: ChatAttachment[]) => Promise<void>;
   stop: (sessionId?: string) => void;
   regenerate: () => Promise<void>;
@@ -592,7 +590,17 @@ let persistenceQueue: Promise<void> = Promise.resolve();
 let draftSaveTimer: ReturnType<typeof setTimeout> | null = null;
 
 /** 提供给对话模型的图像工具定义。 */
-export function imageTools(): unknown[] {
+export function imageTools(config?: ImageConfig, pinned = ""): unknown[] {
+  const pool = config ? configuredImageModels(config) : [];
+  const ids = pool.map((model) => model.id);
+  const editIds = pool.filter((model) => canEditImageModel(model) && (!pinned || model.id === pinned)).map((model) => model.id);
+  const modelParameter = {
+    type: "string",
+    ...(ids.length ? { enum: pinned && ids.includes(pinned) ? [pinned] : ids } : {}),
+    description: pinned ? `当前会话指定的生图模型：${pinned}` : "从已启用的生图模型中选择，填写准确模型 ID。",
+  };
+  const stageParameter = { type: "string", enum: ["asset", "final"], description: "asset：分工中的中间素材，只执行当前部件任务；final：最终成图/合成。默认 final。" };
+  const sizeParameter = { type: "string", description: "输出尺寸，使用服务支持的宽x高字符串，如 1024x1024、1536x1024、1024x1536、2048x2048 或 3840x2160；auto 交给图像模型决定。未提供时沿用用户设置。Gemini/兼容 Chat 按尺寸转换为比例和分辨率档位，实际尺寸由服务决定。" };
   return [
     {
       type: "function",
@@ -603,6 +611,8 @@ export function imageTools(): unknown[] {
         parameters: {
           type: "object",
           properties: {
+            model: modelParameter,
+            stage: stageParameter,
             source_image_ids: {
               type: "array", items: { type: "string" },
               description: "按输入顺序排列的图片 ID；编辑时第一张为编辑基底，其余为参考。使用消息中标记的图片 ID。",
@@ -612,18 +622,14 @@ export function imageTools(): unknown[] {
               description:
                 "忠实表达用户要求的完整提示词，保留指定文字、语言、数量与构图，禁止擅自改变要求。",
             },
-            size: {
-              type: "string",
-              enum: ["1024x1024", "1536x1024", "1024x1536", "auto"],
-              description: "画面比例：正方形、横向、纵向。默认 1024x1024。",
-            },
+            size: sizeParameter,
             n: { type: "integer", description: "生成数量，默认 1，最多 4。" },
           },
-          required: ["prompt"],
+          required: ids.length > 1 ? ["prompt", "model"] : ["prompt"],
         },
       },
     },
-    {
+    ...(!config || editIds.length ? [{
       type: "function",
       function: {
         name: "edit_image",
@@ -632,6 +638,10 @@ export function imageTools(): unknown[] {
         parameters: {
           type: "object",
           properties: {
+            model: { ...modelParameter, ...(config ? { enum: editIds } : {}) },
+            stage: stageParameter,
+            size: sizeParameter,
+            n: { type: "integer", description: "输出数量，默认 1，最多 4。" },
             source_image_ids: {
               type: "array", items: { type: "string" },
               description: "按输入顺序排列的图片 ID；编辑时第一张为编辑基底，其余为参考。使用消息中标记的图片 ID。",
@@ -641,10 +651,10 @@ export function imageTools(): unknown[] {
               description: "编辑指令，说明要如何改动原图，未被提及的部分应保持不变。",
             },
           },
-          required: ["prompt"],
+          required: ids.length > 1 ? ["prompt", "model"] : ["prompt"],
         },
       },
-    },
+    }] : []),
   ];
 }
 
@@ -671,6 +681,9 @@ export const useSessions = create<SessionState>((set, get) => {
       draft({ draftAtts: atts });
     },
     clearDraftAtts: () => draft({ draftAtts: [] }),
+    setImageModel: (imageModel) => {
+      if (get().currentId && !get().runs[get().currentId!]) draft({ imageModel });
+    },
     init: async () => {
       try {
         const raw = await api.loadState("sessions");
@@ -751,6 +764,7 @@ async function runTurn(sessionId: string, set: Setter, get: () => SessionState):
   const cfg = useConfig.getState().config;
   if (!cfg || get().runs[sessionId]) return;
   const runId = uid("run");
+  const pinnedImageModel = get().sessions.find((session) => session.id === sessionId)?.imageModel ?? "";
   let stopped = false;
   let abort: (() => void) | null = null;
   const cancel = () => { stopped = true; abort?.(); };
@@ -788,11 +802,11 @@ async function runTurn(sessionId: string, set: Setter, get: () => SessionState):
           baseUrl: cfg.chat.baseUrl, apiKey: cfg.chat.apiKey, model: cfg.chat.model,
           messages: [
             ...(cfg.chat.systemPrompt.trim() ? [{ role: "system", content: cfg.chat.systemPrompt }] : []),
-            ...(cfg.linkage.enabled && cfg.linkage.useTools ? [{ role: "system", content: imageToolInstructions(session.messages) }] : []),
+            ...(cfg.linkage.enabled && cfg.linkage.useTools ? [{ role: "system", content: `${imageToolInstructions(session.messages)}\n\n${imageModelInstructions(cfg.image, pinnedImageModel)}` }] : []),
             ...history,
           ],
           temperature: cfg.chat.temperature, maxTokens: cfg.chat.maxTokens,
-          tools: useTools ? imageTools() : null, timeoutSecs: cfg.chat.timeoutSecs,
+          tools: useTools ? imageTools(cfg.image, pinnedImageModel) : null, timeoutSecs: cfg.chat.timeoutSecs,
         }, (event) => {
           if (settled || !active()) return;
           const cur = get().runs[sessionId]?.streaming;
@@ -830,22 +844,28 @@ async function runTurn(sessionId: string, set: Setter, get: () => SessionState):
           const args = JSON.parse(call.arguments || "{}") as Record<string, unknown>;
           const prompt = String(args.prompt ?? "").trim();
           if (!prompt) throw new Error("模型没有给出图像指令");
+          const imageModel = selectImageModel(cfg.image, args.model, pinnedImageModel);
+          const connection = imageModelConnection(cfg.image, imageModel);
+          if (!connection.baseUrl || !connection.apiKey) throw new Error(`请先配置生图模型 ${imageModel.id} 的服务地址和 API Key`);
           const sources = call.name === "edit_image" ? selectImageSources(conv.messages, args.source_image_ids) :
             args.source_image_ids !== undefined ? selectImageSources(conv.messages, args.source_image_ids) : [];
+          if ((call.name === "edit_image" || sources.length) && !canEditImageModel(imageModel)) throw new Error(`生图模型 ${imageModel.id} 已设为仅文生图，请选择支持参考图/合成的模型`);
           if (call.name === "edit_image" && !sources.length) throw new Error("没有选择可用的参考图片");
           const images = await Promise.all(sources.map((image) => image.dataUrl || (image.path ? api.readImageDataUrl(image.path) : Promise.reject(new Error("参考图片无法读取")))));
           if (!active()) throw new Error("已停止");
           const sourceLabels = sources.map((source) => source.label);
-          const sentPrompt = `${prompt}\n\n用户原始要求（必须保留文字、数量、构图、素材对应关系与禁止项）：\n${original}`;
-          update(messageId, { toolCalls: readSession()?.messages.find((m) => m.id === messageId)?.toolCalls?.map((tc) => tc.id === call.id ? { ...tc, sourceLabels, sentPrompt } : tc) });
-          patchRun({ toolNote: sources.length ? `正在使用 ${sources.length} 张素材编辑图像…` : "正在生成图片…" });
+          const imageStage = args.stage === "asset" ? "asset" : "final";
+          const outputSize = imageToolSize(args.size, cfg.image.size);
+          const sentPrompt = `${prompt}\n\n${imageStage === "asset" ? "整体任务背景（本次仅生成上面指令指定的中间素材，不执行其他模型的步骤或提前合成；保留与本素材有关的文字、数量、对应关系与禁止项）：" : "用户原始要求（必须保留文字、数量、构图、素材对应关系与禁止项）："}\n${original}`;
+          update(messageId, { toolCalls: readSession()?.messages.find((m) => m.id === messageId)?.toolCalls?.map((tc) => tc.id === call.id ? { ...tc, sourceLabels, sentPrompt, imageModel: connection.model, imageApiMode: connection.apiMode, imageStage } : tc) });
+          patchRun({ toolNote: `${connection.model} · ${sources.length ? `正在使用 ${sources.length} 张素材编辑图像…` : "正在生成图片…"}` });
           const imgCfg = cfg.image;
           const request = api.cancellableImage({
-            baseUrl: imgCfg.baseUrl, apiKey: imgCfg.apiKey, model: imgCfg.model, apiMode: imgCfg.apiMode,
+            ...connection,
             prompt: sentPrompt,
             images, imageLabels: sourceLabels,
             n: Math.min(Math.max(Math.floor(Number(args.n ?? 1)) || 1, 1), 4),
-            size: typeof args.size === "string" && args.size !== "auto" ? args.size : imgCfg.size === "auto" ? undefined : imgCfg.size,
+            size: outputSize,
             quality: imgCfg.quality, background: imgCfg.background, outputFormat: imgCfg.outputFormat, timeoutSecs: imgCfg.timeoutSecs,
           }, sources[0]?.galleryId);
           abort = request.cancel;
@@ -853,7 +873,7 @@ async function runTurn(sessionId: string, set: Setter, get: () => SessionState):
           const items = await request.promise;
           abort = null;
           useGallery.getState().add(items);
-          update(toolId, { pending: false, content: `已生成 ${items.length} 张图片。`, images: items.map((item) => ({
+          update(toolId, { pending: false, content: `已生成 ${items.length} 张${imageStage === "asset" ? "中间素材，请继续剩余生成/合成步骤" : "图片"}。`, images: items.map((item) => ({
             galleryId: item.id, path: item.path, dataUrl: item.dataUrl ?? undefined, prompt: item.prompt, size: item.size, model: item.model,
           })) });
         } catch (err) {

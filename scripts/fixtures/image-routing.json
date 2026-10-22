@@ -1,0 +1,16 @@
+[
+  {"model":"gpt-image-2.5","baseUrl":"https://gateway.example/v1","mode":"auto","expected":"images"},
+  {"model":"DALL-E-3","baseUrl":"https://gateway.example","mode":"auto","expected":"images"},
+  {"model":"gemini-2.5-flash-image","baseUrl":"https://gateway.example/v1","mode":"auto","expected":"chat"},
+  {"model":"models/gemini-2.5-flash-image","baseUrl":"https://generativelanguage.googleapis.com/v1beta","mode":"auto","expected":"gemini"},
+  {"model":"nano-banana","baseUrl":"https://gateway.example/v1","mode":"auto","expected":"chat"},
+  {"model":"NANOBANANA","baseUrl":"https://gateway.example/v1","mode":"auto","expected":"chat"},
+  {"model":"nano_banana","baseUrl":"https://gateway.example","mode":"auto","expected":"chat"},
+  {"model":"custom-image","baseUrl":"https://gateway.example/v1beta/models/custom-image:generateContent","mode":"auto","expected":"gemini"},
+  {"model":"custom-image","baseUrl":"https://gateway.example/v1/chat/completions/","mode":"auto","expected":"chat"},
+  {"model":"gemini-alias","baseUrl":"https://gateway.example/v1/images/generations","mode":"auto","expected":"images"},
+  {"model":"unknown-alias","baseUrl":"https://gateway.example/v1","mode":"auto","expected":"images"},
+  {"model":"gemini-alias","baseUrl":"https://gateway.example/v1","mode":"images","expected":"images"},
+  {"model":"gpt-image-2.5","baseUrl":"https://gateway.example/v1","mode":"chat","expected":"chat"},
+  {"model":"custom-alias","baseUrl":"https://gateway.example/v1beta","mode":"gemini","expected":"gemini"}
+]

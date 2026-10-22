@@ -1,11 +1,13 @@
 import { useEffect, useState } from "react";
 import { Field, Switch } from "./ui";
 import { ModelPicker } from "./ModelPicker";
+import { ImageModelPool } from "./ImageModelPool";
+import { configuredImageModels, defaultImageConnection, IMAGE_API_LABELS, resolveImageApiMode } from "../lib/imageModels";
 import { useConfig, useGallery, useToast } from "../lib/store";
 import { backgroundTaskStatus, configureBackgroundTasks, listModels } from "../lib/api";
 import { openLocalPath } from "../lib/shell";
 import { isAndroid, isDesktop } from "../lib/platform";
-import type { ChatProtocol } from "../types";
+import type { ChatProtocol, ImageApiMode } from "../types";
 
 export function SettingsView() {
   const cfg = useConfig((s) => s.config);
@@ -37,7 +39,7 @@ export function SettingsView() {
     }
     setLoading(kind);
     try {
-      const models = await listModels(ch.baseUrl, ch.apiKey, kind === "chat" ? cfg.chat.protocol : cfg.image.apiMode === "gemini" ? "gemini" : "openai");
+      const models = await listModels(ch.baseUrl, ch.apiKey, kind === "chat" ? cfg.chat.protocol : resolveImageApiMode(cfg.image.apiMode, cfg.image.model, cfg.image.baseUrl) === "gemini" ? "gemini" : "openai");
       if (models.length === 0) {
         note("error", "接口没有返回任何模型");
       } else {
@@ -251,26 +253,31 @@ export function SettingsView() {
                 </button>
               }
             >
-              <ModelPicker value={cfg.image.model} models={cfg.image.models}
+              <ModelPicker value={cfg.image.model} models={[...new Set([...cfg.image.models, ...configuredImageModels(cfg.image).map((model) => model.id)])]}
                 onChange={(model) => patchImage({ model })} onBlur={() => void flush()} />
             </Field>
 
             <Field
-              label="接口形态"
-              hint="images：走 /images/generations 与 /images/edits（gpt-image 系列）。chat：走 /chat/completions 的 modalities 出图（Gemini 系图像模型）。"
+              label="默认接口类型"
+              hint={`当前默认模型使用 ${IMAGE_API_LABELS[defaultImageConnection(cfg.image).apiMode]}。自动按模型 ID 与服务地址预判，模型池中的单独配置优先。`}
             >
               <select
                 className="input"
                 value={cfg.image.apiMode}
                 onChange={(e) => {
-                  patchImage({ apiMode: e.target.value as "images" | "chat" });
+                  patchImage({ apiMode: e.target.value as ImageApiMode });
                   void flush();
                 }}
               >
+                <option value="auto">自动识别 · 根据模型 ID 和服务地址</option>
                 <option value="images">images —— 标准图像接口</option>
                 <option value="gemini">Gemini 原生 · Generate Content</option>
                 <option value="chat">chat —— 多模态对话出图</option>
               </select>
+            </Field>
+
+            <Field label="Chat 生图模型池">
+              <ImageModelPool config={cfg.image} onChange={(modelPool) => patchImage({ modelPool })} onBlur={() => void flush()} />
             </Field>
 
             <div className="grid-2">

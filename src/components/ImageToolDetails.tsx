@@ -1,6 +1,7 @@
 import { copyText } from "../lib/shell";
 import { useToast } from "../lib/store";
 import type { ToolCall } from "../types";
+import { IMAGE_API_LABELS } from "../lib/imageModels";
 
 /** 工具指令就是 AI 润色后的提示词，必须作为消息保留，不能只放在临时状态里。 */
 export function ImageToolDetails({ call, labels, sentPrompt }: {
@@ -18,7 +19,9 @@ export function ImageToolDetails({ call, labels, sentPrompt }: {
     <details className="image-tool-details" open>
       <summary>🔧 {name}</summary>
       <div className="image-tool-content">
+        {(call.imageModel || typeof args?.model === "string") && <div className="image-tool-sources">生图模型：{call.imageModel || String(args.model)}{call.imageApiMode ? ` · ${IMAGE_API_LABELS[call.imageApiMode]}` : ""}{(call.imageStage || args.stage) ? ` · ${(call.imageStage || args.stage) === "asset" ? "中间素材" : "最终成图"}` : ""}</div>}
         {sources.length > 0 && <div className="image-tool-sources">输入顺序：{sources.join(" → ")}</div>}
+        {typeof args?.size === "string" && <div className="image-tool-sources">请求尺寸：{args.size === "auto" ? "模型自动决定" : args.size}</div>}
         <div className="image-tool-prompt">{prompt || "模型未提供图像指令"}</div>
         <button type="button" className="btn sm ghost" onClick={() => void copyText(prompt)
           .then(() => useToast.getState().push("success", "已复制完整指令"))

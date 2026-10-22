@@ -21,6 +21,13 @@ function Install-AndroidBackgroundTasks {
             [void]$manifest.DocumentElement.InsertBefore($entry, $application)
         }
     }
+    $legacy = $manifest.SelectSingleNode('/manifest/uses-permission[@android:name="android.permission.WRITE_EXTERNAL_STORAGE"]', $ns)
+    if ($null -eq $legacy) {
+        $legacy = $manifest.CreateElement('uses-permission')
+        [void]$legacy.SetAttribute('name', $androidNs, 'android.permission.WRITE_EXTERNAL_STORAGE')
+        [void]$manifest.DocumentElement.InsertBefore($legacy, $application)
+    }
+    [void]$legacy.SetAttribute('maxSdkVersion', $androidNs, '28')
     $service = $manifest.SelectSingleNode('/manifest/application/service[@android:name="app.imagestudio.background.BackgroundTasksService"]', $ns)
     if ($null -eq $service) {
         $service = $manifest.CreateElement('service')

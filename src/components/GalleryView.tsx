@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Empty, Seg } from "./ui";
 import { GalleryThumb, showImage } from "./Overlays";
 import { useConfig, useGallery, useSessions, useStudio, useToast, reversePromptText } from "../lib/store";
@@ -22,6 +22,14 @@ export function GalleryView() {
   const [filter, setFilter] = useState<Filter>("all");
   const [confirmClear, setConfirmClear] = useState(false);
   const note = useToast((s) => s.push);
+  useEffect(() => {
+    const back = (event: Event) => {
+      if (confirmClear) { event.preventDefault(); setConfirmClear(false); }
+      else if (selected.length) { event.preventDefault(); clearSelection(); }
+    };
+    window.addEventListener("image-studio-back", back);
+    return () => window.removeEventListener("image-studio-back", back);
+  }, [confirmClear, selected.length, clearSelection]);
 
   const shown = useMemo(
     () => (filter === "all" ? items : items.filter((i) => i.kind === filter)),

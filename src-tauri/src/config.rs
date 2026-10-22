@@ -68,10 +68,35 @@ impl Default for ChatConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
+pub struct ImageModelConfig {
+    pub id: String,
+    pub api_mode: String,
+    pub description: String,
+    pub supports_editing: Option<bool>,
+    pub base_url: String,
+    pub api_key: String,
+}
+
+impl Default for ImageModelConfig {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            api_mode: "auto".into(),
+            description: String::new(),
+            supports_editing: None,
+            base_url: String::new(),
+            api_key: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 pub struct ImageConfig {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    /// `auto` = 按模型 ID 与服务地址预判，可逐模型覆盖；
     /// `images` = 走 /images/generations 与 /images/edits；
     /// `chat`   = 走 /chat/completions 的 modalities 出图（Gemini 系图像模型）。
     pub api_mode: String,
@@ -83,6 +108,7 @@ pub struct ImageConfig {
     pub timeout_secs: u64,
     #[serde(default)]
     pub models: Vec<String>,
+    pub model_pool: Vec<ImageModelConfig>,
 }
 
 impl Default for ImageConfig {
@@ -91,7 +117,7 @@ impl Default for ImageConfig {
             base_url: "http://10.213.196.114:3000".into(),
             api_key: String::new(),
             model: "gpt-image-2".into(),
-            api_mode: "images".into(),
+            api_mode: "auto".into(),
             size: "1024x1024".into(),
             // quality / background / output_format 默认 "auto" = 不下发该参数，
             // 换取对各家网关的最大兼容性，用户可在高级设置里显式指定。
@@ -102,6 +128,7 @@ impl Default for ImageConfig {
             // gpt-image-2.5 实测单张可超过 2 分钟，默认给足余量。
             timeout_secs: 600,
             models: Vec::new(),
+            model_pool: Vec::new(),
         }
     }
 }

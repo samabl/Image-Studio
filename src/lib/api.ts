@@ -44,6 +44,7 @@ export function startBackgroundTask() {
 
 export const backgroundTaskStatus = () => call<{ batteryOptimizationIgnored: boolean; notificationsEnabled: boolean }>("background_task_status");
 export const configureBackgroundTasks = () => call<void>("background_task_configure");
+export const saveImageToAlbum = (dataUrl: string, fileName: string) => call<string>("save_image_to_album", { dataUrl, fileName });
 
 // --- 模型 -----------------------------------------------------------------
 

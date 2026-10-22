@@ -24,6 +24,105 @@ fn image() -> ImageRequest {
 }
 
 #[test]
+fn image_routing_matches_shared_frontend_fixtures() {
+    let fixtures: Vec<Value> =
+        serde_json::from_str(include_str!("../../scripts/fixtures/image-routing.json")).unwrap();
+    for fixture in fixtures {
+        let actual = ai::resolve_image_api_mode(
+            fixture["model"].as_str().unwrap(),
+            fixture["baseUrl"].as_str().unwrap(),
+            fixture["mode"].as_str(),
+        )
+        .unwrap();
+        assert_eq!(actual, fixture["expected"].as_str().unwrap(), "{fixture}");
+    }
+    assert!(
+        ai::resolve_image_api_mode("alias", "https://example.test", Some("unsupported")).is_err()
+    );
+}
+
+#[test]
+fn image_model_pool_config_keeps_legacy_values_and_roundtrips_new_fields() {
+    use gpt_image_studio_lib::config::AppConfig;
+    let legacy: AppConfig = serde_json::from_value(
+        json!({"image": {"model": "old-model", "apiMode": "images", "apiKey": "test-key"}}),
+    )
+    .unwrap();
+    assert_eq!(legacy.image.model, "old-model");
+    assert_eq!(legacy.image.api_mode, "images");
+    assert_eq!(legacy.image.api_key, "test-key");
+    assert!(legacy.image.model_pool.is_empty());
+    let cfg: AppConfig = serde_json::from_value(json!({"image": {"modelPool": [
+        {"id": "A"}, {"id": "C", "apiMode": "gemini", "supportsEditing": true, "description": "最终合成", "baseUrl": "https://example.test/v1beta", "apiKey": "C-test-key"}
+    ]}})).unwrap();
+    assert_eq!(cfg.image.model_pool[0].api_mode, "auto");
+    assert_eq!(cfg.image.model_pool[1].supports_editing, Some(true));
+    let saved = serde_json::to_value(&cfg).unwrap();
+    assert_eq!(
+        saved["image"]["modelPool"][1]["baseUrl"],
+        "https://example.test/v1beta"
+    );
+    assert_eq!(saved["image"]["modelPool"][1]["description"], "最终合成");
+}
+
+#[tokio::test]
+async fn automatic_image_routes_send_real_requests_to_images_chat_and_native_endpoints() {
+    let responses = [
+        json!({"data":[{"b64_json":"YQ=="}]}),
+        json!({"choices":[{"message":{"images":[{"image_url":{"url":"data:image/png;base64,YQ=="}}]}}]}),
+        json!({"candidates":[{"content":{"parts":[{"inlineData":{"mimeType":"image/png","data":"YQ=="}}]}}]}),
+    ];
+    for (i, response) in responses.into_iter().enumerate() {
+        let (base, handle) = server("application/json", response.to_string(), false);
+        let mut req = image();
+        req.api_mode = Some("auto".into());
+        req.api_key = format!("model-{i}-test-key");
+        req.model = ["gpt-image-A", "gemini-B", "model-C"][i].into();
+        req.size = Some(["1536x1024", "2048x2048", "3840x2160"][i].into());
+        req.base_url = if i == 2 {
+            format!("{base}/v1beta/models/model-C:generateContent")
+        } else {
+            base
+        };
+        if i < 2 {
+            req.images.clear();
+        }
+        let images = ai::run_image_request(&req).await.unwrap();
+        assert_eq!(images[0].bytes, b"a");
+        let request = handle.join().unwrap();
+        let body: Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+        if i == 0 {
+            assert!(request.starts_with("POST /v1/images/generations "));
+            assert_eq!(body["model"], "gpt-image-A");
+            assert_eq!(body["size"], "1536x1024");
+        } else if i == 1 {
+            assert!(request.starts_with("POST /v1/chat/completions "));
+            assert_eq!(body["model"], "gemini-B");
+            assert_eq!(body["modalities"][0], "image");
+            assert_eq!(body["image_config"]["aspect_ratio"], "1:1");
+            assert_eq!(body["image_config"]["image_size"], "2K");
+        } else {
+            assert!(request.starts_with("POST /v1beta/models/model-C:generateContent "));
+            assert!(request.contains("x-goog-api-key: model-2-test-key"));
+            assert!(!request.contains("authorization:"));
+            assert_eq!(
+                body["generationConfig"]["imageConfig"]["aspectRatio"],
+                "16:9"
+            );
+            assert_eq!(body["generationConfig"]["imageConfig"]["imageSize"], "4K");
+            assert_eq!(
+                body["contents"][0]["parts"][2]["inlineData"]["data"],
+                "YQ=="
+            );
+            assert_eq!(
+                body["contents"][0]["parts"][4]["inlineData"]["data"],
+                "Yg=="
+            );
+        }
+    }
+}
+
+#[test]
 fn anthropic_messages_preserve_image_order_and_tools() {
     let body = native::build_chat_body(&chat("anthropic"), true).unwrap();
     assert_eq!(body["system"], "保留用户要求");
@@ -35,6 +134,30 @@ fn anthropic_messages_preserve_image_order_and_tools() {
     );
     assert_eq!(body["tools"][0]["input_schema"]["required"][0], "prompt");
     assert!(body.get("modalities").is_none());
+}
+
+#[test]
+fn image_sizes_convert_to_supported_ratios_and_resolution_without_forcing_auto() {
+    assert_eq!(native::image_dimensions(Some("auto")).unwrap(), None);
+    assert_eq!(native::image_dimensions(None).unwrap(), None);
+    assert_eq!(
+        native::image_dimensions(Some("1536x1024")).unwrap(),
+        Some(("3:2", None))
+    );
+    assert_eq!(
+        native::image_dimensions(Some("2160x3840")).unwrap(),
+        Some(("9:16", Some("4K")))
+    );
+    assert_eq!(
+        native::image_dimensions(Some("2048×2048")).unwrap(),
+        Some(("1:1", Some("2K")))
+    );
+    assert_eq!(
+        native::image_dimensions(Some("1200x1600")).unwrap(),
+        Some(("3:4", None))
+    );
+    assert!(native::image_dimensions(Some("invalid")).is_err());
+    assert!(native::image_dimensions(Some("0x1024")).is_err());
 }
 
 #[test]

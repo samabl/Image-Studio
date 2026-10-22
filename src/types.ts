@@ -18,7 +18,18 @@ export interface ChatConfig {
   models: string[];
 }
 
-export type ImageApiMode = "images" | "chat" | "gemini";
+export type ImageApiMode = "auto" | "images" | "chat" | "gemini";
+export type ResolvedImageApiMode = Exclude<ImageApiMode, "auto">;
+
+export interface ImageModelConfig {
+  id: string;
+  apiMode: ImageApiMode;
+  description?: string;
+  supportsEditing?: boolean;
+  /** 留空沿用图像连接；不同服务地址需填写该服务的密钥。 */
+  baseUrl?: string;
+  apiKey?: string;
+}
 
 export interface ImageConfig {
   baseUrl: string;
@@ -33,6 +44,8 @@ export interface ImageConfig {
   n: number;
   timeoutSecs: number;
   models: string[];
+  /** 供 Chat 选择的模型池；旧配置/空池沿用默认模型。 */
+  modelPool?: ImageModelConfig[];
 }
 
 export interface LinkageConfig {
@@ -93,6 +106,9 @@ export interface ToolCall {
   /** 本地展示元数据，不透传协议；保留实际输入顺序与完整发送指令。 */
   sourceLabels?: string[];
   sentPrompt?: string;
+  imageModel?: string;
+  imageApiMode?: ResolvedImageApiMode;
+  imageStage?: "asset" | "final";
 }
 
 export interface ChatAttachment {
@@ -139,6 +155,8 @@ export interface ChatSession {
   updatedAt: number;
   draftText?: string;
   draftAtts?: ChatAttachment[];
+  /** 空值表示让 Chat 从已启用的模型池中选择。 */
+  imageModel?: string;
 }
 
 // ---------------------------------------------------------------------------

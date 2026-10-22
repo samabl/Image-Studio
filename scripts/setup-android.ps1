@@ -230,6 +230,11 @@ Install-AndroidBackgroundTasks `
     -SourceRoot (Join-Path $root 'src-tauri/android')
 Ok '已安装 Android 后台任务服务与所需权限'
 
+# 重新构建已有生成工程时也更新图标；自适应前景/背景保持与版本控制资产一致。
+Copy-Item -Path (Join-Path $root 'src-tauri/icons/android/*') `
+    -Destination (Join-Path $root 'src-tauri/gen/android/app/src/main/res') -Recurse -Force
+Ok '已同步 Android 启动图标与自适应前景/背景'
+
 Write-Host "`n完成。`n" -ForegroundColor Green
 Write-Host @"
 后续命令：

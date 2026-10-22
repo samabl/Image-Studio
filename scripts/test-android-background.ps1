@@ -22,7 +22,9 @@ try {
     Install-AndroidBackgroundTasks -AndroidRoot $fixtureRoot -SourceRoot $source
     $first = [IO.File]::ReadAllText($manifestPath)
     [xml]$doc = $first
-    Assert-Background ($doc.manifest.'uses-permission'.Count -eq 6) '后台服务、电池优化和通知权限完整注入'
+    Assert-Background ($doc.manifest.'uses-permission'.Count -eq 7) '后台服务、电池优化、通知与旧版相册权限完整注入'
+    $legacy = $doc.manifest.'uses-permission' | Where-Object { $_.name -eq 'android.permission.WRITE_EXTERNAL_STORAGE' }
+    Assert-Background ($legacy.maxSdkVersion -eq '28') '旧存储权限只适用于 Android 9 及以下'
     Assert-Background ($doc.manifest.application.activity.name -eq '.MainActivity') '保留现有 Activity'
     Assert-Background ($doc.manifest.application.provider.authorities -eq '${applicationId}.fileprovider') '保留 FileProvider 占位符'
     Assert-Background ($doc.manifest.application.networkSecurityConfig -eq '@xml/network_security_config') '保留内网流量配置'

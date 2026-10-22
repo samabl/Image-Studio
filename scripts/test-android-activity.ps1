@@ -19,6 +19,7 @@ try {
     $installed = [IO.File]::ReadAllText($activityPath)
     Assert-Activity ($installed.StartsWith('package com.example.renamed')) '保留生成工程的 package，支持 identifier 改名'
     Assert-Activity (-not $installed.Contains('__APP_PACKAGE__')) '模板占位符已完全替换'
+    Assert-Activity ($installed.Contains('onBackPressedDispatcher.addCallback') -and $installed.Contains('window.__imageStudioBack') -and $installed.Contains('moveTaskToBack(true)')) '返回键进入前端分层处理，仅明确返回桌面时移到后台'
     $bytes = [IO.File]::ReadAllBytes($activityPath)
     Assert-Activity (-not ($bytes[0] -eq 0xef -and $bytes[1] -eq 0xbb -and $bytes[2] -eq 0xbf)) 'Kotlin 文件使用无 BOM 的 UTF-8'
     Install-AndroidActivityInsets -JavaRoot $javaRoot -TemplatePath $template
