@@ -130,6 +130,27 @@ export function juryFeedback(review: JuryReview): string {
 
 type TextTask = { promise: Promise<string>; cancel: () => void };
 
+/** 单个评审最多尝试次数：网络抖动、限流或返回格式不合法时自动重试，而不是直接判失败。 */
+const JURY_ATTEMPTS = 3;
+const JURY_NETWORK_ERROR = /超时|timed out|timeout|网络|连接|connection|sending request|error sending|HTTP\s*(429|5\d\d)|rate limit|服务不可用|decoding response|unexpected end/i;
+const JURY_FORMAT_ERROR = /有效 JSON|空意见|空内容/i;
+
+/** 重试时把要求说得更死：格式错误多半是模型把 JSON 裹在解释文字里。 */
+function retryJuryRequest(request: ChatRequest, scoring: boolean): ChatRequest {
+  const hint = scoring
+    ? "上一次的回答没有被接受：必须只输出一个 JSON 对象（可以放在 ```json 代码块里），包含 score、summary、checks，分数为 0–100，不要输出解释、道歉或其他文字。"
+    : "上一次的回答没有被接受：请直接给出评审意见，不要道歉或输出无关说明。";
+  return {
+    ...request,
+    messages: request.messages.map((message) => {
+      if (!message || typeof message !== "object") return message;
+      const item = message as { role?: unknown; content?: unknown };
+      if (item.role !== "system" || typeof item.content !== "string") return message;
+      return { ...item, content: `${item.content}\n${hint}` };
+    }),
+  };
+}
+
 /** 并行独立评审；取消会立即收束全部评审，迟到结果不再写入历史。 */
 export function startJuryReview(
   config: AppConfig,
@@ -160,21 +181,38 @@ export function startJuryReview(
   };
   publish();
   const promise = Promise.all(members.map(async (member, index) => {
-    let task: TextTask | undefined;
-    try {
-      task = requestText(juryRequest(member, config, input));
-      tasks.add(task);
-      const result = await Promise.race([task.promise.then((text) => ({ text })), cancellation.then(() => ({ canceled: true }))]);
-      if ("canceled" in result || stopped) return;
-      const text = jurySafeText(result.text.trim(), config);
-      if (!text) throw new Error("评审模型返回了空意见");
-      const goalScore = input.scoring ? parseGoalScore(text) : undefined;
-      update(index, { status: "complete", text, ...(goalScore ? { goalScore } : {}) });
-    } catch (error) {
-      update(index, { status: "error", error: jurySafeText(error, config) });
-    } finally {
-      if (task) tasks.delete(task);
+    let lastError: unknown = new Error("评审未执行");
+    for (let attempt = 1; attempt <= JURY_ATTEMPTS; attempt += 1) {
+      let task: TextTask | undefined;
+      try {
+        const request = juryRequest(member, config, input);
+        task = requestText(attempt === 1 ? request : retryJuryRequest(request, Boolean(input.scoring)));
+        tasks.add(task);
+        const result = await Promise.race([task.promise.then((text) => ({ text })), cancellation.then(() => ({ canceled: true }))]);
+        if ("canceled" in result || stopped) return;
+        const text = jurySafeText(result.text.trim(), config);
+        if (!text) throw new Error("评审模型返回了空意见");
+        const goalScore = input.scoring ? parseGoalScore(text) : undefined;
+        update(index, { status: "complete", text, ...(goalScore ? { goalScore } : {}) });
+        return;
+      } catch (error) {
+        lastError = error;
+        if (stopped) return;
+        const message = error instanceof Error ? error.message : String(error);
+        const networkError = JURY_NETWORK_ERROR.test(message);
+        const formatError = JURY_FORMAT_ERROR.test(message);
+        // 配置/协议/鉴权类错误重试也不会变好，直接记录失败。
+        if ((!networkError && !formatError) || attempt >= JURY_ATTEMPTS) break;
+        update(index, { status: "pending", error: undefined });
+        if (networkError) {
+          await Promise.race([new Promise((resolve) => setTimeout(resolve, 800 * attempt)), cancellation]);
+          if (stopped) return;
+        }
+      } finally {
+        if (task) tasks.delete(task);
+      }
     }
+    update(index, { status: "error", error: jurySafeText(lastError, config) });
   })).then(() => {
     if (!stopped) {
       const completed = review.opinions.filter((opinion) => opinion.status === "complete").length;

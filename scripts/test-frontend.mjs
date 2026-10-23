@@ -1237,7 +1237,7 @@ test("个别评审失败时忽略该成员继续评分，不结束 Goal，也不
   sessions().setGoal({enabled:true,scorer:"jury",targetScore:85});
   const pending=sessions().send("真实图像",[]); callTool(h.streams[0],[{args:{prompt:"真实图像"}}]); await tick();
   h.imageCalls[0].resolve([generated("partial_score","image-test")]); await tick();
-  h.textCalls[0].resolve(scoreJSON(99)); h.textCalls[1].resolve("我给 100 分"); await tick();
+  h.textCalls[0].resolve(scoreJSON(99)); h.textCalls[1].reject(new Error("不支持看图")); await tick();
   callTool(h.streams[1],[{name:"review_goal",args:{image_ids:["image_partial_score"]}}]); await tick();
   assert.equal(h.textCalls.length,2,"同一批图片不会重复付费评审");
   const review=sessions().current().messages.at(-1).goalReview;
@@ -1261,6 +1261,24 @@ test("成图自动评审后再调用 review_images 不会重复评审同一批�
   assert.equal(tool.juryReview,undefined,"不再生成第二个评审面板");
   assert.match(tool.content,/已经评审过/);
   complete(h.streams[2]); await pending;
+});
+
+test("评审返回无效 JSON 时自动重试该成员，而不是直接判失败", async (t) => {
+  const h=await harness(); guardHarness(t,h); const sessions=h.useSessions.getState;
+  h.useConfig.setState({config:withJury(h.useConfig.getState().config)});
+  sessions().setGoal({enabled:true,scorer:"jury",targetScore:85});
+  const pending=sessions().send("真实图像",[]); callTool(h.streams[0],[{args:{prompt:"真实图像"}}]); await tick();
+  h.imageCalls[0].resolve([generated("retry_score","image-test")]); await tick();
+  h.textCalls[0].resolve(scoreJSON(90)); h.textCalls[1].resolve("不是 JSON"); await tick();
+  assert.equal(h.textCalls.length,3,"无效 JSON 自动重试该评审");
+  assert.match(JSON.stringify(h.textCalls[2].request.messages),/JSON 对象/);
+  h.textCalls[2].resolve(scoreJSON(91)); await tick();
+  callTool(h.streams[1],[{name:"review_goal",args:{image_ids:["image_retry_score"]}}]); await tick();
+  const review=sessions().current().messages.at(-1).goalReview;
+  assert.equal(review.status,"satisfied");
+  assert.equal(review.score,90.5);
+  complete(h.streams[2]); await pending;
+  assert.equal(sessions().current().messages.at(-1).goalProgress.status,"satisfied");
 });
 
 test("同一批成果只评分一次：重复提交被拒绝，屡次重复则结束自动执行", async (t) => {
@@ -1310,6 +1328,21 @@ test("完成、错误和停止都 flush 最后 token/思考，迟到事件不能
   }
   sessions().newSession(); const next=sessions().send("独立会话",[]); complete(h.streams.at(-1),"新会话自己的内容"); await next;
   assert.equal(sessions().current().messages.at(-1).content,"新会话自己的内容");
+});
+
+test("对话请求遇到传输类错误会自动重试，而不是直接结束本轮", async () => {
+  const h=await harness(); const sessions=h.useSessions.getState;
+  const pending=sessions().send("你好",[]);
+  h.streams[0].onEvent({type:"delta",text:"半截"});
+  h.streams[0].onEvent({type:"error",message:"error sending request: connection reset by peer"});
+  await new Promise((resolve)=>setTimeout(resolve,2000));
+  assert.equal(h.streams.length,2,"失败后自动发起第二次请求");
+  assert.match(JSON.stringify(h.streams[1].request.messages),/你好/);
+  complete(h.streams[1],"重试成功");
+  await pending;
+  const last=sessions().current().messages.at(-1);
+  assert.equal(last.content,"重试成功");
+  assert.equal(last.error,undefined);
 });
 
 test("安卓原生后台中断暂停所有队列、取消并发 Chat/生图/工作室并持久化真实原因", async (t) => {

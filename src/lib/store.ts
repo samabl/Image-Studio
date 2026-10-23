@@ -593,6 +593,11 @@ export async function reversePromptText(imageDataUrl: string, onCancel?: (cancel
 // ---------------------------------------------------------------------------
 
 const MAX_TOOL_ROUNDS = 4;
+/** 对话请求遇到传输类故障时的总尝试次数（含首次）。 */
+const CHAT_ATTEMPTS = 3;
+/** 只重试网络/限流/服务端故障；鉴权、参数、停止等确定性失败重试没有意义。 */
+const RETRYABLE_CHAT_ERROR = /超时|timed out|timeout|网络|连接|connection|sending request|error sending|HTTP\s*(429|5\d\d)|rate limit|服务不可用|empty response|decoding response|unexpected end/i;
+const canRetryChat = (message?: string) => Boolean(message && !/已停止|停止/.test(message) && RETRYABLE_CHAT_ERROR.test(message));
 
 export interface StreamingState {
   messageId: string;
@@ -1072,7 +1077,23 @@ async function runTurn(sessionId: string, set: Setter, get: () => SessionState):
       const history = conversationMessages(session.messages);
       const messageId = uid("m");
       patchRun({ streaming: { messageId, content: "", reasoning: "", toolCalls: [] }, toolNote: round ? "正在检查图像结果…" : "" });
-      const final = await new Promise<{ ok: boolean; error?: string }>((resolve) => {
+      const chatRequest: ChatRequest = {
+        protocol: cfg.chat.protocol, stream: cfg.chat.stream,
+        baseUrl: cfg.chat.baseUrl, apiKey: cfg.chat.apiKey, model: cfg.chat.model,
+        messages: [
+          ...(cfg.chat.systemPrompt.trim() ? [{ role: "system", content: cfg.chat.systemPrompt }] : []),
+          ...(cfg.linkage.enabled && cfg.linkage.useTools ? [{ role: "system", content: `${imageToolInstructions(session.messages)}\n\n${imageModelInstructions(cfg.image, pinnedImageModel)}` }] : []),
+          ...(!imageToolsEnabled && (goal.enabled || jury.enabled || codeRuntime.enabled) ? [{ role: "system", content: imageCatalogInstructions(session.messages) }] : []),
+          ...(jury.enabled ? [{ role: "system", content: juryInstructions }] : []),
+          ...(codeRuntime.enabled ? [{ role: "system", content: `${codeImageInstructions}\n本次代码超时上限：${codeRuntime.timeoutSecs} 秒。` }] : []),
+          ...(goal.enabled ? [{ role: "system", content: `${goalInstructions(goal, progress.corrections)}${terminal ? `\n自动执行已结束：${progress.summary}。诚实总结已完成成果和未解决问题，不再调用工具。` : ""}` }] : []),
+          ...history,
+          ...(continuation ? [{ role: "user", content: continuation }] : []),
+        ],
+        temperature: cfg.chat.temperature, maxTokens: cfg.chat.maxTokens,
+        tools: useTools ? [...(imageToolsEnabled ? imageTools(cfg.image, pinnedImageModel) : []), ...(goal.enabled ? [goalReviewTool] : []), ...(jury.enabled ? [juryReviewTool] : []), ...(codeRuntime.enabled ? [codeImageTool] : [])] : null, timeoutSecs: cfg.chat.timeoutSecs,
+      };
+      const attemptChat = () => new Promise<{ ok: boolean; error?: string }>((resolve) => {
         let settled = false;
         const buffer = createStreamBuffer((batch) => {
           const cur = get().runs[sessionId]?.streaming;
@@ -1089,22 +1110,7 @@ async function runTurn(sessionId: string, set: Setter, get: () => SessionState):
           resolve(result);
         };
         const guard = setTimeout(() => { stream.cancel(); finish({ ok: false, error: "等待响应超时" }); }, (cfg.chat.timeoutSecs + 60) * 1000);
-        const stream = api.chatStream({
-          protocol: cfg.chat.protocol, stream: cfg.chat.stream,
-          baseUrl: cfg.chat.baseUrl, apiKey: cfg.chat.apiKey, model: cfg.chat.model,
-          messages: [
-            ...(cfg.chat.systemPrompt.trim() ? [{ role: "system", content: cfg.chat.systemPrompt }] : []),
-            ...(cfg.linkage.enabled && cfg.linkage.useTools ? [{ role: "system", content: `${imageToolInstructions(session.messages)}\n\n${imageModelInstructions(cfg.image, pinnedImageModel)}` }] : []),
-            ...(!imageToolsEnabled && (goal.enabled || jury.enabled || codeRuntime.enabled) ? [{ role: "system", content: imageCatalogInstructions(session.messages) }] : []),
-            ...(jury.enabled ? [{ role: "system", content: juryInstructions }] : []),
-            ...(codeRuntime.enabled ? [{ role: "system", content: `${codeImageInstructions}\n本次代码超时上限：${codeRuntime.timeoutSecs} 秒。` }] : []),
-            ...(goal.enabled ? [{ role: "system", content: `${goalInstructions(goal, progress.corrections)}${terminal ? `\n自动执行已结束：${progress.summary}。诚实总结已完成成果和未解决问题，不再调用工具。` : ""}` }] : []),
-            ...history,
-            ...(continuation ? [{ role: "user", content: continuation }] : []),
-          ],
-          temperature: cfg.chat.temperature, maxTokens: cfg.chat.maxTokens,
-          tools: useTools ? [...(imageToolsEnabled ? imageTools(cfg.image, pinnedImageModel) : []), ...(goal.enabled ? [goalReviewTool] : []), ...(jury.enabled ? [juryReviewTool] : []), ...(codeRuntime.enabled ? [codeImageTool] : [])] : null, timeoutSecs: cfg.chat.timeoutSecs,
-        }, (event) => {
+        const stream = api.chatStream(chatRequest, (event) => {
           if (settled || !active()) return;
           const cur = get().runs[sessionId]?.streaming;
           if (!cur || cur.messageId !== messageId) return;
@@ -1115,6 +1121,16 @@ async function runTurn(sessionId: string, set: Setter, get: () => SessionState):
         abort = () => { stream.cancel(); finish({ ok: false, error: stoppedMessage() }); };
         if (stopped) abort();
       });
+      let final = await attemptChat();
+      // 网络抖动/限流/服务端错误自动重试，避免一次瞬时失败就结束整轮或整个 Goal。
+      for (let attempt = 1; !final.ok && attempt < CHAT_ATTEMPTS && canRetryChat(final.error) && active(); attempt += 1) {
+        const wait = 1200 * attempt;
+        patchRun({ toolNote: `请求失败（${final.error}），${Math.round(wait / 1000)} 秒后自动重试（${attempt + 1}/${CHAT_ATTEMPTS}）…` });
+        // 上一次的残片作废，重试从干净状态重新流式输出。
+        patchRun({ streaming: { messageId, content: "", reasoning: "", toolCalls: [] } });
+        await new Promise((resolve) => setTimeout(resolve, wait));
+        if (!stopped && active()) final = await attemptChat();
+      }
       const streamed = get().runs[sessionId]?.streaming;
       if (!streamed) break;
       // 停止时保留已生成文字，丢弃未执行的工具调用。
