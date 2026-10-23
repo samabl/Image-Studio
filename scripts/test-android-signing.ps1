@@ -63,7 +63,7 @@ function Invoke-AndroidSigningTool {
         $value = $content.Substring(7)
         if ($script:failure -eq 'multi') { return @{ ExitCode = 0; Output = "Signer #1 certificate SHA-256 digest: $value`nSigner #2 certificate SHA-256 digest: $value" } }
         if ($script:failure -eq 'multi-distinct') { return @{ ExitCode = 0; Output = "Signer #1 certificate SHA-256 digest: $value`nSigner #2 certificate SHA-256 digest: $script:other" } }
-        return @{ ExitCode = 0; Output = "Signer #1 certificate SHA-256 digest: $value" }
+        return @{ ExitCode = 0; Output = "signer #1 certificate SHA-256 digest: $value" }
     }
     if ($Arguments[0] -ne 'sign') { throw 'Unexpected fixture tool call' }
     foreach ($option in @('--ks-pass', '--key-pass')) {

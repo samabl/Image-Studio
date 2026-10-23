@@ -85,7 +85,7 @@ function Get-AndroidApkSignature {
     param([string]$Apksigner, [string]$ApkPath)
     $result = Invoke-AndroidSigningTool $Apksigner @('verify', '--print-certs', $ApkPath)
     if ($result.ExitCode -ne 0) { return @{ Signed = $false; Fingerprint = $null } }
-    $fingerprintMatches = [regex]::Matches($result.Output, '(?m)^Signer #\d+ certificate SHA-256 digest:\s*([a-fA-F0-9:]+)\s*$')
+    $fingerprintMatches = [regex]::Matches($result.Output, '(?mi)^signer #\d+ certificate SHA-256 digest:\s*([a-fA-F0-9:]+)\s*$')
     if ($fingerprintMatches.Count -eq 0) { throw 'Release APK 必须由唯一的固定签名证书签名' }
     # 新版 Build Tools 可能按签名方案重复报告同一个 signer；只拒绝不同的证书身份。
     $fingerprints = @($fingerprintMatches | ForEach-Object {
