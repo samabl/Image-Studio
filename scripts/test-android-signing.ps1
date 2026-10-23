@@ -62,6 +62,7 @@ function Invoke-AndroidSigningTool {
         if (-not $content.StartsWith('signed:')) { return @{ ExitCode = 1; Output = '' } }
         $value = $content.Substring(7)
         if ($script:failure -eq 'multi') { return @{ ExitCode = 0; Output = "Signer #1 certificate SHA-256 digest: $value`nSigner #2 certificate SHA-256 digest: $value" } }
+        if ($script:failure -eq 'multi-distinct') { return @{ ExitCode = 0; Output = "Signer #1 certificate SHA-256 digest: $value`nSigner #2 certificate SHA-256 digest: $script:other" } }
         return @{ ExitCode = 0; Output = "Signer #1 certificate SHA-256 digest: $value" }
     }
     if ($Arguments[0] -ne 'sign') { throw 'Unexpected fixture tool call' }
@@ -123,6 +124,10 @@ try {
     }
     $script:failure = 'multi'
     $root = New-ApkFixture 'multi' "signed:$script:fp"
+    Sign-Fixture $root
+    Assert-Signing (Test-Path -LiteralPath (Join-Path $root 'app [release]-signed.apk')) 'Repeated output for one signing certificate is accepted'
+    $script:failure = 'multi-distinct'
+    $root = New-ApkFixture 'multi-distinct' "signed:$script:fp"
     Assert-Throws { Sign-Fixture $root } 'Ambiguous multiple signing identities rejected' '唯一'
     $script:failure = ''
     $names = @($script:toolCalls | ForEach-Object { $_.Arguments } | Where-Object { $_ -like 'IMAGE_STUDIO_*PASSWORD_*' -or $_ -like 'env:IMAGE_STUDIO_*PASSWORD_*' } | ForEach-Object { $_ -replace '^env:', '' })
