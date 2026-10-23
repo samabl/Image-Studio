@@ -18,6 +18,53 @@ use ai::{ChatEvent, ChatRequest, ImageRequest};
 use config::AppConfig;
 use error::AppResult;
 use gallery::{GalleryItem, GalleryLock, SaveMeta};
+use serde_json::Value;
+
+/// 前端用 `image-studio-path:<路径>` 引用磁盘图片，发送前统一读成 data URL。
+/// 这样几十 MB 的 base64 不必经过 IPC 的 JSON 复制，也不会让历史图片常驻 WebView 内存；
+/// 请求里依然是完整图片，没有减少任何一张。
+const IMAGE_PATH_PREFIX: &str = "image-studio-path:";
+
+/// 图片已被删除或路径越界时用 1×1 透明 PNG 顶替，避免整次请求因为一张旧图失败。
+const PLACEHOLDER_IMAGE: &str =
+    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+fn inline_image_path(root: &std::path::Path, raw: &str) -> String {
+    let allowed = std::fs::canonicalize(raw).ok().filter(|path| {
+        std::fs::canonicalize(root)
+            .map(|root| path.starts_with(&root))
+            .unwrap_or(false)
+    });
+    allowed
+        .and_then(|path| gallery::read_as_data_url(&path.to_string_lossy()).ok())
+        .unwrap_or_else(|| PLACEHOLDER_IMAGE.to_string())
+}
+
+/// 递归替换 `{"image_url": {"url": "image-studio-path:..."}}`（OpenAI / Anthropic / Gemini 通用）。
+fn inline_local_images(root: &std::path::Path, value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            let replacement = match map.get("url") {
+                Some(Value::String(url)) => url
+                    .strip_prefix(IMAGE_PATH_PREFIX)
+                    .map(|raw| inline_image_path(root, raw)),
+                _ => None,
+            };
+            if let Some(data) = replacement {
+                map.insert("url".into(), Value::String(data));
+            }
+            for item in map.values_mut() {
+                inline_local_images(root, item);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                inline_local_images(root, item);
+            }
+        }
+        _ => {}
+    }
+}
 
 /// 流式对话的取消标志表，key 为前端生成的 streamId。
 #[derive(Default)]
@@ -142,11 +189,17 @@ async fn list_models(
 
 #[tauri::command]
 async fn chat_stream(
+    app: AppHandle,
     streams: State<'_, Streams>,
     stream_id: String,
-    request: ChatRequest,
+    mut request: ChatRequest,
     on_event: Channel<ChatEvent>,
 ) -> AppResult<()> {
+    if let Ok(root) = config::app_root(&app) {
+        for message in request.messages.iter_mut() {
+            inline_local_images(&root, message);
+        }
+    }
     let flag = streams.register(&stream_id);
 
     let result = ai::chat_stream(request, on_event, flag).await;
@@ -164,7 +217,12 @@ fn chat_cancel(streams: State<'_, Streams>, stream_id: String) {
 
 /// 非流式对话：用于提示词优化、图像反推等内部调用。
 #[tauri::command]
-async fn chat_once(request: ChatRequest) -> AppResult<String> {
+async fn chat_once(app: AppHandle, mut request: ChatRequest) -> AppResult<String> {
+    if let Ok(root) = config::app_root(&app) {
+        for message in request.messages.iter_mut() {
+            inline_local_images(&root, message);
+        }
+    }
     ai::chat_once(request).await
 }
 
@@ -209,11 +267,30 @@ async fn set_native_theme(app: AppHandle, theme: String, mode: String) -> AppRes
 #[tauri::command]
 async fn generate_image(
     app: AppHandle,
-    request: ImageRequest,
+    mut request: ImageRequest,
     parent_id: Option<String>,
     request_id: Option<String>,
     streams: State<'_, Streams>,
 ) -> AppResult<Vec<GalleryItem>> {
+    // 参考图可以只给磁盘路径，读盘和 base64 编码放在 Rust 侧，前端不再复制大字符串。
+    if let Ok(root) = config::app_root(&app) {
+        for image in request.images.iter_mut() {
+            let replacement = image
+                .strip_prefix(IMAGE_PATH_PREFIX)
+                .map(|raw| inline_image_path(&root, raw));
+            if let Some(data) = replacement {
+                *image = data;
+            }
+        }
+        if let Some(mask) = request.mask.as_mut() {
+            let replacement = mask
+                .strip_prefix(IMAGE_PATH_PREFIX)
+                .map(|raw| inline_image_path(&root, raw));
+            if let Some(data) = replacement {
+                *mask = data;
+            }
+        }
+    }
     let kind = if request.images.is_empty() {
         "generate"
     } else if request.mask.as_ref().is_some_and(|m| !m.trim().is_empty()) {
@@ -271,6 +348,30 @@ mod request_tests {
         requests.cancel("first");
         assert!(first.load(Ordering::Relaxed));
         assert!(!second.load(Ordering::Relaxed));
+    }
+
+    /// 历史图片只带路径时，发送前必须真正读成 data URL；文件缺失则退化为占位图而不是让请求失败。
+    #[test]
+    fn image_path_markers_are_inlined() {
+        let root = std::env::temp_dir().join(format!("image-studio-inline-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("sample.png");
+        std::fs::write(&file, [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]).unwrap();
+
+        let mut value = serde_json::json!({ "image_url": { "url": format!("{IMAGE_PATH_PREFIX}{}", file.display()) } });
+        inline_local_images(&root, &mut value);
+        let url = value["image_url"]["url"].as_str().unwrap();
+        assert!(url.starts_with("data:image/png;base64,"), "{url}");
+
+        let mut missing = serde_json::json!({ "url": format!("{IMAGE_PATH_PREFIX}{}", root.join("gone.png").display()) });
+        inline_local_images(&root, &mut missing);
+        assert_eq!(missing["url"].as_str(), Some(PLACEHOLDER_IMAGE));
+
+        let mut outside = serde_json::json!({ "url": format!("{IMAGE_PATH_PREFIX}{}", file.parent().unwrap().join("..").join("escape.png").display()) });
+        inline_local_images(&root, &mut outside);
+        assert_eq!(outside["url"].as_str(), Some(PLACEHOLDER_IMAGE));
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }
 

@@ -82,6 +82,17 @@ test("Gemini 工具调用保留原始 thoughtSignature 供下一轮回传", () =
   assert.deepEqual(m.tool_calls[0].provider_data, providerData);
 });
 
+test("历史图片没有 base64 时改成磁盘引用发送，图片数量不减少", () => {
+  const messages = [message("tool", { toolCallId: "c1", content: "完成", images: [
+    { galleryId: "g1", path: "outputs/g1.png", prompt: "" },
+    { galleryId: "g2", path: "outputs/g2.png", prompt: "", dataUrl: attachment("g2").dataUrl },
+  ] })];
+  const out = chat.conversationMessages(messages);
+  assert.deepEqual(out.map((m) => m.role), ["tool", "user"]);
+  const urls = out[1].content.filter((part) => part.type === "image_url").map((part) => part.image_url.url);
+  assert.deepEqual(urls, ["image-studio-path:outputs/g1.png", attachment("g2").dataUrl]);
+});
+
 let harnessId = 0;
 async function harness() {
   const streams = [];
@@ -1126,16 +1137,18 @@ test("独立评分必须是有依据的有限 0–100 分和非空逐项约束",
 const scoredReport = (scores, passed = true) => ({ status: "complete", imageIds: ["image_actual"], createdAt: 1,
   opinions: scores.map((score,index) => ({ memberId: String(index), name: "评审" + index, model: "vision", status: "complete", goalScore: goal.parseGoalScore(scoreJSON(score, passed)) })) });
 
-test("Goal 依据未舍入均分和每个明确约束判定，部分评审失败绝不能通过", () => {
+test("Goal 依据未舍入均分和每个明确约束判定，失败的评审成员被忽略而不是作废整次验收", () => {
   const settings = goal.goalSettings({ enabled: true, targetScore: 85 });
   const borderline = goal.goalReviewFromScores(scoredReport([84.999,84.999]), settings, "jury");
   assert.equal(borderline.score, 85); assert.equal(borderline.status, "needs_revision");
   assert.equal(goal.goalReviewFromScores(scoredReport([80,90]), settings, "jury").status, "satisfied");
   assert.equal(goal.goalReviewFromScores(scoredReport([99,100],false), settings, "jury").status, "needs_revision");
   const failed = scoredReport([90,90]); failed.status = "partial"; failed.opinions[1] = { status: "error", error: "看图失败" };
-  assert.throws(() => goal.goalReviewFromScores(failed, settings, "jury"), /全部完成/);
+  const partial = goal.goalReviewFromScores(failed, settings, "jury");
+  assert.equal(partial.status, "satisfied"); assert.equal(partial.score, 90);
+  assert.match(partial.summary, /忽略 1 位/);
   const missing = scoredReport([90]); delete missing.opinions[0].goalScore;
-  assert.throws(() => goal.goalReviewFromScores(missing, settings, "chat"));
+  assert.throws(() => goal.goalReviewFromScores(missing, settings, "chat"), /没有任何评审给出有效评分/);
 });
 
 test("非 Goal 历史中的空助手和不可见字符不产生空气泡，但真实内容和工具协议不丢失", () => {
@@ -1218,21 +1231,21 @@ test("评审团对新成图独立打分，复用同一图片完整评分但新�
   assert.equal(report.reviewerScores.length,2); assert.equal(report.corrections,1);
 });
 
-test("评审不完整不再无限重评同一张图：一次失败即结束 Goal 并说明真实障碍", async (t) => {
+test("个别评审失败时忽略该成员继续评分，不结束 Goal，也不重复评审同一张图", async (t) => {
   const h=await harness(); guardHarness(t,h); const sessions=h.useSessions.getState;
   h.useConfig.setState({config:withJury(h.useConfig.getState().config)});
   sessions().setGoal({enabled:true,scorer:"jury",targetScore:85});
   const pending=sessions().send("真实图像",[]); callTool(h.streams[0],[{args:{prompt:"真实图像"}}]); await tick();
   h.imageCalls[0].resolve([generated("partial_score","image-test")]); await tick();
   h.textCalls[0].resolve(scoreJSON(99)); h.textCalls[1].resolve("我给 100 分"); await tick();
-  callTool(h.streams[1],[{name:"review_goal",args:{image_ids:["image_partial_score"],score:100,status:"satisfied"}}]); await tick();
+  callTool(h.streams[1],[{name:"review_goal",args:{image_ids:["image_partial_score"]}}]); await tick();
   assert.equal(h.textCalls.length,2,"同一批图片不会重复付费评审");
-  assert.match(JSON.stringify(sessions().current().messages),/不能判定 Goal 通过/);
+  const review=sessions().current().messages.at(-1).goalReview;
+  assert.equal(review.status,"satisfied");
+  assert.equal(review.score,99);
+  assert.match(review.summary,/忽略 1 位/);
   complete(h.streams[2]); await pending;
-  const progress=sessions().current().messages.at(-1).goalProgress;
-  assert.equal(progress.status,"blocked");
-  assert.match(progress.summary,/评审未能完成/);
-  assert.equal(h.textCalls.length,2,"结束后不再发起评审");
+  assert.equal(sessions().current().messages.at(-1).goalProgress.status,"satisfied");
 });
 
 test("同一批成果只评分一次：重复提交被拒绝，屡次重复则结束自动执行", async (t) => {

@@ -74,18 +74,20 @@ export function parseGoalScore(text: string): GoalScore {
 }
 
 export function goalReviewFromScores(report: JuryReview, settings: GoalSettings, scorer: "chat" | "jury", answer?: string): GoalReview {
-  if (report.status !== "complete" || !report.opinions.length || report.opinions.some((opinion) => opinion.status !== "complete" || !opinion.goalScore)) {
-    throw new Error("评分尚未全部完成，不能判定 Goal 通过；请重试评分或说明实际障碍");
-  }
-  const reviewerScores = report.opinions.map((opinion) => ({ memberId: opinion.memberId, name: opinion.name, model: opinion.model,
+  // 单个评审失败（超时、模型不支持看图、没按 JSON 返回）不能作废整次验收：
+  // 忽略这些成员，用其余有效评分继续判定，避免整个 Goal 被打断。
+  const scored = report.opinions.filter((opinion) => opinion.status === "complete" && opinion.goalScore);
+  if (!scored.length) throw new Error("没有任何评审给出有效评分，无法判定 Goal；请检查评审模型后重试");
+  const ignored = report.opinions.length - scored.length;
+  const reviewerScores = scored.map((opinion) => ({ memberId: opinion.memberId, name: opinion.name, model: opinion.model,
     score: opinion.goalScore!.score, summary: opinion.goalScore!.summary }));
   const average = reviewerScores.reduce((sum, reviewer) => sum + reviewer.score, 0) / reviewerScores.length;
   const score = Math.round(average * 100) / 100;
-  const checks = report.opinions.flatMap((opinion) => opinion.goalScore!.checks.map((check) => ({ ...check,
-    requirement: report.opinions.length > 1 ? `${opinion.name} · ${check.requirement}` : check.requirement,
+  const checks = scored.flatMap((opinion) => opinion.goalScore!.checks.map((check) => ({ ...check,
+    requirement: scored.length > 1 ? `${opinion.name} · ${check.requirement}` : check.requirement,
   })));
   const satisfied = average >= settings.targetScore && checks.every((check) => check.passed);
-  const summary = `${scorer === "jury" ? "评审团平均" : "Chat"}评分 ${score}/100，目标 ${settings.targetScore}/100。${satisfied ? "已达标。" : average < settings.targetScore ? "未达到目标分数，需继续修正。" : "仍有明确要求未满足，需继续修正。"} ${reviewerScores.map((reviewer) => reviewer.summary).join("；")}`;
+  const summary = `${scorer === "jury" ? "评审团平均" : "Chat"}评分 ${score}/100，目标 ${settings.targetScore}/100${ignored > 0 ? `（已忽略 ${ignored} 位未完成评分的评审）` : ""}。${satisfied ? "已达标。" : average < settings.targetScore ? "未达到目标分数，需继续修正。" : "仍有明确要求未满足，需继续修正。"} ${reviewerScores.map((reviewer) => reviewer.summary).join("；")}`;
   return { status: satisfied ? "satisfied" : "needs_revision", score, targetScore: settings.targetScore, scorer,
     summary, checks, imageIds: report.imageIds, answer, reviewerScores };
 }

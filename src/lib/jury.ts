@@ -1,4 +1,4 @@
-import { userImageContent, type ImageSource } from "./chat";
+import { IMAGE_PATH_PREFIX, userImageContent, type ImageSource } from "./chat";
 import { parseGoalScore } from "./goal";
 import type { AppConfig, ChatRequest, JuryConfig, JuryMemberConfig, JuryOpinion, JuryReview, GoalSettings } from "../types";
 
@@ -53,7 +53,9 @@ export function juryRequest(member: JuryMemberConfig, config: AppConfig, input: 
   if (!member.model.trim()) throw new Error("未填写识图模型");
   if (!connection.baseUrl.trim() || !connection.apiKey.trim()) throw new Error("未配置评审连接的地址或 API Key");
   if (!Object.prototype.hasOwnProperty.call(JURY_PROTOCOLS, connection.protocol)) throw new Error("评审协议无效");
-  if ((!input.images.length && !input.scoring?.answer) || input.images.some((image) => !image.dataUrl?.startsWith("data:image/"))) {
+  // 图片可以是 data URL、磁盘引用（由 Rust 读盘）或直接给出 path，三者都算可读。
+  const readable = (image: ImageSource) => Boolean(image.dataUrl?.startsWith("data:image/") || image.dataUrl?.startsWith(IMAGE_PATH_PREFIX) || image.path);
+  if ((!input.images.length && !input.scoring?.answer) || input.images.some((image) => !readable(image))) {
     throw new Error("评审需要可读取的实际图片或完整文字答案");
   }
   const text = [
@@ -133,8 +135,13 @@ export function startJuryReview(
   input: JuryInput,
   requestText: (request: ChatRequest) => TextTask,
   onUpdate: (review: JuryReview) => void = () => {},
+  /** 本次运行中已经确认失败的成员：后续评分直接跳过，避免每次修正都等它超时。 */
+  skipMembers: string[] = [],
 ): { promise: Promise<JuryReview>; cancel: () => void } {
-  const members = juryMembers(config);
+  const candidates = juryMembers(config);
+  const remaining = candidates.filter((member) => !skipMembers.includes(member.id));
+  // 全部成员都失败过时重新尝试一遍，不能把评审团整个丢掉。
+  const members = remaining.length ? remaining : candidates;
   let review: JuryReview = {
     imageIds: input.images.map((image) => image.id), createdAt: Date.now(), status: "reviewing",
     opinions: members.map((member) => ({ memberId: member.id, name: member.name.trim() || member.model || "未命名评审", model: member.model, status: "pending" })),

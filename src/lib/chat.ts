@@ -8,6 +8,17 @@ export interface ImageSource {
   galleryId?: string;
 }
 
+/**
+ * 历史图片只保留磁盘路径，不常驻 base64：发送前由 Rust 读成 data URL。
+ * 这样几十 MB 的图片不必在 JS 里复制、也不经过 IPC 的 JSON 序列化，
+ * 同时请求里依然是完整的图片内容（没有减少任何一张图）。
+ */
+export const IMAGE_PATH_PREFIX = "image-studio-path:";
+
+export function imageReference(image: ImageSource): string | undefined {
+  return image.dataUrl || (image.path ? `${IMAGE_PATH_PREFIX}${image.path}` : undefined);
+}
+
 export function attachmentLabel(a: ChatAttachment, index: number): string {
   return `素材 ${index + 1}${a.name ? `：${a.name}` : ""}（图片 ID：${a.id}）`;
 }
@@ -41,17 +52,19 @@ export function selectImageSources(messages: ChatMessage[], ids?: unknown): Imag
 export function userImageContent(text: string, images: ImageSource[]): unknown[] {
   return [
     { type: "text", text },
-    ...images.flatMap((image) => [
-      { type: "text", text: image.label },
-      { type: "image_url", image_url: { url: image.dataUrl } },
-    ]),
+    ...images.flatMap((image) => {
+      const url = imageReference(image);
+      return url
+        ? [{ type: "text", text: image.label }, { type: "image_url", image_url: { url } }]
+        : [{ type: "text", text: image.label }];
+    }),
   ];
 }
 
-export function toApiMessages(m: ChatMessage, withImages = true): unknown[] {
+export function toApiMessages(m: ChatMessage): unknown[] {
   if (m.role === "tool") {
     const tool = { role: "tool", tool_call_id: m.toolCallId, content: m.content || "已完成" };
-    const images = withImages ? imageSources(m).filter((image) => image.dataUrl) : [];
+    const images = imageSources(m).filter((image) => imageReference(image));
     return images.length ? [tool, { role: "user", content: userImageContent("以下是图像工具实际输出，请检查是否满足我的要求。", images) }] : [tool];
   }
   if (m.role === "assistant") {
@@ -59,37 +72,16 @@ export function toApiMessages(m: ChatMessage, withImages = true): unknown[] {
       tool_calls: m.toolCalls.map((tc) => ({ id: tc.id, type: "function", function: { name: tc.name, arguments: tc.arguments }, ...(tc.providerData ? { provider_data: tc.providerData } : {}) })),
     } : {}) }];
   }
-  const images = withImages ? imageSources(m) : [];
+  const images = imageSources(m).filter((image) => imageReference(image));
   return [{ role: "user", content: images.length ? userImageContent(m.content, images) : m.content }];
 }
 
-/**
- * 每次请求最多携带的历史图片数。整段历史都塞进去会让每个请求的体积随对话线性增长
- * （一张 1024² 的 data URL 就有数 MB），在安卓上直接表现为发消息卡顿和内存飙升。
- * 更早的图片仍保留 ID 与 path，模型可以继续用 edit_image / review_images 按 ID 读取。
- */
-export const MAX_CONTEXT_IMAGES = 8;
-
-function contextImageMessages(messages: ChatMessage[]): Set<string> {
-  const keep = new Set<string>();
-  let budget = MAX_CONTEXT_IMAGES;
-  for (let i = messages.length - 1; i >= 0 && budget > 0; i -= 1) {
-    const count = imageSources(messages[i]).filter((image) => image.dataUrl).length;
-    if (!count) continue;
-    if (count > budget && keep.size) break;
-    keep.add(messages[i].id);
-    budget -= count;
-  }
-  return keep;
-}
-
 export function conversationMessages(messages: ChatMessage[]): unknown[] {
-  const withImages = contextImageMessages(messages);
   const out: unknown[] = [];
   let feedback: unknown[] = [];
   for (const message of messages) {
     if (message.role !== "tool" && feedback.length) { out.push(...feedback); feedback = []; }
-    const [first, ...images] = toApiMessages(message, withImages.has(message.id));
+    const [first, ...images] = toApiMessages(message);
     out.push(first);
     if (message.role === "tool") feedback.push(...images);
     else out.push(...images);

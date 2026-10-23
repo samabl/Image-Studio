@@ -517,8 +517,8 @@ function GeneratedImages({ images }: { images: GeneratedRef[] }) {
         })();
         return (
         <div className="gen-card" key={img.galleryId}>
+          {/* 始终走 asset 协议按需解码：图片已落盘，没必要把几 MB 的 base64 塞进 DOM 常驻内存。 */}
           <FileImage
-            dataUrl={img.dataUrl}
             path={img.path}
             alt={img.prompt}
             onClick={() =>
