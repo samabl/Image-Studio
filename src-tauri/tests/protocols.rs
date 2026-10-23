@@ -513,3 +513,54 @@ async fn gateway_ignoring_stream_flag_preserves_json_tool_calls() {
         |event| matches!(event, ChatEvent::ToolCalls { calls } if calls[0].name == "edit_image")
     ));
 }
+
+
+#[test]
+fn gemini_gateway_markdown_images_are_outputs_not_failures() {
+    let value = json!({"candidates":[{"finishReason":"STOP","content":{"role":"model","parts":[
+        {"text":"![image](data:image/jpeg;base64,YQ==)"},
+        {"inlineData":{"mimeType":"image/jpeg","data":"YQ=="}},
+        {"text":"![image](data:image/png;base64,Yg==)"},
+        {"thought":true,"text":"![draft](data:image/png;base64,Yw==)","thoughtSignature":"private"}
+    ]}}]});
+    let images = native::parse_images(&value).unwrap();
+    assert_eq!(images.len(), 2); assert_eq!(images[0].bytes, b"a");
+    assert_eq!(images[0].ext, "jpg"); assert_eq!(images[1].bytes, b"b");
+    let remote = json!({"candidates":[{"content":{"parts":[{"text":"Read [docs](https://example.test/docs). ![image](https://image.test/result.png)"}]}}]});
+    assert_eq!(native::image_response_urls(&remote).unwrap(), vec!["https://image.test/result.png"]);
+}
+
+#[test]
+fn gemini_missing_images_report_finish_or_safety_reason_without_signatures() {
+    let value = json!({"promptFeedback":{"blockReason":"SAFETY"},"candidates":[{"finishReason":"IMAGE_SAFETY","content":{"parts":[{"text":"Cannot generate this image"},{"thought":true,"text":"secret-thought","thoughtSignature":"private-signature"}]}}]});
+    let message = native::parse_images(&value).err().unwrap().to_string();
+    assert!(message.contains("SAFETY")); assert!(message.contains("Cannot generate"));
+    assert!(!message.contains("secret-thought")); assert!(!message.contains("private-signature"));
+}
+
+#[test]
+fn gemini_explicit_resolution_is_not_a_quality_parameter() {
+    let mut req = image(); req.image_size = Some("4K".into()); req.quality = Some("high".into()); req.size = Some("1536x1024".into());
+    let body = native::build_image_body(&req).unwrap();
+    assert_eq!(body["generationConfig"]["imageConfig"], json!({"aspectRatio":"3:2","imageSize":"4K"}));
+    assert!(body.get("quality").is_none());
+    let chat = ai::build_chat_image_body(&req).unwrap();
+    assert_eq!(chat["image_config"], json!({"aspect_ratio":"3:2","image_size":"4K"}));
+    assert_eq!(chat["modalities"], json!(["image","text"]));
+    assert!(chat.get("quality").is_none());
+    assert_eq!(chat["messages"][0]["content"][2]["image_url"]["url"], req.images[0]);
+    assert_eq!(chat["messages"][0]["content"][4]["image_url"]["url"], req.images[1]);
+    req.size = Some("auto".into()); req.image_size = Some("1K".into());
+    assert_eq!(native::build_image_body(&req).unwrap()["generationConfig"]["imageConfig"], json!({"imageSize":"1K"}));
+    req.image_size = Some("8K".into()); assert!(native::build_image_body(&req).is_err());
+    assert!(ai::build_chat_image_body(&req).is_err());
+}
+
+#[test]
+fn image_downloads_never_authenticate_third_party_hosts() {
+    assert!(ai::image_download_same_origin("https://gateway.test/image.png", "https://gateway.test/v1"));
+    assert!(!ai::image_download_same_origin("https://image.test/image.png", "https://gateway.test/v1"));
+    assert!(!ai::image_download_same_origin("http://gateway.test/image.png", "https://gateway.test/v1"));
+    assert!(!ai::image_download_same_origin("https://gateway.test:444/image.png", "https://gateway.test/v1"));
+    assert!(!ai::image_download_same_origin("https://user:pass@gateway.test/image.png", "https://gateway.test/v1"));
+}

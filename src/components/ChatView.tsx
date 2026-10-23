@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Markdown } from "./Markdown";
 import { Empty, FileImage, NumberInput, Panel, Spinner } from "./ui";
 import { showImage } from "./Overlays";
@@ -9,13 +9,14 @@ import { SaveImageButton } from "./SaveImageButton";
 import { AddToGalleryButton } from "./AddToGalleryButton";
 import { ImageToolDetails } from "./ImageToolDetails";
 import { configuredImageModels } from "../lib/imageModels";
-import { GOAL_LEVELS, goalSettings } from "../lib/goal";
+import { GOAL_SCORERS, goalSettings } from "../lib/goal";
+import { displayToolCalls, hasDisplayText, hasVisibleMessage } from "../lib/messagePresentation";
 import { GoalReport } from "./GoalReport";
 import { JuryReport } from "./JuryReport";
 import { CodeExecutionReport } from "./CodeExecutionReport";
 import { juryMembers } from "../lib/jury";
 import { generatedGalleryItem } from "../lib/gallery";
-import type { ChatAttachment, ChatMessage, GeneratedRef, GoalLevel, SendMode } from "../types";
+import type { ChatAttachment, ChatMessage, GeneratedRef, GoalScorer, SendMode } from "../types";
 
 const SUGGESTIONS = [
   "画一只雨夜霓虹街头的猫",
@@ -25,23 +26,22 @@ const SUGGESTIONS = [
 
 export function ChatView() {
   const cfg = useConfig((s) => s.config);
-  const sessions = useSessions((s) => s.sessions);
   const currentId = useSessions((s) => s.currentId);
-  const runs = useSessions((s) => s.runs);
-  const run = currentId ? runs[currentId] : undefined;
+  const sessionCount = useSessions((s) => s.sessions.length);
+  const session = useSessions((s) => s.sessions.find((item) => item.id === currentId) ?? null);
+  const run = useSessions((s) => currentId ? s.runs[currentId] : undefined);
   const streaming = run?.streaming;
   const busy = Boolean(run);
   const toolNote = run?.toolNote;
-  const backgroundCount = Object.keys(runs).filter((id) => id !== currentId).length;
+  const backgroundCount = useSessions((s) => Object.keys(s.runs).filter((id) => id !== currentId).length);
   const [showSessions, setShowSessions] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
 
-  const session = useMemo(
-    () => sessions.find((s) => s.id === currentId) ?? null,
-    [sessions, currentId],
-  );
+  const followBottom = useRef(true);
+  const [showLatest, setShowLatest] = useState(false);
+  useEffect(() => { followBottom.current = true; setShowLatest(false); }, [currentId]);
   const text = session?.draftText ?? "";
   const atts = session?.draftAtts ?? [];
   const setText = (value: string) => useSessions.getState().setDraftText(value);
@@ -51,15 +51,20 @@ export function ChatView() {
     return () => window.removeEventListener("image-studio-back", back);
   }, [showSessions]);
 
-  // 新消息 / 流式增量时贴底
+  // 合并到绘制帧；用户阅读历史时不抢滚动位置。
   useEffect(() => {
+    const frame = requestAnimationFrame(() => {
+      const el = scrollRef.current;
+      if (el && followBottom.current) el.scrollTop = el.scrollHeight;
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [currentId, session?.messages, streaming?.content, streaming?.reasoning, toolNote]);
+  const trackScroll = () => {
     const el = scrollRef.current;
     if (!el) return;
-    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 220;
-    if (nearBottom || streaming) {
-      el.scrollTop = el.scrollHeight;
-    }
-  }, [session?.messages.length, streaming?.content, streaming?.reasoning, toolNote]);
+    followBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 100;
+    setShowLatest(!followBottom.current);
+  };
 
   // 自适应输入框高度
   useEffect(() => {
@@ -116,7 +121,7 @@ export function ChatView() {
           onClick={() => setShowSessions((v) => !v)}
           title="历史会话"
         >
-          🗂 {showSessions ? "收起" : `历史 (${sessions.length})`}
+          🗂 {showSessions ? "收起" : `历史 (${sessionCount})`}
         </button>
         {backgroundCount > 0 && <span className="chip accent">后台 {backgroundCount} 个任务</span>}
         <div style={{ flex: 1 }} />
@@ -128,7 +133,7 @@ export function ChatView() {
       </div>
 
       <div className="chat-secondary">
-      {session && <Panel key={session.id} title={<><span>对话选项</span>{goal.enabled && <span className="chip accent">Goal · {GOAL_LEVELS[goal.level].label}</span>}</>} className="chat-options">
+      {session && <Panel key={session.id} title={<><span>对话选项</span>{goal.enabled && <span className="chip accent">Goal · ≥ {goal.targetScore} 分</span>}</>} className="chat-options">
       {toolsReady && (
         <div className="chat-image-model">
           <label htmlFor="chat-image-model">生图模型</label>
@@ -147,14 +152,18 @@ export function ChatView() {
           disabled={busy || (!toolsReady && !goal.enabled)}
           onClick={() => useSessions.getState().setGoal({ enabled: !goal.enabled })}>Goal 自动修正</button>
         {goal.enabled && <>
-          <label>验收等级<select className="input" aria-label="Goal 验收等级" disabled={busy} value={goal.level}
-            onChange={(e) => { const level = e.target.value as GoalLevel; useSessions.getState().setGoal({ level, maxCorrections: GOAL_LEVELS[level].corrections }); }}>
-            {Object.entries(GOAL_LEVELS).map(([value, entry]) => <option key={value} value={value}>{entry.label}</option>)}
+          <label>目标分数<NumberInput className="input" min={1} max={100} aria-label="Goal 目标分数" disabled={busy} value={goal.targetScore}
+            onValueChange={(targetScore) => useSessions.getState().setGoal({ targetScore })} /><span>/100</span></label>
+          <label>评分来源<select className="input goal-scorer" aria-label="Goal 评分来源" disabled={busy} value={goal.scorer}
+            onChange={(e) => useSessions.getState().setGoal({ scorer: e.target.value as GoalScorer })}>
+            {Object.entries(GOAL_SCORERS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
           </select></label>
           <label>最多修正<NumberInput className="input" min={0} max={20} aria-label="Goal 最多修正次数" disabled={busy} value={goal.maxCorrections}
             onValueChange={(maxCorrections) => useSessions.getState().setGoal({ maxCorrections })} /></label>
         </>}
         {!toolsReady && <span className="hint">需启用图像工具或内置 JS</span>}
+        {goal.enabled && <span className="hint">独立评分达到目标分且符合全部明确要求才停止修正。</span>}
+        {goal.enabled && goal.scorer === "jury" && (!cfg?.jury?.enabled || !juryMembers(cfg).length) && <span className="err">请启用评审团，或选择 Chat 评分。</span>}
       </div>
       {cfg?.jury?.enabled && <div className="chat-feature-status"><span className="chip">评审团 · {juryMembers(cfg).length} 位</span>
         <button type="button" className="btn sm ghost" onClick={() => useConfig.getState().setTab("settings")}>配置评审</button></div>}
@@ -162,40 +171,14 @@ export function ChatView() {
       </Panel>}
       {run?.goalProgress && <Panel title={`Goal 进度 · 修正 ${run.goalProgress.corrections}/${run.goalProgress.maxCorrections}`} className="goal-running"><GoalReport progress={run.goalProgress} /></Panel>}
 
-      {showSessions && (
-        <div className="session-list" aria-label="历史会话">
-          {sessions.map((s) => (
-            <div
-              key={s.id}
-              className={`session-pill${s.id === currentId ? " active" : ""}`}
-            >
-              <button type="button" className="session-select" onClick={() => {
-                useSessions.getState().selectSession(s.id);
-                setShowSessions(false);
-              }}><span className="t">{s.title || "新对话"}</span>{runs[s.id] && <Spinner />}</button>
-              {sessions.length > 1 && (
-                <button
-                  type="button"
-                  className="session-delete"
-                  aria-label={`删除会话 ${s.title || "新对话"}`}
-                  title="删除"
-                  style={{ opacity: 0.6 }}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    useSessions.getState().deleteSession(s.id);
-                  }}
-                >
-                  ✕
-                </button>
-              )}
-            </div>
-          ))}
-        </div>
-      )}
+      {showSessions && <SessionList onSelect={() => setShowSessions(false)} />}
       </div>
 
       {/* 消息区 */}
-      <div className="messages" ref={scrollRef}>
+      <div className="messages" ref={scrollRef} onScroll={trackScroll} onLoadCapture={() => {
+        if (!followBottom.current) return;
+        requestAnimationFrame(() => { const el = scrollRef.current; if (el && followBottom.current) el.scrollTop = el.scrollHeight; });
+      }}>
         {!session || session.messages.length === 0 ? (
           <Empty
             icon="💬"
@@ -223,9 +206,7 @@ export function ChatView() {
           </Empty>
         ) : (
           <>
-            {session.messages.map((m) => (
-              <MessageRow key={m.id} message={m} />
-            ))}
+            <MessageHistory key={session.id} messages={session.messages} />
             {streaming && (
                 <MessageRow
                   key={streaming.messageId}
@@ -255,6 +236,11 @@ export function ChatView() {
         )}
       </div>
 
+      {showLatest && <div className="chat-scroll-hint"><button type="button" className="btn sm ghost" onClick={() => {
+        followBottom.current = true; setShowLatest(false);
+        const el = scrollRef.current; if (el) el.scrollTop = el.scrollHeight;
+      }}>↓ 回到最新消息</button></div>}
+
       {/* 输入区 */}
       <div className="composer">
         <div className="composer-inner">
@@ -281,7 +267,7 @@ export function ChatView() {
               <div className="pending-att">
                 {atts.map((a, index) => (
                   <div className="item" key={a.id}>
-                    <img src={a.dataUrl} alt={a.name ?? ""} onClick={() => showImage({ dataUrl: a.dataUrl, title: a.name })} />
+                    <img src={a.dataUrl} alt={a.name ?? ""} loading="lazy" decoding="async" onClick={() => showImage({ dataUrl: a.dataUrl, title: a.name })} />
                     <span className="ref-number" title={a.name}>素材 {index + 1}</span>
                     <div className="ref-order">
                       <button type="button" disabled={index === 0} title="前移素材" onClick={() => useSessions.getState().moveDraftAtt(a.id, -1)}>←</button>
@@ -392,7 +378,43 @@ export function ChatView() {
 
 // ---------------------------------------------------------------------------
 
-function MessageRow({ message, live }: { message: ChatMessage; live?: boolean }) {
+function SessionList({ onSelect }: { onSelect: () => void }) {
+  const sessions = useSessions((state) => state.sessions);
+  const currentId = useSessions((state) => state.currentId);
+  const runs = useSessions((state) => state.runs);
+  return <div className="session-list" aria-label="历史会话">{sessions.map((item) => <div key={item.id} className={`session-pill${item.id === currentId ? " active" : ""}`}>
+    <button type="button" className="session-select" onClick={() => { useSessions.getState().selectSession(item.id); onSelect(); }}>
+      <span className="t">{item.title || "新对话"}</span>{runs[item.id] && <Spinner />}
+    </button>
+    {sessions.length > 1 && <button type="button" className="session-delete" aria-label={`删除会话 ${item.title || "新对话"}`} title="删除"
+      onClick={() => useSessions.getState().deleteSession(item.id)}>×</button>}
+  </div>)}</div>;
+}
+
+const HISTORY_PAGE = 60;
+const MessageHistory = memo(function MessageHistory({ messages }: { messages: ChatMessage[] }) {
+  const [limit, setLimit] = useState(HISTORY_PAGE);
+  const visible = useMemo(() => messages.filter((message) => hasVisibleMessage(message)), [messages]);
+  const anchor = useRef<{ element: HTMLElement; height: number; top: number } | null>(null);
+  useLayoutEffect(() => {
+    if (!anchor.current) return;
+    const { element, height, top } = anchor.current;
+    element.scrollTop = top + element.scrollHeight - height;
+    anchor.current = null;
+  }, [limit]);
+  return <>
+    {visible.length > limit && <div className="chat-history-more"><button type="button" className="btn sm ghost" onClick={(event) => {
+      const element = event.currentTarget.closest<HTMLElement>(".messages");
+      if (element) anchor.current = { element, height: element.scrollHeight, top: element.scrollTop };
+      setLimit((value) => value + HISTORY_PAGE);
+    }}>加载更早消息（还有 {visible.length - limit} 条）</button></div>}
+    {visible.slice(-limit).map((message) => <MessageRow key={message.id} message={message} />)}
+  </>;
+});
+
+export const MessageRow = memo(function MessageRow({ message, live }: { message: ChatMessage; live?: boolean }) {
+  if (!hasVisibleMessage(message, live)) return null;
+  const visibleCalls = displayToolCalls(message.toolCalls);
   const isUser = message.role === "user";
   const isTool = message.role === "tool";
 
@@ -403,16 +425,19 @@ function MessageRow({ message, live }: { message: ChatMessage; live?: boolean })
         <div className="avatar ai">🖼</div>
         <div className="bubble">
           <div className="bubble-head">
-            <span className="who">{message.goalReview ? "Goal 验收" : "图像工具"}</span>
+            <span className="who">{message.goalReview ? "Goal 评分" : message.juryReview ? "独立评审" : message.codeExecution ? "代码图像工具" : "图像工具"}</span>
             {message.pending && <Spinner />}
           </div>
           <div className="bubble-body">
             {message.pending ? (
-              <span style={{ color: "var(--text-dim)" }}>正在调用图像模型…</span>
+              <span style={{ color: "var(--text-dim)" }}>{message.juryReview ? "正在独立评审…" : message.codeExecution ? "正在处理图片…" : "正在调用图像模型…"}</span>
             ) : message.goalReview ? <GoalReport review={message.goalReview} /> : (
               <Markdown source={message.juryReview ? message.content.split("\n评审团意见（")[0] : message.content} />
             )}
             {imgs.length > 0 && <GeneratedImages images={imgs} />}
+            {message.juryReview && <JuryReport review={message.juryReview} />}
+            {message.codeExecution && <CodeExecutionReport execution={message.codeExecution} />}
+            {hasDisplayText(message.error) && <div className="err">{message.error}</div>}
           </div>
         </div>
       </div>
@@ -435,14 +460,14 @@ function MessageRow({ message, live }: { message: ChatMessage; live?: boolean })
                 <div key={a.id} className="att-labeled"><span className="chip">素材 {index + 1} · {a.name ?? "图片"}</span><img
                   key={a.id}
                   src={a.dataUrl}
-                  alt={a.name ?? ""}
+                  alt={a.name ?? ""} loading="lazy" decoding="async"
                   onClick={() => showImage({ dataUrl: a.dataUrl, title: a.name })}
                 /></div>
               ))}
             </div>
           )}
 
-          {message.reasoning && (
+          {hasDisplayText(message.reasoning) && (
             <details className="reasoning">
               <summary>思考过程</summary>
               {message.reasoning}
@@ -450,19 +475,19 @@ function MessageRow({ message, live }: { message: ChatMessage; live?: boolean })
           )}
 
           {message.goalProgress && <GoalReport progress={message.goalProgress} />}
-          {message.content && !message.goalProgress ? (
+          {hasDisplayText(message.content) && !message.goalProgress ? (
             <div className={live && !message.content.endsWith("\n") ? "cursor" : undefined}>
               <Markdown source={message.content} />
             </div>
-          ) : live && !message.toolCalls?.length ? (
+          ) : live ? (
             <span style={{ color: "var(--muted)" }}>
-              <Spinner /> 正在思考…
+              <Spinner /> {message.toolCalls?.length ? "正在准备图像工具…" : "正在思考…"}
             </span>
           ) : null}
 
-          {message.toolCalls && message.toolCalls.length > 0 && !live && (
+          {visibleCalls.length > 0 && !live && (
             <div className="image-tool-list">
-              {message.toolCalls.filter((tc) => tc.name !== "review_goal" && tc.name !== "review_images" && tc.name !== "edit_image_code").map((tc) => (
+              {visibleCalls.map((tc) => (
                 <ImageToolDetails key={tc.id} call={tc} labels={tc.sourceLabels} sentPrompt={tc.sentPrompt} />
               ))}
             </div>
@@ -477,7 +502,7 @@ function MessageRow({ message, live }: { message: ChatMessage; live?: boolean })
       </div>
     </div>
   );
-}
+});
 
 function GeneratedImages({ images }: { images: GeneratedRef[] }) {
   return (

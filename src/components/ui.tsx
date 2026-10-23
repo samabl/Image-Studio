@@ -12,7 +12,7 @@ export function Panel({ title, children, defaultOpen = false, className = "" }: 
   const [open, setOpen] = useState(defaultOpen);
   return <details className={`panel ${className}`} open={open} onToggle={(event) => setOpen(event.currentTarget.open)}>
     <summary className="panel-heading">{title}</summary>
-    <div className="panel-body">{children}</div>
+    {open && <div className="panel-body">{children}</div>}
   </details>;
 }
 
@@ -174,6 +174,7 @@ export function FileImage({
       className={className}
       style={style}
       loading="lazy"
+      decoding="async"
       draggable={false}
       onClick={onClick}
       onLoad={onLoad}

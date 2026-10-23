@@ -94,7 +94,7 @@ pub fn to_data_url(mime: &str, bytes: &[u8]) -> String {
     format!("data:{mime};base64,{}", STANDARD.encode(bytes))
 }
 
-fn ext_for_mime(mime: &str) -> &'static str {
+pub(crate) fn ext_for_mime(mime: &str) -> &'static str {
     match mime {
         "image/jpeg" | "image/jpg" => "jpg",
         "image/webp" => "webp",
@@ -685,6 +685,9 @@ pub struct ImageRequest {
     pub size: Option<String>,
     #[serde(default)]
     pub quality: Option<String>,
+    /// Gemini 分辨率档位：1K / 2K / 4K，与 quality 分开。
+    #[serde(default)]
+    pub image_size: Option<String>,
     #[serde(default)]
     pub background: Option<String>,
     #[serde(default)]
@@ -747,7 +750,7 @@ fn collect_images_from_json(v: &Value, out: &mut Vec<String>) {
 
 /// 从纯文本里捞出 data URL / Markdown 图片链接。
 /// Gemini 系图像模型会把结果以 `![image](data:image/jpeg;base64,...)` 塞进 content。
-fn extract_urls_from_text(text: &str) -> Vec<String> {
+pub(crate) fn extract_urls_from_text(text: &str) -> Vec<String> {
     let mut out = Vec::new();
 
     let mut rest = text;
@@ -761,22 +764,29 @@ fn extract_urls_from_text(text: &str) -> Vec<String> {
     }
 
     let mut rest = text;
-    while let Some(idx) = rest.find("](http") {
+    while let Some(idx) = rest.find("![") {
         let tail = &rest[idx + 2..];
-        let end = tail
-            .find(|c: char| matches!(c, ')' | '"' | '\'' | ']' | '<' | '>') || c.is_whitespace())
-            .unwrap_or(tail.len());
-        out.push(tail[..end].to_string());
+        let Some(link) = tail.find("](") else { break; };
+        let tail = &tail[link + 2..];
+        let end = tail.find(|c: char| matches!(c, ')' | '"' | '\'' | ']' | '<' | '>') || c.is_whitespace()).unwrap_or(tail.len());
+        if tail.starts_with("http://") || tail.starts_with("https://") {
+            out.push(tail[..end].to_string());
+        }
         rest = &tail[end..];
     }
 
     out
 }
 
-async fn download(client: &reqwest::Client, url: &str, api_key: &str) -> AppResult<RawImage> {
+pub fn image_download_same_origin(url: &str, base_url: &str) -> bool {
+    let (Ok(url), Ok(base)) = (reqwest::Url::parse(url), reqwest::Url::parse(base_url)) else { return false; };
+    matches!(url.scheme(), "http" | "https") && url.origin() == base.origin() && url.username().is_empty() && url.password().is_none()
+}
+
+async fn download(client: &reqwest::Client, url: &str, api_key: &str, base_url: &str) -> AppResult<RawImage> {
     let mut rb = client.get(url);
     // 只有同源网关才带 key，避免把密钥泄漏给第三方图床
-    rb = rb.bearer_auth(api_key.trim());
+    if image_download_same_origin(url, base_url) { rb = rb.bearer_auth(api_key.trim()); }
     let resp = rb.send().await?;
     if !resp.status().is_success() {
         return Err(api_error(resp).await);
@@ -803,6 +813,21 @@ async fn download(client: &reqwest::Client, url: &str, api_key: &str) -> AppResu
         revised_prompt: None,
         source_url: Some(url.to_string()),
     })
+}
+
+pub(crate) async fn resolve_output_images(req: &ImageRequest, client: &reqwest::Client, urls: Vec<String>) -> AppResult<Vec<RawImage>> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for url in urls {
+        if !seen.insert(url.clone()) { continue; }
+        if url.starts_with("data:image/") {
+            let (mime, bytes) = parse_data_url(&url)?;
+            out.push(RawImage { ext: ext_for_mime(&mime).into(), bytes, mime, revised_prompt: None, source_url: None });
+        } else if url.starts_with("https://") || url.starts_with("http://") {
+            out.push(download(client, &url, &req.api_key, &req.base_url).await?);
+        }
+    }
+    Ok(out)
 }
 
 /// 走 `/images/generations`（文生图）。
@@ -868,7 +893,7 @@ async fn generate_via_images(
                     source_url: None,
                 });
             } else if let Some(u) = item.get("url").and_then(Value::as_str) {
-                let mut img = download(client, u, &req.api_key).await?;
+                let mut img = download(client, u, &req.api_key, &req.base_url).await?;
                 img.revised_prompt = revised;
                 out.push(img);
             }
@@ -884,12 +909,7 @@ async fn generate_via_images(
 }
 
 /// 走 `/chat/completions` + `modalities:["image","text"]`（Gemini 系图像模型）。
-async fn generate_via_chat(
-    req: &ImageRequest,
-    client: &reqwest::Client,
-) -> AppResult<Vec<RawImage>> {
-    let url = build_url(&req.base_url, "/chat/completions")?;
-
+pub fn build_chat_image_body(req: &ImageRequest) -> AppResult<Value> {
     let mut content: Vec<Value> = vec![json!({ "type": "text", "text": req.prompt })];
     for (i, img) in req.images.iter().enumerate() {
         content.push(json!({ "type": "text", "text": crate::native::image_label(req, i) }));
@@ -906,12 +926,11 @@ async fn generate_via_chat(
         json!([{ "role": "user", "content": content }]),
     );
     body.insert("modalities".into(), json!(["image", "text"]));
-    if let Some((ratio, resolution)) = crate::native::image_dimensions(req.size.as_deref())? {
-        let mut config = json!({ "aspect_ratio": ratio });
-        if let Some(resolution) = resolution {
-            config["image_size"] = json!(resolution);
-        }
-        body.insert("image_config".into(), config);
+    if let Some(config) = crate::native::image_config(req)? {
+        let mut compatible = json!({});
+        if let Some(ratio) = config.get("aspectRatio") { compatible["aspect_ratio"] = ratio.clone(); }
+        if let Some(size) = config.get("imageSize") { compatible["image_size"] = size.clone(); }
+        body.insert("image_config".into(), compatible);
     }
     if let Some(Value::Object(extra)) = &req.extra_body {
         for (k, v) in extra {
@@ -923,7 +942,12 @@ async fn generate_via_chat(
         }
     }
 
-    let mut body = Value::Object(body);
+    Ok(Value::Object(body))
+}
+
+async fn generate_via_chat(req: &ImageRequest, client: &reqwest::Client) -> AppResult<Vec<RawImage>> {
+    let url = build_url(&req.base_url, "/chat/completions")?;
+    let mut body = build_chat_image_body(req)?;
     let resp = post_json(client, &url, &req.api_key, &mut body, false).await?;
     let v: Value = resp.json().await?;
     if let Some(err) = v.get("error") {
@@ -961,13 +985,13 @@ async fn generate_via_chat(
                 source_url: None,
             });
         } else if u.starts_with("http") {
-            out.push(download(client, &u, &req.api_key).await?);
+            out.push(download(client, &u, &req.api_key, &req.base_url).await?);
         }
     }
     if out.is_empty() {
         return Err(AppError::other(format!(
-            "模型未返回图像（当前模型可能不支持 modalities 出图），原始响应：{}",
-            truncate(&v.to_string(), 600)
+            "模型未返回图像（当前模型可能不支持 modalities 出图）。{}",
+            crate::native::image_response_diagnostic(&v)
         )));
     }
     Ok(out)
@@ -1054,7 +1078,7 @@ async fn edit_via_images(req: &ImageRequest, client: &reqwest::Client) -> AppRes
                     source_url: None,
                 });
             } else if let Some(u) = item.get("url").and_then(Value::as_str) {
-                let mut img = download(client, u, &req.api_key).await?;
+                let mut img = download(client, u, &req.api_key, &req.base_url).await?;
                 img.revised_prompt = revised;
                 out.push(img);
             }
@@ -1132,6 +1156,9 @@ pub async fn run_image_request(req: &ImageRequest) -> AppResult<Vec<RawImage>> {
         ));
     }
 
+    if mode == "images" && req.image_size.as_deref().is_some_and(|s| !s.trim().is_empty() && s.trim() != "auto") {
+        return Err(AppError::config("Images 接口不使用 image_size，请用 size 指定具体尺寸"));
+    }
     if mode == "gemini" {
         return crate::native::generate_images(req, &client).await;
     }

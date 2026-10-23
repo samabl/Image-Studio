@@ -640,15 +640,24 @@ pub fn build_image_body(req: &ImageRequest) -> AppResult<Value> {
         parts.push(json!({ "inlineData": { "mimeType": mime, "data": STANDARD.encode(bytes) } }));
     }
     let mut body = json!({ "contents": [{ "role": "user", "parts": parts }], "generationConfig": { "responseModalities": ["TEXT", "IMAGE"] } });
-    if let Some((ratio, resolution)) = image_dimensions(req.size.as_deref())? {
-        let mut config = json!({ "aspectRatio": ratio });
-        if let Some(resolution) = resolution {
-            config["imageSize"] = json!(resolution);
-        }
-        body["generationConfig"]["imageConfig"] = config;
-    }
+    if let Some(config) = image_config(req)? { body["generationConfig"]["imageConfig"] = config; }
     merge_extra(&mut body, &req.extra_body);
     Ok(body)
+}
+
+/// 允许显式选择分辨率，不能把 quality:high 直接塞进 Gemini 请求体。
+pub fn image_config(req: &ImageRequest) -> AppResult<Option<Value>> {
+    let mut config = json!({});
+    if let Some((ratio, resolution)) = image_dimensions(req.size.as_deref())? {
+        config["aspectRatio"] = json!(ratio);
+        if let Some(resolution) = resolution { config["imageSize"] = json!(resolution); }
+    }
+    if let Some(size) = req.image_size.as_deref().map(str::trim).filter(|s| !s.is_empty() && *s != "auto") {
+        let size = size.to_ascii_uppercase();
+        if !matches!(size.as_str(), "1K" | "2K" | "4K") { return Err(AppError::config("Gemini 分辨率档位仅支持 1K / 2K / 4K")); }
+        config["imageSize"] = json!(size);
+    }
+    Ok(if config.as_object().unwrap().is_empty() { None } else { Some(config) })
 }
 
 /// 原生/兼容 Gemini 使用比例与分辨率档位，无法保证逐像素尺寸。
@@ -710,52 +719,66 @@ pub fn image_dimensions(
     Ok(Some((ratio, resolution)))
 }
 
-pub fn parse_images(value: &Value) -> AppResult<Vec<RawImage>> {
-    if let Some(error) = value.get("error") {
-        return Err(AppError::other(text(&error["message"])));
-    }
-    let mut out = Vec::new();
+/// 非图像响应只提取短诊断，避免把数 MB 的 thought signature 或图片数据写进对话。
+pub fn image_response_diagnostic(value: &Value) -> String {
+    let mut details = Vec::new();
+    if let Some(reason) = value["promptFeedback"]["blockReason"].as_str() { details.push(format!("拦截原因：{reason}")); }
     if let Some(candidates) = value["candidates"].as_array() {
-        for candidate in candidates {
+        for candidate in candidates.iter().take(3) {
+            if let Some(reason) = candidate["finishReason"].as_str() { details.push(format!("结束原因：{reason}")); }
             if let Some(parts) = candidate["content"]["parts"].as_array() {
-                for part in parts {
-                    if part["thought"] == true {
-                        continue;
+                for part in parts.iter().filter(|p| p["thought"] != true).take(3) {
+                    if let Some(text) = part["text"].as_str().filter(|s| !s.contains("data:image/") && !s.trim().is_empty()) {
+                        details.push(ai::truncate(text.trim(), 200));
                     }
-                    let Some(image) = part.get("inlineData").or_else(|| part.get("inline_data"))
-                    else {
-                        continue;
-                    };
-                    let mime = image
-                        .get("mimeType")
-                        .or_else(|| image.get("mime_type"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("image/png");
-                    let Some(data) = image["data"].as_str() else {
-                        continue;
-                    };
-                    let (mime, bytes) = ai::parse_data_url(&format!("data:{mime};base64,{data}"))?;
-                    let ext = match mime.as_str() {
-                        "image/jpeg" => "jpg",
-                        "image/webp" => "webp",
-                        _ => "png",
-                    };
-                    out.push(RawImage {
-                        bytes,
-                        mime,
-                        ext: ext.into(),
-                        revised_prompt: None,
-                        source_url: None,
-                    });
                 }
             }
         }
     }
-    if out.is_empty() {
-        return Err(AppError::other(
-            "Gemini 未返回图像，请确认模型支持图像输出，或检查安全策略拦截",
-        ));
+    if let Some(choices) = value["choices"].as_array() {
+        for choice in choices.iter().take(3) {
+            if let Some(reason) = choice["finish_reason"].as_str() { details.push(format!("结束原因：{reason}")); }
+            if let Some(content) = choice["message"]["content"].as_str().filter(|s| !s.contains("data:image/") && !s.trim().is_empty()) {
+                details.push(ai::truncate(content.trim(), 200));
+            }
+        }
     }
+    if details.is_empty() { "请确认模型支持图像输出，或检查安全策略和网关返回格式".into() } else { details.join("；") }
+}
+
+pub fn image_response_urls(value: &Value) -> AppResult<Vec<String>> {
+    if let Some(error) = value.get("error") { return Err(AppError::other(text(&error["message"]))); }
+    let mut urls = Vec::new();
+    if let Some(candidates) = value["candidates"].as_array() {
+        for candidate in candidates {
+            if let Some(parts) = candidate["content"]["parts"].as_array() {
+                for part in parts {
+                    if part["thought"] == true { continue; }
+                    if let Some(image) = part.get("inlineData").or_else(|| part.get("inline_data")) {
+                        let mime = image.get("mimeType").or_else(|| image.get("mime_type")).and_then(Value::as_str).unwrap_or("image/png");
+                        if let Some(data) = image["data"].as_str() { urls.push(format!("data:{mime};base64,{data}")); }
+                    }
+                    // 实测网关会在 GenerateContent 的 text part 中返回 Markdown data URL。
+                    if let Some(text) = part["text"].as_str() { urls.extend(ai::extract_urls_from_text(text)); }
+                }
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    urls.retain(|u| seen.insert(u.clone()));
+    if urls.is_empty() { return Err(AppError::other(format!("Gemini 未返回图像。{}", image_response_diagnostic(value)))); }
+    Ok(urls)
+}
+
+pub fn parse_images(value: &Value) -> AppResult<Vec<RawImage>> {
+    let mut out = Vec::new();
+    for url in image_response_urls(value)? {
+        if !url.starts_with("data:image/") { continue; }
+        let (mime, bytes) = ai::parse_data_url(&url)?;
+        let ext = ai::ext_for_mime(&mime).to_string();
+        out.push(RawImage { bytes, mime, ext, revised_prompt: None, source_url: None });
+    }
+    if out.is_empty() { return Err(AppError::other("Gemini 返回远程图片链接，需要通过生图请求下载")); }
     Ok(out)
 }
 
@@ -776,7 +799,8 @@ pub async fn generate_images(
         if !response.status().is_success() {
             return Err(api_error(response).await);
         }
-        out.extend(parse_images(&response.json::<Value>().await?)?);
+        let value = response.json::<Value>().await?;
+        out.extend(ai::resolve_output_images(req, client, image_response_urls(&value)?).await?);
     }
     Ok(out)
 }

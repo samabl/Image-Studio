@@ -1,6 +1,6 @@
 [package]
 name = "gpt-image-studio"
-version = "0.2.5"
+version = "0.2.6"
 description = "跨平台 AI 图像工作台：对话 / 文生图 / 图生图 / 图像编辑"
 authors = ["GPT Image Studio"]
 edition = "2021"

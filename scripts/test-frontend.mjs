@@ -18,7 +18,13 @@ const imageModelsUrl = await compile("src/lib/imageModels.ts");
 const imageModels = await import(imageModelsUrl);
 const imageSizeUrl = await compile("src/lib/imageSize.ts");
 const goalUrl = await compile("src/lib/goal.ts");
-const juryUrl = await compile("src/lib/jury.ts", { "./chat": chatUrl });
+const juryUrl = await compile("src/lib/jury.ts", { "./chat": chatUrl, "./goal": goalUrl });
+const goal = await import(goalUrl);
+const streamBufferUrl = await compile("src/lib/streamBuffer.ts");
+const streamBuffer = await import(streamBufferUrl);
+const imageSize = await import(imageSizeUrl);
+const presentation = await import(await compile("src/lib/messagePresentation.ts"));
+const updates = await import(await compile("src/lib/updates.ts"));
 const jury = await import(juryUrl);
 const codeWorkerSource = await readFile(new URL("../src/lib/codeWorker.js", import.meta.url), "utf8");
 const codeWorkerUrl = `data:text/javascript,${encodeURIComponent(`export default ${JSON.stringify(codeWorkerSource)};`)}`;
@@ -141,7 +147,7 @@ async function harness() {
   globalThis.__studioTestApi = api;
   const apiUrl = `data:text/javascript,${encodeURIComponent(Object.keys(api).map((name) => `export const ${name} = (...args) => globalThis.__studioTestApi.${name}(...args);`).join("\n"))}`;
   const imageUrl = await compile("src/lib/image.ts");
-  const storeUrl = await compile("src/lib/store.ts", { zustand: import.meta.resolve("zustand"), "./api": apiUrl, "./image": imageUrl, "./chat": chatUrl, "./imageModels": imageModelsUrl, "./imageSize": imageSizeUrl, "./goal": goalUrl, "./jury": juryUrl, "./codeRuntime": codeMockUrl });
+  const storeUrl = await compile("src/lib/store.ts", { zustand: import.meta.resolve("zustand"), "./api": apiUrl, "./image": imageUrl, "./chat": chatUrl, "./imageModels": imageModelsUrl, "./imageSize": imageSizeUrl, "./goal": goalUrl, "./jury": juryUrl, "./codeRuntime": codeMockUrl, "./streamBuffer": streamBufferUrl });
   const store = await import(`${storeUrl}#${++harnessId}`);
   store.useConfig.setState({ ready: true, config: {
     chat: { protocol: "openai", baseUrl: "https://example.test", apiKey: "test-key", model: "test-model", systemPrompt: "测试", maxTokens: 4096, temperature: null, timeoutSecs: 30, stream: true, models: [] },
@@ -802,64 +808,87 @@ const callTool = (stream, calls) => {
 };
 
 const goalCheck = (status, imageIds, passed = status === "satisfied") => ({ status, summary: passed ? "逐项符合要求" : "需要修正人物数量", image_ids: imageIds, checks: [{ requirement: "恰好两个人", passed, details: passed ? "实际图片包含两个人" : "实际图片只有一个人" }] });
+const scoreJSON = (score = 90, passed = true, requirement = "明确用户要求") => JSON.stringify({ score, summary: "根据实际成果独立评分", checks: [{ requirement, score, passed, details: passed ? "实际内容符合要求" : "实际内容违反明确要求" }] });
+const guardHarness = (t, h) => t.after(() => {
+  const sessions = h.useSessions.getState();
+  Object.keys(sessions.runs).forEach((id) => sessions.stop(id));
+  if (h.useStudio.getState().busy) h.useStudio.getState().stop();
+});
 
-test("Goal 自动检查实际回图、修正后重新验收，达标才结束并保存记录", async () => {
-  const h = await harness(); const sessions = h.useSessions.getState;
-  sessions().setGoal({ enabled: true, level: "strict", maxCorrections: 2 });
+test("Goal 自动独立评分实际回图、修正后重新验收，达标才结束并保存记录", async (t) => {
+  const h = await harness(); guardHarness(t, h); const sessions = h.useSessions.getState;
+  sessions().setGoal({ enabled: true, targetScore: 95, scorer: "chat", maxCorrections: 2 });
   const pending = sessions().send("恰好两个人，文字保持你好", []);
   assert.ok(h.streams[0].request.tools.some((tool) => tool.function.name === "review_goal"));
-  assert.ok(h.streams[0].request.messages.some((message) => typeof message.content === "string" && message.content.includes("验收等级：严格")));
-  sessions().setGoal({ level: "relaxed" }); assert.equal(sessions().current().goal.level, "strict");
+  assert.ok(h.streams[0].request.messages.some((m) => typeof m.content === "string" && m.content.includes("目标分数：95/100")));
+  sessions().setGoal({ targetScore: 70 }); assert.equal(sessions().current().goal.targetScore, 95);
   callTool(h.streams[0], [{ args: { prompt: "两个人" } }]); await tick();
   h.imageCalls[0].resolve([generated("initial", "image-test")]); await tick();
   assert.ok(JSON.stringify(h.streams[1].request.messages).includes(attachment("initial").dataUrl));
-  callTool(h.streams[1], [{ name: "review_goal", args: goalCheck("needs_revision", ["image_initial"]) }]); await tick();
+  callTool(h.streams[1], [{ name: "review_goal", args: { ...goalCheck("satisfied", ["image_initial"]), score: 100 } }]); await tick();
+  assert.equal(h.streams.length, 2, "等待真正的独立评分，不能接受主 Chat 的自评");
+  assert.equal(h.textCalls[0].request.tools, null);
+  assert.ok(JSON.stringify(h.textCalls[0].request.messages).includes(attachment("initial").dataUrl));
+  assert.match(JSON.stringify(h.textCalls[0].request.messages), /文字保持你好/);
+  h.textCalls[0].resolve(scoreJSON(58, false, "恰好两个人")); await tick();
   callTool(h.streams[2], [{ name: "edit_image", args: { prompt: "补齐第二个人，保留文字", source_image_ids: ["image_initial"] } }]); await tick();
   assert.deepEqual(h.imageCalls[1].request.images, [attachment("initial").dataUrl]);
   assert.ok(h.imageCalls[1].request.prompt.includes("文字保持你好"));
   h.imageCalls[1].resolve([generated("fixed", "image-test")]); await tick();
   callTool(h.streams[3], [{ name: "review_goal", args: goalCheck("satisfied", ["image_initial"]) }]); await tick();
   assert.ok(sessions().current().messages.at(-1).content.includes("不能以旧图代替"));
-  callTool(h.streams[4], [{ name: "review_goal", args: goalCheck("satisfied", ["image_fixed"]) }]); await tick();
+  assert.equal(h.textCalls.length, 1);
+  callTool(h.streams[4], [{ name: "review_goal", args: { image_ids: ["image_fixed"] } }]); await tick();
+  h.textCalls[1].resolve(scoreJSON(98)); await tick();
   assert.equal(h.streams[5].request.tools, null);
   complete(h.streams[5], "已修正并满足要求"); await pending;
   const report = sessions().current().messages.at(-1).goalProgress;
-  assert.equal(report.status, "satisfied"); assert.equal(report.corrections, 1); assert.equal(report.attempts, 2);
+  assert.equal(report.status, "satisfied"); assert.equal(report.score, 98); assert.equal(report.scorer, "chat");
+  assert.equal(report.corrections, 1); assert.equal(report.attempts, 2);
   await sessions().persist(); assert.equal(h.saves.at(-1).sessions[0].messages.at(-1).goalProgress.status, "satisfied");
   assert.equal(h.imageCalls.length, 2);
 });
 
-test("Goal 不能用文字宣称完成、旧图或未通过检查代替最新实际回图", async () => {
-  const h = await harness(); const sessions = h.useSessions.getState;
-  sessions().setGoal({ enabled: true, maxCorrections: 1 });
+test("Goal 不能用文字宣称完成、旧图或伪造通过绕过独立分数和明确约束", async (t) => {
+  const h = await harness(); guardHarness(t, h); const sessions = h.useSessions.getState;
+  sessions().setGoal({ enabled: true, targetScore: 85, maxCorrections: 1 });
   const pending = sessions().send("生成两个人", []);
   complete(h.streams[0], "已经完成"); await tick();
   assert.equal(h.streams.length, 2); assert.ok(h.streams[1].request.messages.at(-1).content.includes("不能只用文字"));
   callTool(h.streams[1], [{ args: { prompt: "两个人" } }]); await tick();
   h.imageCalls[0].resolve([generated("current", "image-test")]); await tick();
   callTool(h.streams[2], [{ name: "review_goal", args: goalCheck("satisfied", ["image_missing"]) }]); await tick();
-  assert.ok(sessions().current().messages.at(-1).content.includes("找不到图片"));
-  callTool(h.streams[3], [{ name: "review_goal", args: goalCheck("satisfied", ["image_current"], false) }]); await tick();
-  assert.ok(sessions().current().messages.at(-1).content.includes("不能判定"));
-  callTool(h.streams[4], [{ name: "review_goal", args: goalCheck("blocked", ["image_current"]) }]); await tick();
+  assert.ok(sessions().current().messages.at(-1).content.includes("找不到图片")); assert.equal(h.textCalls.length, 0);
+  callTool(h.streams[3], [{ name: "review_goal", args: { ...goalCheck("satisfied", ["image_current"]), score: 100 } }]); await tick();
+  h.textCalls[0].resolve(scoreJSON(99, false)); await tick();
+  const review = sessions().current().messages.find((m) => m.goalReview)?.goalReview;
+  assert.equal(review.status, "needs_revision"); assert.equal(review.score, 99);
+  assert.match(review.summary, /明确要求未满足/);
+  callTool(h.streams[4], [{ name: "review_goal", args: { image_ids: ["image_current"], blocked_reason: "当前服务不能满足真实要求" } }]); await tick();
   complete(h.streams[5], "当前模型无法满足"); await pending;
   assert.equal(sessions().current().messages.at(-1).goalProgress.status, "blocked");
 });
 
-test("文字 Goal 通过完整答案验收，图像请求失败不能用空回图宣称完成", async () => {
-  const h = await harness(); const sessions = h.useSessions.getState;
-  sessions().setGoal({enabled:true,maxCorrections:1});
-  const text=sessions().send("写一个标题",[]);
-  callTool(h.streams[0],[{name:"review_goal",args:{status:"satisfied",summary:"标题符合要求",answer:"清新图像工作台",checks:[{requirement:"简短中文标题",passed:true,details:"使用七字中文标题"}]}}]); await tick();
-  complete(h.streams[1]); await text;
-  assert.equal(sessions().current().messages.at(-1).goalProgress.status,"satisfied");
-  assert.ok(sessions().current().messages.some(m=>m.goalReview?.answer==="清新图像工作台"));
-  const image=sessions().send("生成图片",[]);
-  callTool(h.streams[2],[{args:{prompt:"生成图片"}}]); await tick(); h.imageCalls[0].reject(new Error("服务不可用")); await tick();
-  callTool(h.streams[3],[{name:"review_goal",args:{...goalCheck("satisfied",[]),answer:"已生成"}}]); await tick();
-  assert.ok(sessions().current().messages.at(-1).content.includes("尚未返回实际最终图片"));
-  callTool(h.streams[4],[{name:"review_goal",args:goalCheck("blocked",[])}]); await tick(); complete(h.streams[5]); await image;
-  assert.equal(sessions().current().messages.at(-1).goalProgress.status,"blocked");
+test("纯文字 Goal 在关闭图像/代码工具时也可独立评分，生图失败不能以文字冒充结果", async (t) => {
+  const h = await harness(); guardHarness(t, h); const sessions = h.useSessions.getState; const cfg = h.useConfig.getState().config;
+  h.useConfig.setState({ config: { ...cfg, linkage: { ...cfg.linkage, enabled: false, useTools: false } } });
+  sessions().setGoal({ enabled: true, targetScore: 85, scorer: "chat", maxCorrections: 1 });
+  const text = sessions().send("写一个简短中文标题", []);
+  assert.deepEqual(h.streams[0].request.tools.map((tool) => tool.function.name), ["review_goal"]);
+  callTool(h.streams[0], [{ name: "review_goal", args: { image_ids: [], answer: "清新图像工作台", status: "satisfied", score: 100 } }]); await tick();
+  assert.equal(h.streams.length, 1); assert.match(JSON.stringify(h.textCalls[0].request.messages), /清新图像工作台/);
+  assert.equal(h.textCalls[0].request.model, cfg.chat.model);
+  h.textCalls[0].resolve(scoreJSON(91)); await tick(); complete(h.streams[1]); await text;
+  assert.equal(sessions().current().messages.at(-1).goalProgress.status, "satisfied");
+  assert.ok(sessions().current().messages.some((m) => m.goalReview?.answer === "清新图像工作台"));
+  h.useConfig.setState({ config: cfg });
+  const image = sessions().send("生成图片", []);
+  callTool(h.streams[2], [{ args: { prompt: "生成图片" } }]); await tick(); h.imageCalls[0].reject(new Error("服务不可用")); await tick();
+  callTool(h.streams[3], [{ name: "review_goal", args: { image_ids: [], answer: "已生成" } }]); await tick();
+  assert.ok(sessions().current().messages.at(-1).content.includes("尚未返回实际最终图片")); assert.equal(h.textCalls.length, 1);
+  callTool(h.streams[4], [{ name: "review_goal", args: { image_ids: [], blocked_reason: "生图服务不可用" } }]); await tick();
+  complete(h.streams[5]); await image;
+  assert.equal(sessions().current().messages.at(-1).goalProgress.status, "blocked");
 });
 
 test("Goal 达到修正上限后拒绝更多生图，停止会取消请求并保留停止状态", async () => {
@@ -906,7 +935,7 @@ test("生图失败仅由 Chat 决定重试或切换，保留完整请求且不�
 test("重试不能切换用户固定模型，Goal 设置和停止在并发会话间隔离", async () => {
   const h = await harness(); const sessions = h.useSessions.getState; const cfg=h.useConfig.getState().config;
   h.useConfig.setState({config:{...cfg,image:{...cfg.image,modelPool:[{id:"A",apiMode:"images"},{id:"B",apiMode:"chat"}]}}});
-  sessions().setImageModel("A"); sessions().setGoal({enabled:true,level:"strict",maxCorrections:2});
+  sessions().setImageModel("A"); sessions().setGoal({enabled:true,targetScore:95,scorer:"chat",maxCorrections:2});
   const first=sessions().currentId; const p1=sessions().send("第一目标",[]);
   const [failed]=callTool(h.streams[0],[{args:{model:"A",prompt:"目标"}}]); await tick(); h.imageCalls[0].reject(new Error("繁忙")); await tick();
   sessions().newSession(); const second=sessions().currentId; const p2=sessions().send("普通会话",[]);
@@ -1061,4 +1090,251 @@ test("Chat 控制编辑/合成尺寸，省略沿用设置，显式 auto 不强�
   callTool(h.streams[0],[{name:"edit_image",args:{prompt:"组合",size:"2048x2048",source_image_ids:["ref"]}}]);await tick();
   assert.equal(h.imageCalls[0].request.size,"2048x2048");
   h.imageCalls[0].resolve([generated("g","image-test")]);await tick();complete(h.streams[1]);await pending;
+});
+
+
+test("Goal 等级迁移为分数，新增设置约束范围且不接受伪造评分来源", () => {
+  assert.deepEqual(goal.goalSettings(), { enabled: false, scorer: "auto", targetScore: 85, maxCorrections: 3 });
+  for (const [level, score, corrections] of [["relaxed",70,1],["standard",85,3],["strict",95,6]]) {
+    assert.deepEqual(goal.goalSettings({ enabled: true, level }), { enabled: true, scorer: "auto", targetScore: score, maxCorrections: corrections });
+  }
+  assert.equal(goal.goalSettings({ level: "strict", targetScore: 88 }).targetScore, 88);
+  assert.equal(goal.goalSettings({ targetScore: 0, maxCorrections: -2 }).targetScore, 1);
+  assert.equal(goal.goalSettings({ targetScore: 200, maxCorrections: 99 }).targetScore, 100);
+  assert.equal(goal.goalSettings({ targetScore: 99.7, maxCorrections: 3.9 }).maxCorrections, 3);
+  assert.equal(goal.goalSettings({ targetScore: NaN, maxCorrections: Infinity }).targetScore, 85);
+  assert.equal(goal.goalSettings({ scorer: "__proto__" }).scorer, "auto");
+  assert.equal(goal.goalSettings({ scorer: "jury" }).scorer, "jury");
+});
+
+test("独立评分必须是有依据的有限 0–100 分和非空逐项约束", () => {
+  const valid = JSON.parse(scoreJSON(84.995));
+  assert.equal(goal.parseGoalScore("```json\n" + JSON.stringify(valid) + "\n```").score, 84.995);
+  for (const value of [null, [], {}, { ...valid, score: "99" }, { ...valid, score: -1 }, { ...valid, score: 101 },
+    { ...valid, summary: " " }, { ...valid, checks: [] }, { ...valid, checks: Array(41).fill(valid.checks[0]) },
+    { ...valid, checks: [{ ...valid.checks[0], passed: "true" }] }, { ...valid, checks: [{ ...valid.checks[0], score: 101 }] },
+    { ...valid, checks: [{ ...valid.checks[0], requirement: " " }] }, { ...valid, checks: [{ ...valid.checks[0], details: "" }] }]) {
+    assert.throws(() => goal.parseGoalScore(JSON.stringify(value)));
+  }
+  assert.throws(() => goal.parseGoalScore('{"score":1e400,"summary":"依据","checks":[]}'));
+  assert.throws(() => goal.parseGoalScore("已通过，100 分"), /JSON/);
+  assert.throws(() => goal.parseGoalSubmission({ image_ids: ["x","x"] }));
+  assert.throws(() => goal.parseGoalSubmission({ image_ids: [3] }));
+  assert.throws(() => goal.parseGoalSubmission({ image_ids: [] }));
+});
+
+const scoredReport = (scores, passed = true) => ({ status: "complete", imageIds: ["image_actual"], createdAt: 1,
+  opinions: scores.map((score,index) => ({ memberId: String(index), name: "评审" + index, model: "vision", status: "complete", goalScore: goal.parseGoalScore(scoreJSON(score, passed)) })) });
+
+test("Goal 依据未舍入均分和每个明确约束判定，部分评审失败绝不能通过", () => {
+  const settings = goal.goalSettings({ enabled: true, targetScore: 85 });
+  const borderline = goal.goalReviewFromScores(scoredReport([84.999,84.999]), settings, "jury");
+  assert.equal(borderline.score, 85); assert.equal(borderline.status, "needs_revision");
+  assert.equal(goal.goalReviewFromScores(scoredReport([80,90]), settings, "jury").status, "satisfied");
+  assert.equal(goal.goalReviewFromScores(scoredReport([99,100],false), settings, "jury").status, "needs_revision");
+  const failed = scoredReport([90,90]); failed.status = "partial"; failed.opinions[1] = { status: "error", error: "看图失败" };
+  assert.throws(() => goal.goalReviewFromScores(failed, settings, "jury"), /全部完成/);
+  const missing = scoredReport([90]); delete missing.opinions[0].goalScore;
+  assert.throws(() => goal.goalReviewFromScores(missing, settings, "chat"));
+});
+
+test("非 Goal 历史中的空助手和不可见字符不产生空气泡，但真实内容和工具协议不丢失", () => {
+  for (const content of ["", " \n\t", "\u200B\u200C\u200D\u2060\uFEFF"]) {
+    assert.equal(presentation.hasVisibleMessage(message("assistant", { content })), false);
+  }
+  for (const field of [{ reasoning: "分析依据" }, { error: "请求失败" }, { images: [{ path: "out.png" }] }, { attachments: [attachment("a")] },
+    { goalReview: {} }, { goalProgress: {} }, { juryReview: {} }, { codeExecution: {} }, { pending: true }]) {
+    assert.equal(presentation.hasVisibleMessage(message("assistant", field)), true);
+  }
+  const internal = [{ id: "r", name: "review_goal", arguments: "{}" }, { id: "j", name: "review_images", arguments: "{}" }, { id: "c", name: "edit_image_code", arguments: "{}" }];
+  assert.deepEqual(presentation.displayToolCalls(internal), []);
+  assert.equal(presentation.hasVisibleMessage(message("assistant", { toolCalls: internal }), true), false);
+  assert.equal(presentation.hasVisibleMessage(message("assistant"), true), true, "流式等待展示真实的思考提示而不是空壳");
+  assert.equal(presentation.hasVisibleMessage(message("assistant", { toolCalls: [{id:"g",name:"generate_image",arguments:"{}"}] })), true);
+  assert.deepEqual(chat.conversationMessages([message("assistant", { toolCalls: [internal[0]] }), message("tool", { toolCallId:"r",content:"独立评分完成" })]).map((m) => m.role), ["assistant","tool"]);
+});
+
+test("流式合并保持文字和 reasoning 顺序，flush 清理定时器并保留最后工具列表", async () => {
+  const batches = []; const buffer = streamBuffer.createStreamBuffer((batch) => batches.push(batch), 100);
+  const tools = [{ id: "g", name: "generate_image", arguments: '{"prompt":"完整"}' }];
+  for (let i=0; i<200; i++) { buffer.push({type:"delta",text:String(i)+"，"}); buffer.push({type:"reasoning",text:"想"+i+"。"}); }
+  buffer.push({type:"toolCalls",calls:[]}); buffer.push({type:"toolCalls",calls:tools});
+  assert.equal(batches.length,0); buffer.flush(); buffer.flush();
+  assert.equal(batches.length,1);
+  assert.equal(batches[0].content,Array.from({length:200},(_,i)=>String(i)+"，").join(""));
+  assert.equal(batches[0].reasoning,Array.from({length:200},(_,i)=>"想"+i+"。").join(""));
+  assert.deepEqual(batches[0].toolCalls,tools);
+  await new Promise((resolve)=>setTimeout(resolve,120)); assert.equal(batches.length,1);
+});
+
+test("Chat 工具可指定 Images 画质或 Gemini 分辨率，不接受错误或互不兼容的参数", () => {
+  for (const quality of ["auto","low","medium","high","standard","hd"]) assert.equal(imageSize.imageToolQuality(quality,"auto","images"),quality);
+  assert.equal(imageSize.imageToolQuality(undefined,"high","images"),"high");
+  assert.equal(imageSize.imageToolQuality(" HIGH ","auto","images"),"high");
+  for (const mode of ["gemini","chat"]) {
+    for (const resolution of ["1K","2K","4K"]) assert.equal(imageSize.imageToolResolution(resolution.toLowerCase(),mode),resolution);
+    assert.throws(()=>imageSize.imageToolQuality("high","auto",mode),/image_size/);
+  }
+  assert.equal(imageSize.imageToolResolution("auto","images"),undefined);
+  assert.throws(()=>imageSize.imageToolResolution("2K","images"),/quality/);
+  for (const value of [null,2,"8K",{}]) assert.throws(()=>imageSize.imageToolResolution(value,"gemini"));
+  for (const value of [null,1,"ultra",{}]) assert.throws(()=>imageSize.imageToolQuality(value,"auto","images"));
+});
+
+
+test("显式评审团必须配置，自动模式可回退 Chat，显式 Chat 不改成评审团", async (t) => {
+  const h=await harness(); guardHarness(t,h); const sessions=h.useSessions.getState;
+  sessions().setGoal({enabled:true,scorer:"jury"}); await sessions().send("目标",[]);
+  assert.equal(h.streams.length,0); assert.match(h.useToast.getState().toasts.at(-1).text,/配置并启用评审团/);
+  sessions().setGoal({scorer:"auto"}); const auto=sessions().send("文字目标",[]);
+  callTool(h.streams[0],[{name:"review_goal",args:{image_ids:[],answer:"真实完整答案"}}]); await tick();
+  assert.equal(h.textCalls.length,1); assert.equal(h.textCalls[0].request.model,"test-model");
+  h.textCalls[0].resolve(scoreJSON(90)); await tick(); complete(h.streams[1]); await auto;
+  h.useConfig.setState({config:withJury(h.useConfig.getState().config)}); sessions().setGoal({scorer:"chat"});
+  const chatRun=sessions().send("只让 Chat 打分",[]); callTool(h.streams[2],[{args:{prompt:"出图"}}]); await tick();
+  h.imageCalls[0].resolve([generated("chat_only","image-test")]); await tick(); assert.equal(h.textCalls.length,1,"不自动让评审团重复付费");
+  callTool(h.streams[3],[{name:"review_goal",args:{image_ids:["image_chat_only"]}}]); await tick();
+  assert.equal(h.textCalls.length,2); assert.equal(h.textCalls[1].request.model,"test-model");
+  h.textCalls[1].resolve(scoreJSON(92)); await tick(); complete(h.streams[4]); await chatRun;
+  assert.equal(sessions().current().messages.at(-1).goalProgress.scorer,"chat");
+});
+
+test("评审团对新成图独立打分，复用同一图片完整评分但新图使缓存失效", async (t) => {
+  const h=await harness(); guardHarness(t,h); const sessions=h.useSessions.getState;
+  h.useConfig.setState({config:withJury(h.useConfig.getState().config)});
+  sessions().setGoal({enabled:true,scorer:"jury",targetScore:90,maxCorrections:2});
+  const pending=sessions().send("保留原要求",[]); callTool(h.streams[0],[{args:{prompt:"初稿"}}]); await tick();
+  h.imageCalls[0].resolve([generated("first_score","image-test")]); await tick(); assert.equal(h.textCalls.length,2);
+  h.textCalls[0].resolve(scoreJSON(60)); h.textCalls[1].resolve(scoreJSON(70)); await tick();
+  callTool(h.streams[1],[{name:"review_goal",args:{image_ids:["image_first_score"]}}]); await tick();
+  assert.equal(h.textCalls.length,2,"缓存来自真实的独立评审，不接受 Chat 自评");
+  callTool(h.streams[2],[{name:"edit_image",args:{prompt:"修正",source_image_ids:["image_first_score"]}}]); await tick();
+  h.imageCalls[1].resolve([generated("new_score","image-test")]); await tick(); assert.equal(h.textCalls.length,4);
+  for (const task of h.textCalls.slice(2)) assert.ok(JSON.stringify(task.request.messages).includes(attachment("new_score").dataUrl));
+  h.textCalls[2].resolve(scoreJSON(95)); h.textCalls[3].resolve(scoreJSON(97)); await tick();
+  callTool(h.streams[3],[{name:"review_goal",args:{image_ids:["image_new_score"]}}]); await tick(); assert.equal(h.textCalls.length,4);
+  complete(h.streams[4]); await pending;
+  const report=sessions().current().messages.at(-1).goalProgress; assert.equal(report.score,96); assert.equal(report.status,"satisfied");
+  assert.equal(report.reviewerScores.length,2); assert.equal(report.corrections,1);
+});
+
+test("部分评审或无效评分不会通过；停止独立评分取消所有成员且不再付费续跑", async (t) => {
+  const h=await harness(); guardHarness(t,h); const sessions=h.useSessions.getState;
+  h.useConfig.setState({config:withJury(h.useConfig.getState().config)});
+  sessions().setGoal({enabled:true,scorer:"jury",targetScore:85});
+  const pending=sessions().send("真实图像",[]); callTool(h.streams[0],[{args:{prompt:"真实图像"}}]); await tick();
+  h.imageCalls[0].resolve([generated("partial_score","image-test")]); await tick();
+  h.textCalls[0].resolve(scoreJSON(99)); h.textCalls[1].resolve("我给 100 分"); await tick();
+  callTool(h.streams[1],[{name:"review_goal",args:{image_ids:["image_partial_score"],score:100,status:"satisfied"}}]); await tick();
+  assert.equal(h.textCalls.length,4,"不缓存部分/无效评分，必须重新独立评分");
+  h.textCalls[2].resolve(scoreJSON(100)); h.textCalls[3].reject(new Error("评审不可用")); await tick();
+  assert.match(sessions().current().messages.at(-1).content,/不能判定 Goal 通过/);
+  callTool(h.streams[2],[{name:"review_goal",args:{image_ids:["image_partial_score"]}}]); await tick();
+  sessions().stop(); await pending;
+  assert.ok(h.textCalls.slice(4).every((task)=>task.canceled)); assert.equal(h.streams.length,3);
+  assert.equal(sessions().current().messages.at(-1).goalProgress.status,"stopped");
+});
+
+test("含文字答案的图像评分不能污染随后纯图片评分缓存", async (t) => {
+  const h=await harness(); guardHarness(t,h); const sessions=h.useSessions.getState;
+  sessions().setGoal({enabled:true,scorer:"chat",targetScore:95,maxCorrections:2});
+  const pending=sessions().send("出图并说明",[]); callTool(h.streams[0],[{args:{prompt:"出图"}}]); await tick();
+  h.imageCalls[0].resolve([generated("mixed_answer","image-test")]); await tick();
+  callTool(h.streams[1],[{name:"review_goal",args:{image_ids:["image_mixed_answer"],answer:"真实图像说明"}}]); await tick();
+  h.textCalls[0].resolve(scoreJSON(80)); await tick();
+  callTool(h.streams[2],[{name:"review_goal",args:{image_ids:["image_mixed_answer"]}}]); await tick();
+  assert.equal(h.textCalls.length,2); h.textCalls[1].resolve(scoreJSON(98)); await tick(); complete(h.streams[3]); await pending;
+  assert.equal(sessions().current().messages.at(-1).goalProgress.score,98);
+});
+
+test("完成、错误和停止都 flush 最后 token/思考，迟到事件不能污染新会话", async (t) => {
+  const h=await harness(); guardHarness(t,h); const sessions=h.useSessions.getState;
+  for (const ending of ["done","error","stop"]) {
+    const index=h.streams.length; const pending=sessions().send("检查缓冲 "+ending,[]); const stream=h.streams[index];
+    for (const text of ["完整","\n","最后的尾巴"]) stream.onEvent({type:"delta",text});
+    for (const text of ["独立思考","的结尾"]) stream.onEvent({type:"reasoning",text});
+    if (ending==="stop") sessions().stop(); else stream.onEvent(ending==="done"?{type:"done",finishReason:"stop"}:{type:"error",message:"故障原因"});
+    await pending; const last=sessions().current().messages.at(-1);
+    assert.equal(last.content,"完整\n最后的尾巴"); assert.equal(last.reasoning,"独立思考的结尾");
+    if (ending==="error") assert.equal(last.error,"故障原因");
+    const saved=JSON.stringify(sessions().current().messages);
+    stream.onEvent({type:"delta",text:"迟到不应落盘"}); assert.equal(JSON.stringify(sessions().current().messages),saved);
+  }
+  sessions().newSession(); const next=sessions().send("独立会话",[]); complete(h.streams.at(-1),"新会话自己的内容"); await next;
+  assert.equal(sessions().current().messages.at(-1).content,"新会话自己的内容");
+});
+
+test("安卓原生后台中断暂停所有队列、取消并发 Chat/生图/工作室并持久化真实原因", async (t) => {
+  const h=await harness(); guardHarness(t,h); h.backgroundState.enabled=true; const sessions=h.useSessions.getState;
+  sessions().setGoal({enabled:true,scorer:"chat"}); const firstId=sessions().currentId;
+  const first=sessions().send("自动 Goal",[]); await tick(); callTool(h.streams[0],[{args:{prompt:"第一图"}}]); await tick();
+  await sessions().send("Goal 排队内容",[],"queue");
+  sessions().newSession(); const secondId=sessions().currentId; const second=sessions().send("另一会话",[]); await tick();
+  h.streams[1].onEvent({type:"delta",text:"已经收到的部分文字"}); await sessions().send("另一个队列",[],"queue");
+  sessions().newSession(); sessions().pauseQueue(); await sessions().send("空闲队列",[],"queue");
+  h.useStudio.getState().setPrompt("工作室图像"); const studio=h.useStudio.getState().run(); await tick();
+  assert.equal(h.backgroundTasks.length,3); assert.equal(h.imageCalls.length,2);
+  const reason="Android 后台服务被系统终止，请手动继续。"; h.interruptBackgroundTasks(reason);
+  await Promise.all([first,second,studio]); await sessions().persist();
+  assert.deepEqual(sessions().runs,{}); assert.equal(h.streams.length,2); assert.ok(h.imageCalls.every((call)=>call.canceled));
+  assert.ok(h.backgroundTasks.every((task)=>task.finished)); assert.equal(h.useStudio.getState().busy,false); assert.equal(h.useStudio.getState().error,reason);
+  const firstSession=sessions().sessions.find((session)=>session.id===firstId);
+  assert.equal(firstSession.messages.at(-1).goalProgress.status,"stopped"); assert.equal(firstSession.messages.at(-1).goalProgress.summary,reason);
+  const secondSession=sessions().sessions.find((session)=>session.id===secondId);
+  assert.ok(secondSession.messages.some((message)=>message.content==="已经收到的部分文字" && message.error===reason));
+  assert.ok(sessions().sessions.every((session)=>session.queuePaused)); assert.ok(sessions().sessions.every((session)=>session.queuedMessages.length===1));
+  assert.ok(h.saves.at(-1).sessions.every((session)=>session.queuePaused));
+  await tick(); assert.equal(h.streams.length,2,"不能推进任何队列或自动重放付费调用");
+});
+
+test("后台服务启动确认迟到时不再提交付费请求，中断原因仍可见并保留队列", async (t) => {
+  const h=await harness(); guardHarness(t,h); const sessions=h.useSessions.getState; let ready;
+  const task={finished:false,ready:new Promise((resolve)=>{ready=resolve;}),finish:async()=>{task.finished=true;}};
+  h.api.startBackgroundTask=()=>task;
+  const pending=sessions().send("等待后台保护确认",[]); await sessions().send("保留队列",[],"queue");
+  h.interruptBackgroundTasks("唤醒锁保护已失效"); assert.equal(h.streams.length,0); ready(); await pending;
+  assert.equal(h.streams.length,0); assert.equal(h.imageCalls.length,0); assert.equal(task.finished,true);
+  assert.equal(sessions().current().messages.at(-1).error,"唤醒锁保护已失效");
+  assert.equal(sessions().current().queuePaused,true); assert.equal(sessions().current().queuedMessages.length,1);
+});
+
+test("Chat 逐次指定质量/分辨率并在重试保留参数，错误组合不发送请求", async (t) => {
+  const h=await harness(); guardHarness(t,h); const sessions=h.useSessions.getState; const cfg=h.useConfig.getState().config;
+  h.useConfig.setState({config:{...cfg,image:{...cfg.image,modelPool:[{id:"images-A",apiMode:"images"},{id:"gemini-B",apiMode:"gemini"}]}}});
+  const pending=sessions().send("先高画质出图，再 4K 编辑",[]);
+  const [initial]=callTool(h.streams[0],[{args:{model:"images-A",prompt:"高画质图",quality:"high",size:"1536x1024"}}]); await tick();
+  assert.equal(h.imageCalls[0].request.quality,"high"); h.imageCalls[0].reject(new Error("暂时繁忙")); await tick();
+  callTool(h.streams[1],[{name:"retry_image",args:{failed_call_id:initial.id,model:"images-A"}}]); await tick();
+  assert.deepEqual(h.imageCalls[1].request,h.imageCalls[0].request); h.imageCalls[1].resolve([generated("quality_source","images-A")]); await tick();
+  callTool(h.streams[2],[{name:"edit_image",args:{model:"gemini-B",prompt:"只改颜色",source_image_ids:["image_quality_source"],image_size:"4K",size:"auto"}}]); await tick();
+  assert.equal(h.imageCalls[2].request.imageSize,"4K"); assert.equal(h.imageCalls[2].request.quality,"auto");
+  assert.deepEqual(h.imageCalls[2].request.images,[attachment("quality_source").dataUrl]);
+  h.imageCalls[2].resolve([generated("quality_4k","gemini-B")]); await tick();
+  callTool(h.streams[3],[{args:{model:"gemini-B",prompt:"错误画质",quality:"high"}}]); await tick();
+  assert.equal(h.imageCalls.length,3); assert.match(sessions().current().messages.at(-1).content,/image_size/);
+  complete(h.streams[4]); await pending;
+  const calls=sessions().current().messages.flatMap((message)=>message.toolCalls??[]);
+  assert.equal(calls.find((call)=>call.name==="edit_image").requestedImageSize,"4K");
+});
+
+
+test("更新链接的前后端共用信任样例，只允许本仓库准确的 Release/下载路径", async () => {
+  const fixtures = JSON.parse(await readFile(new URL("./fixtures/update-urls.json", import.meta.url), "utf8"));
+  for (const fixture of fixtures) assert.equal(updates.trustedUpdateUrl(fixture.url), fixture.ui, fixture.url);
+  assert.equal(updates.LATEST_RELEASE_URL, "https://github.com/samabl/Image-Studio/releases/latest");
+});
+
+test("更新入口使用原生命令并在错误时保留 Release 页面，安卓后台事件有成对的订阅/清理", async () => {
+  const api = await readFile(new URL("../src/lib/api.ts", import.meta.url), "utf8");
+  const component = await readFile(new URL("../src/components/SoftwareUpdate.tsx", import.meta.url), "utf8");
+  const app = await readFile(new URL("../src/App.tsx", import.meta.url), "utf8");
+  assert.ok(api.includes('call<SoftwareUpdate>("check_for_updates")'));
+  assert.ok(component.includes("trustedUpdateUrl(url)"));
+  assert.ok(component.includes("open(LATEST_RELEASE_URL)"));
+  assert.match(component, /checking.current/);
+  assert.match(component, /role="alert"/);
+  assert.match(component, /相同签名/);
+  assert.ok(app.includes('addEventListener("image-studio-background-error", interrupted)'));
+  assert.ok(app.includes('removeEventListener("image-studio-background-error", interrupted)'));
+  assert.ok(app.indexOf('addEventListener("image-studio-background-error"') < app.indexOf('bootstrap().catch'));
 });

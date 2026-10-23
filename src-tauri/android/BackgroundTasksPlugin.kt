@@ -13,6 +13,13 @@ import android.net.Uri
 import android.os.Build
 import android.os.PowerManager
 import android.os.Environment
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.ResultReceiver
+import android.webkit.WebView
+import androidx.appcompat.app.AppCompatActivity
+import java.util.concurrent.atomic.AtomicBoolean
 import android.media.MediaScannerConnection
 import android.provider.MediaStore
 import android.util.Base64
@@ -77,6 +84,24 @@ class BackgroundTasksPlugin(private val activity: Activity) : Plugin(activity) {
       content?.setBackgroundColor(color)
       content?.getChildAt(0)?.setBackgroundColor(color)
     }
+  }
+
+  override fun load(webView: WebView) {
+    BackgroundTaskRuntime.attach(webView)
+  }
+
+  override fun onPause(activity: AppCompatActivity) {
+    BackgroundTaskRuntime.setPaused(true)
+  }
+
+  override fun onResume(activity: AppCompatActivity) {
+    BackgroundTaskRuntime.setPaused(false)
+  }
+
+  override fun onDestroy(activity: AppCompatActivity) {
+    // WebView 被销毁后 JS 工作流无法继续；释放保护，不自动重放付费请求。
+    BackgroundTaskRuntime.detach()
+    runCatching { activity.stopService(Intent(activity, BackgroundTasksService::class.java)) }
   }
 
   @Command
@@ -167,16 +192,48 @@ class BackgroundTasksPlugin(private val activity: Activity) : Plugin(activity) {
 
   @Command
   fun start(invoke: Invoke) {
+    val handler = Handler(Looper.getMainLooper())
+    val settled = AtomicBoolean(false)
+    val args = try { invoke.parseArgs(TaskArgs::class.java) } catch (error: Exception) {
+      invoke.reject(error.message ?: "无效的后台任务"); return
+    }
+    if (args.taskId.isBlank()) { invoke.reject("无效的后台任务"); return }
+    fun finishOrphan() {
+      runCatching { activity.startService(Intent(activity, BackgroundTasksService::class.java)
+        .setAction(BackgroundTasksService.FINISH).putExtra("taskId", args.taskId)) }
+    }
+    val timeout = Runnable {
+      if (settled.compareAndSet(false, true)) {
+        // 超时不能只 reject 后留一个孤立任务/唤醒锁。
+        finishOrphan()
+        invoke.reject("Android 后台服务未确认启动，请保持应用前台并检查后台权限")
+      }
+    }
+    val receiver = object : ResultReceiver(handler) {
+      override fun onReceiveResult(resultCode: Int, resultData: Bundle?) {
+        if (!settled.compareAndSet(false, true)) {
+          // 超时后的成功确认也要清理，避免迟到 START 又留下孤立任务。
+          if (resultCode == 0) finishOrphan()
+          return
+        }
+        handler.removeCallbacks(timeout)
+        if (resultCode == 0) invoke.resolve()
+        else invoke.reject(resultData?.getString("error") ?: "无法启动后台任务")
+      }
+    }
     try {
-      val args = invoke.parseArgs(TaskArgs::class.java)
-      require(args.taskId.isNotBlank())
       val intent = Intent(activity, BackgroundTasksService::class.java)
         .setAction(BackgroundTasksService.START)
         .putExtra("taskId", args.taskId)
+        .putExtra(BackgroundTasksService.RESULT, receiver)
+      handler.postDelayed(timeout, 10_000L)
       ContextCompat.startForegroundService(activity, intent)
-      invoke.resolve()
     } catch (error: Exception) {
-      invoke.reject(error.message ?: "无法启动后台任务，请保持应用前台后重试")
+      handler.removeCallbacks(timeout)
+      if (settled.compareAndSet(false, true)) {
+        finishOrphan()
+        invoke.reject(error.message ?: "无法启动后台任务，请保持应用前台后重试")
+      }
     }
   }
 
@@ -200,6 +257,9 @@ class BackgroundTasksPlugin(private val activity: Activity) : Plugin(activity) {
     val result = JSObject()
     result.put("batteryOptimizationIgnored", power.isIgnoringBatteryOptimizations(activity.packageName))
     result.put("notificationsEnabled", NotificationManagerCompat.from(activity).areNotificationsEnabled())
+    result.put("activeTasks", BackgroundTaskRuntime.activeTasks)
+    result.put("wakeLockHeld", BackgroundTaskRuntime.wakeLockHeld)
+    result.put("lastError", BackgroundTaskRuntime.lastError)
     invoke.resolve(result)
   }
 

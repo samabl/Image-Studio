@@ -46,7 +46,7 @@ function renderInline(text: string, keyBase: string): React.ReactNode[] {
       out.push(<em key={key}>{renderInline(tok.slice(1, -1), key)}</em>);
     } else if (tok.startsWith("![")) {
       const mm = /^!\[([^\]]*)\]\(([^)\s]+)\)$/.exec(tok);
-      if (mm) out.push(<img key={key} src={mm[2]} alt={mm[1]} loading="lazy" />);
+      if (mm) out.push(<img key={key} src={mm[2]} alt={mm[1]} loading="lazy" decoding="async" />);
     } else if (tok.startsWith("[")) {
       const mm = /^\[([^\]]*)\]\(([^)\s]+)\)$/.exec(tok);
       if (mm) {

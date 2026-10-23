@@ -4,6 +4,8 @@ function Install-AndroidBackgroundTasks {
         [Parameter(Mandatory = $true)][string]$AndroidRoot,
         [Parameter(Mandatory = $true)][string]$SourceRoot
     )
+    $gradlePath = Join-Path $AndroidRoot 'app/build.gradle.kts'
+    if (-not (Test-Path -LiteralPath $gradlePath -PathType Leaf)) { throw 'Android 工程缺少 app/build.gradle.kts，请先执行 tauri android init' }
     $manifestPath = Join-Path $AndroidRoot 'app/src/main/AndroidManifest.xml'
     $manifest = New-Object System.Xml.XmlDocument
     $manifest.PreserveWhitespace = $true
@@ -42,8 +44,27 @@ function Install-AndroidBackgroundTasks {
     try { $manifest.Save($writer) } finally { $writer.Dispose() }
     $packageDir = Join-Path $AndroidRoot 'app/src/main/java/app/imagestudio/background'
     New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
-    foreach ($file in @('BackgroundTasksPlugin.kt', 'BackgroundTasksService.kt')) {
+    foreach ($file in @('BackgroundTasksPlugin.kt', 'BackgroundTasksService.kt', 'BackgroundTaskRuntime.kt')) {
         Copy-Item -LiteralPath (Join-Path $SourceRoot $file) -Destination (Join-Path $packageDir $file) -Force
     }
     [IO.File]::WriteAllText((Join-Path $AndroidRoot 'app/background-tasks.pro'), '-keep class app.imagestudio.background.** { *; }', (New-Object System.Text.UTF8Encoding($false)))
+    $gradle = [IO.File]::ReadAllText($gradlePath)
+    $marker = '// Image Studio native background tasks'
+    if (-not $gradle.Contains($marker)) {
+        $block = @'
+
+// Image Studio native background tasks
+android {
+    // Service.onTimeout(startId, fgsType) requires compile SDK 35+.
+    compileSdk = maxOf(compileSdk ?: 35, 35)
+    buildTypes {
+        getByName("release") {
+            proguardFiles("background-tasks.pro")
+        }
+    }
+}
+'@
+        [IO.File]::AppendAllText($gradlePath, "$block
+", (New-Object System.Text.UTF8Encoding($false)))
+    }
 }

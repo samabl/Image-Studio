@@ -5,6 +5,7 @@ pub mod config;
 pub mod error;
 pub mod gallery;
 pub mod native;
+pub mod updates;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -357,6 +358,11 @@ fn import_image_file(path: String) -> AppResult<String> {
     gallery::read_as_data_url(&path)
 }
 
+#[tauri::command]
+async fn check_for_updates() -> AppResult<updates::SoftwareUpdate> {
+    updates::check().await
+}
+
 // ---------------------------------------------------------------------------
 // 入口
 // ---------------------------------------------------------------------------
@@ -394,6 +400,7 @@ pub fn run() {
             load_state,
             save_state,
             list_models,
+            check_for_updates,
             chat_stream,
             chat_cancel,
             chat_once,

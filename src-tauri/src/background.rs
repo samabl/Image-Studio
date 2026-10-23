@@ -7,6 +7,12 @@ use tauri::AppHandle;
 pub struct BackgroundStatus {
     battery_optimization_ignored: bool,
     notifications_enabled: bool,
+    #[serde(default)]
+    active_tasks: usize,
+    #[serde(default)]
+    wake_lock_held: bool,
+    #[serde(default)]
+    last_error: Option<String>,
 }
 
 #[cfg(target_os = "android")]

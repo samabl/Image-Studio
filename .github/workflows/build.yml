@@ -46,6 +46,8 @@ jobs:
 
       - name: 安装 Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
 
       # 缓存 ~/.cargo/registry、~/.cargo/git 与 src-tauri/target，
       # 并用 Cargo.lock 做 key，依赖没变就直接复用上次的编译产物。
@@ -68,16 +70,16 @@ jobs:
       - name: 协议回归测试（离线）
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib --test protocols
 
-      - name: 构建（release + NSIS 安装包）
-        run: pnpm tauri:build
+      - name: 构建（Windows x86_64 release + NSIS 安装包）
+        run: pnpm tauri:build --target x86_64-pc-windows-msvc
 
       - name: 收集产物
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist-artifacts | Out-Null
-          Copy-Item src-tauri/target/release/gpt-image-studio.exe dist-artifacts/ -ErrorAction Stop
+          Copy-Item src-tauri/target/x86_64-pc-windows-msvc/release/gpt-image-studio.exe dist-artifacts/ -ErrorAction Stop
           $bundleConfig = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
-          $installer = "src-tauri/target/release/bundle/nsis/$($bundleConfig.productName)_$($bundleConfig.version)_x64-setup.exe"
+          $installer = "src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/$($bundleConfig.productName)_$($bundleConfig.version)_x64-setup.exe"
           Copy-Item -LiteralPath $installer -Destination dist-artifacts/ -ErrorAction Stop
           Get-ChildItem dist-artifacts | Format-Table Name, Length
 
@@ -106,9 +108,13 @@ jobs:
           pattern: gpt-image-studio-*
           path: build-artifacts
 
+      - name: 发布文件与固定证书回归测试
+        run: python scripts/test-release.py
+
       - name: 整理发布文件与 SHA256 校验和
         env:
           RELEASE_TAG: ${{ github.ref_name }}
+          ANDROID_SIGNING_CERT_SHA256: ${{ vars.ANDROID_SIGNING_CERT_SHA256 }}
         run: python scripts/prepare-release.py --tag "$RELEASE_TAG" --artifacts build-artifacts --output release-assets
 
       - name: 上传全部产物后发布
@@ -122,34 +128,44 @@ jobs:
           gh release edit "$RELEASE_TAG" --draft=false --latest
 
   # ---------------------------------------------------------------------------
-  # Android：按 ABI 矩阵并行出 APK
-  #
-  # 为什么拆成矩阵而不是一个 job 编全部 ABI：
-  #   1) 每个 job 独立磁盘，避免 4 个 ABI 的 target 目录撑爆 runner 空间；
-  #   2) 并行跑，墙钟时间短得多；
-  #   3) 某个 ABI 失败不会连累其它 ABI（fail-fast: false）。
+  # Android：后续 Release 只构建 arm64-v8a。其他架构仍可在本机按需构建。
   # ---------------------------------------------------------------------------
   android:
-    name: Android ${{ matrix.abi }}
+    name: Android arm64-v8a
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: aarch64
-            abi: arm64-v8a
-          - target: armv7
-            abi: armeabi-v7a
-          - target: x86_64
-            abi: x86_64
     steps:
       - uses: actions/checkout@v4
+
+      # PR（包括 fork）只编译和测试，不接触发布密钥，也不上传可安装的 APK。
+      # main / tag / 手动构建必须使用同一固定 keystore，缺失时在耗时编译前失败。
+      - name: 检查固定 Release 签名配置
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        env:
+          ANDROID_KEY_BASE64: ${{ secrets.ANDROID_KEY_BASE64 }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_KEY_STORE_PASSWORD: ${{ secrets.ANDROID_KEY_STORE_PASSWORD }}
+          ANDROID_SIGNING_CERT_SHA256: ${{ vars.ANDROID_SIGNING_CERT_SHA256 }}
+        run: pwsh -File scripts/prepare-android-signing.ps1 -ValidateOnly
 
       - name: 安装 JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
+
+      - name: 准备并校验固定 Release keystore
+        id: android_signing
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        env:
+          ANDROID_KEY_BASE64: ${{ secrets.ANDROID_KEY_BASE64 }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_KEY_STORE_PASSWORD: ${{ secrets.ANDROID_KEY_STORE_PASSWORD }}
+          ANDROID_SIGNING_CERT_SHA256: ${{ vars.ANDROID_SIGNING_CERT_SHA256 }}
+        run: pwsh -File scripts/prepare-android-signing.ps1
 
       # 不用 android-actions/setup-android：它在 ubuntu-24.04 镜像上会去安装上游
       # 已移除的旧版 `tools` 包，sdkmanager 直接退出码 1 把整个 job 打断。
@@ -170,6 +186,15 @@ jobs:
             echo "sdkmanager: $SDKMANAGER"
           else
             echo "::warning::没找到 cmdline-tools 里的 sdkmanager"
+          fi
+
+          # 原生后台超时回调要求 compileSdk 35+，明确准备最低支持平台。
+          if [ -n "$SDKMANAGER" ]; then
+            yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+            "$SDKMANAGER" --install "platforms;android-35" "build-tools;35.0.0"
+          elif [ ! -d "$ANDROID_HOME/platforms/android-35" ] || [ ! -d "$ANDROID_HOME/build-tools/35.0.0" ]; then
+            echo "::error::缺少 Android SDK 35 / Build-Tools 35，且 sdkmanager 不可用"
+            exit 1
           fi
 
           NDK_DIR=$(ls -d "$ANDROID_HOME"/ndk/* 2>/dev/null | sort -V | tail -1 || true)
@@ -207,14 +232,13 @@ jobs:
       - name: 安装 Rust 与 Android 目标
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
+          targets: aarch64-linux-android
 
       - name: 缓存 Rust 依赖与产物
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri -> target
-          # 每个 ABI 单独一份缓存，避免互相覆盖
-          key: android-${{ matrix.target }}
+          key: android-aarch64
           cache-on-failure: true
 
       - name: 缓存 Gradle
@@ -245,39 +269,9 @@ jobs:
         shell: pwsh
         run: pwsh -File scripts/test-android-background.ps1
 
-      # 准备签名材料。没配 secrets 就生成一把一次性 keystore，
-      # 保证产物可安装（代价是每次构建签名不同、无法覆盖安装）。
-      - name: 准备签名 keystore
+      - name: 校验固定 Release 签名逻辑
         shell: pwsh
-        env:
-          SECRET_KEY_BASE64: ${{ secrets.ANDROID_KEY_BASE64 }}
-          SECRET_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          SECRET_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-        run: |
-          $ErrorActionPreference = "Stop"
-          $ksAlias = if ($env:SECRET_KEY_ALIAS) { $env:SECRET_KEY_ALIAS } else { "ci-upload" }
-          $ksPass  = if ($env:SECRET_KEY_PASSWORD) { $env:SECRET_KEY_PASSWORD } else { "android" }
-          $tmp = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { [IO.Path]::GetTempPath() }
-
-          if ($env:SECRET_KEY_BASE64) {
-            Write-Host "使用仓库 secrets 中配置的 keystore"
-            $ks = Join-Path $tmp "upload.jks"
-            [IO.File]::WriteAllBytes($ks, [Convert]::FromBase64String($env:SECRET_KEY_BASE64))
-          } else {
-            Write-Host "::warning::未配置 ANDROID_KEY_BASE64，改用一次性 CI keystore；每次构建签名都不同，无法覆盖安装。"
-            $ks = Join-Path $tmp "ci-upload.jks"
-            & "$env:JAVA_HOME/bin/keytool" -genkeypair -v -keystore $ks -alias $ksAlias `
-              -keyalg RSA -keysize 2048 -validity 10000 `
-              -storepass $ksPass -keypass $ksPass `
-              -dname "CN=CI, OU=CI, O=GPT Image Studio, L=CI, S=CI, C=CN"
-            if ($LASTEXITCODE -ne 0) { throw "keytool 生成 keystore 失败" }
-          }
-          if (-not (Test-Path $ks)) { throw "keystore 未生成：$ks" }
-          Write-Host "keystore: $ks"
-
-          foreach ($pair in @(@("ANDROID_KS_PATH", $ks), @("ANDROID_KS_ALIAS", $ksAlias), @("ANDROID_KS_PASSWORD", $ksPass))) {
-            [IO.File]::AppendAllText($env:GITHUB_ENV, "$($pair[0])=$($pair[1])`n")
-          }
+        run: pwsh -File scripts/test-android-signing.ps1
 
       # 复用仓库里的脚本：init 工程 + 注入明文流量放行。
       # GitHub runner 自带 pwsh，所以 Windows/Linux 用同一份逻辑。
@@ -287,7 +281,7 @@ jobs:
 
       - name: 构建 APK
         # --ci：跳过交互式提问（签名等），否则 runner 上会卡住等输入
-        run: pnpm tauri android build --apk --ci --target ${{ matrix.target }}
+        run: pnpm tauri android build --apk --ci --target aarch64
 
       - name: 诊断信息（仅构建失败时）
         if: failure()
@@ -302,21 +296,40 @@ jobs:
 
       # Tauri 的 Gradle 模板没有配 signingConfig，产出的 release APK 是未签名的，
       # 无法直接安装。这里用 apksigner 做后置签名：与 Gradle 模板结构无关，稳定得多。
-      - name: 签名 APK（zipalign + apksigner）
+      - name: 签名 APK（固定证书 + zipalign + apksigner）
+        if: github.event_name != 'pull_request'
         shell: pwsh
+        env:
+          ANDROID_KS_PATH: ${{ steps.android_signing.outputs.keystore_path }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_KEY_STORE_PASSWORD: ${{ secrets.ANDROID_KEY_STORE_PASSWORD }}
+          ANDROID_SIGNING_CERT_SHA256: ${{ steps.android_signing.outputs.certificate_sha256 }}
+        run: pwsh -File scripts/sign-android-apk.ps1
+
+      - name: 清理签名私钥
+        if: always() && github.event_name != 'pull_request'
+        shell: pwsh
+        env:
+          KEYSTORE_PATH: ${{ steps.android_signing.outputs.keystore_path }}
         run: |
-          pwsh -File scripts/sign-android-apk.ps1 `
-            -KeystorePath $env:ANDROID_KS_PATH `
-            -KeyAlias $env:ANDROID_KS_ALIAS `
-            -KeyPassword $env:ANDROID_KS_PASSWORD
+          if ($env:KEYSTORE_PATH) {
+            $path = [IO.Path]::GetFullPath($env:KEYSTORE_PATH)
+            $root = [IO.Path]::GetFullPath($env:RUNNER_TEMP) + [IO.Path]::DirectorySeparatorChar
+            if (-not $path.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) -or (Split-Path $path -Leaf) -notlike 'image-studio-release-*.jks') { throw 'keystore 清理路径超出预期范围' }
+            Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+          }
 
       - name: 列出最终产物
         run: find src-tauri/gen/android/app/build/outputs/apk -name "*.apk" -exec ls -lh {} \;
 
       - name: 上传 APK
+        if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@v4
         with:
-          name: gpt-image-studio-android-${{ matrix.abi }}
-          path: src-tauri/gen/android/app/build/outputs/apk/**/*.apk
+          name: gpt-image-studio-android-arm64-v8a
+          path: |
+            src-tauri/gen/android/app/build/outputs/apk/**/*-signed.apk
+            src-tauri/gen/android/app/build/outputs/apk/android-signing-cert.sha256
           if-no-files-found: error
           retention-days: 14

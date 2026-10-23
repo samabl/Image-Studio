@@ -1,0 +1,176 @@
+[
+  {
+    "url": "https://github.com/samabl/Image-Studio/releases/latest",
+    "page": false,
+    "download": false,
+    "ui": true
+  },
+  {
+    "url": "https://github.com/samabl/Image-Studio/releases/tag/v0.2.10",
+    "page": true,
+    "download": false,
+    "ui": true
+  },
+  {
+    "url": "https://github.com:443/samabl/Image-Studio/releases/tag/v0.2.10",
+    "page": true,
+    "download": false,
+    "ui": true
+  },
+  {
+    "url": "https://github.com/samabl/Image-Studio/releases/download/v0.2.10/app-windows-x64.exe",
+    "page": false,
+    "download": true,
+    "ui": true
+  },
+  {
+    "url": "https://github.com/samabl/Image-Studio/releases/download/v0.2.10/app%20android-arm64-v8a.apk",
+    "page": false,
+    "download": true,
+    "ui": true
+  },
+  {
+    "url": "http://github.com/samabl/Image-Studio/releases/tag/v1.0.0",
+    "page": false,
+    "download": false,
+    "ui": false
+  },
+  {
+    "url": "https://github.com.evil.test/samabl/Image-Studio/releases/tag/v1.0.0",
+    "page": false,
+    "download": false,
+    "ui": false
+  },
+  {
+    "url": "https://evil.test/samabl/Image-Studio/releases/tag/v1.0.0",
+    "page": false,
+    "download": false,
+    "ui": false
+  },
+  {
+    "url": "https://github.com/other/Image-Studio/releases/tag/v1.0.0",
+    "page": false,
+    "download": false,
+    "ui": false
+  },
+  {
+    "url": "https://user@github.com/samabl/Image-Studio/releases/tag/v1.0.0",
+    "page": false,
+    "download": false,
+    "ui": false
+  },
+  {
+    "url": "https://user:password@github.com/samabl/Image-Studio/releases/download/v1.0.0/a.exe",
+    "page": false,
+    "download": false,
+    "ui": false
+  },
+  {
+    "url": "https://github.com:444/samabl/Image-Studio/releases/tag/v1.0.0",
+    "page": false,
+    "download": false,
+    "ui": false
+  },
+  {
+    "url": "https://github.com/samabl/Image-Studio/releases/tag/v1.0.0?redirect=evil",
+    "page": false,
+    "download": false,
+    "ui": false
+  },
+  {
+    "url": "https://github.com/samabl/Image-Studio/releases/tag/v1.0.0?",
+    "page": false,
+    "download": false,
+    "ui": false
+  },
+  {
+    "url": "https://github.com/samabl/Image-Studio/releases/tag/v1.0.0#",
+    "page": false,
+    "download": false,
+    "ui": false
+  },
+  {
+    "url": "https://github.com/samabl/Image-Studio/releases/tag/v1.0.0/extra",
+    "page": false,
+    "download": false,
+    "ui": false
+  },
+  {
+    "url": "https://github.com/samabl/Image-Studio/releases/tag/",
+    "page": false,
+    "download": false,
+    "ui": false
+  },
+  {
+    "url": "https://github.com/samabl/Image-Studio/releases/latest/extra",
+    "page": false,
+    "download": false,
+    "ui": false
+  },
+  {
+    "url": "https://github.com/samabl/Image-Studio/releases/download/v1.0.0",
+    "page": false,
+    "download": false,
+    "ui": false
+  },
+  {
+    "url": "https://github.com/samabl/Image-Studio/releases/download//a.exe",
+    "page": false,
+    "download": false,
+    "ui": false
+  },
+  {
+    "url": "https://github.com/samabl/Image-Studio/releases/download/v1.0.0/",
+    "page": false,
+    "download": false,
+    "ui": false
+  },
+  {
+    "url": "https://github.com/samabl/Image-Studio/releases/download/v1.0.0/a.exe/extra",
+    "page": false,
+    "download": false,
+    "ui": false
+  },
+  {
+    "url": "https://github.com/samabl/Image-Studio/releases/tag/v1.0.0%2Fextra",
+    "page": false,
+    "download": false,
+    "ui": false
+  },
+  {
+    "url": "https://github.com/samabl/Image-Studio/releases/download/v1.0.0/a%5cb.exe",
+    "page": false,
+    "download": false,
+    "ui": false
+  },
+  {
+    "url": "https://github.com/samabl/Image-Studio/releases/tag/v1.0.0\\extra",
+    "page": false,
+    "download": false,
+    "ui": false
+  },
+  {
+    "url": "https://github.com/samabl/Image-Studio/releases/tag/v1.0.0\n",
+    "page": false,
+    "download": false,
+    "ui": false
+  },
+  {
+    "url": "https://github.com/samabl/Image-Studio/releases/tag/../../issues",
+    "page": false,
+    "download": false,
+    "ui": false
+  },
+  {
+    "url": "javascript:alert(1)",
+    "page": false,
+    "download": false,
+    "ui": false
+  },
+  {
+    "url": "not a URL",
+    "page": false,
+    "download": false,
+    "ui": false
+  }
+]

@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Field, NumberInput, Panel, Switch } from "./ui";
 import { ModelPicker } from "./ModelPicker";
 import { ImageModelPool } from "./ImageModelPool";
+import { SoftwareUpdate } from "./SoftwareUpdate";
 import { JurySettings } from "./JurySettings";
 import { availableImageModelIds, defaultImageConnection, IMAGE_API_LABELS, resolveImageApiMode } from "../lib/imageModels";
 import { channelReady, useConfig, useGallery, useToast } from "../lib/store";
@@ -60,15 +61,19 @@ export function SettingsView() {
   return (
     <div className="settings">
       <div className="settings-inner">
+        <SoftwareUpdate />
         {isAndroid && (
           <Panel title="后台与锁屏任务" className="settings-panel">
             <div className="hint" style={{ marginBottom: 10 }}>
-              锁屏继续任务需允许忽略电池优化，并开启任务通知。
+              任务期间自动持有 CPU Wake Lock，后台 WebView 保持多轮执行；完成或取消后释放。锁屏联网仍需允许忽略电池优化，并建议开启任务通知、允许厂商后台运行。
             </div>
             <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
               <span className="chip">锁屏运行：{background ? background.batteryOptimizationIgnored ? "已允许" : "待允许" : "读取中"}</span>
               <span className="chip">任务通知：{background ? background.notificationsEnabled ? "已开启" : "未开启" : "读取中"}</span>
+              <span className="chip">CPU 唤醒锁：{background ? background.wakeLockHeld ? "已持有" : "未持有（空闲时正常）" : "读取中"}</span>
+              <span className="chip">后台任务：{background?.activeTasks ?? 0}</span>
             </div>
+            {background?.lastError && <div className="error">{background.lastError}</div>}
             <button type="button" className="btn" onClick={() => void configureBackgroundTasks().catch((err: Error) => note("error", err.message))}>
               {!background?.batteryOptimizationIgnored ? "允许锁屏继续运行" : !background.notificationsEnabled ? "开启任务通知" : "后台权限设置"}
             </button>

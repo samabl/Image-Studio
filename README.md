@@ -304,11 +304,12 @@ cargo test --manifest-path src-tauri/Cargo.toml --test live_gateway list_models 
 ## Windows 打包
 
 ```bash
-pnpm tauri:build
+# Release 固定为 Windows x86_64
+pnpm tauri:build --target x86_64-pc-windows-msvc
 ```
 
-- 安装包（NSIS）：`src-tauri/target/release/bundle/nsis/GPT Image Studio_0.2.1_x64-setup.exe`
-- 免安装可执行文件：`src-tauri/target/release/gpt-image-studio.exe`（前端已内嵌，双击即用）
+- 安装包（NSIS）：`src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*_x64-setup.exe`
+- 免安装可执行文件：`src-tauri/target/x86_64-pc-windows-msvc/release/gpt-image-studio.exe`（前端已内嵌，双击即用）
 - 安装模式为 `currentUser`（免管理员），语言含简体中文
 - 若目标机器缺少 WebView2，安装包会走 `downloadBootstrapper` 自动下载
 - 想同时产出 MSI，把 `tauri.conf.json` 里的 `bundle.targets` 改成 `"all"`（首次会下载 WiX）
@@ -334,11 +335,11 @@ Android 需要额外安装工具链（本仓库不包含它们，也无法预置
 | 依赖 | 建议版本 |
 | --- | --- |
 | JDK | 17（Tauri 2 要求 17） |
-| Android SDK | Platform 34+、Build-Tools 34+ |
+| Android SDK | Platform 35+、Build-Tools 35+（后台服务超时回调需 compileSdk ≥ 35） |
 | Android NDK | 26.x |
-| Rust targets | `aarch64-linux-android`、`armv7-linux-androideabi`、`i686-linux-android`、`x86_64-linux-android` |
+| Rust targets | `aarch64-linux-android`（Release 仅 Android arm64） |
 
-```bash
+```powershell
 # 1) 环境变量（Windows PowerShell 示例）
 $env:JAVA_HOME          = "C:\Program Files\Eclipse Adoptium\jdk-17"
 $env:ANDROID_HOME       = "$env:LOCALAPPDATA\Android\Sdk"
@@ -349,11 +350,14 @@ pnpm android:setup
 # 也可以指定要放行的内网网关（比全局放开安全得多）
 # pnpm android:setup -- -CleartextHosts 10.213.196.114,192.168.1.10
 
-# 3) 打包 APK / AAB
-pnpm android:apk                    # 产出 APK（未签名）
-# 签名（必做，否则装不上）：
-pwsh -File scripts/sign-android-apk.ps1 -KeystorePath <jks> -KeyAlias <alias> -KeyPassword <pwd>
-pnpm tauri android build --ci       # 产出 AAB（上架 Google Play 用）
+# 3) 打包 arm64 APK / AAB
+pnpm android:apk                    # 仅产出 arm64 APK（未签名）
+# 签名（必做；沿用固定 keystore；密码只在本机环境里设置）：
+$env:ANDROID_KEY_PASSWORD = Read-Host "固定签名私钥密码" -MaskInput
+pwsh -File scripts/sign-android-apk.ps1 -KeystorePath <jks> -KeyAlias <alias>
+Remove-Item Env:ANDROID_KEY_PASSWORD
+# AAB 仅在本地按需生成，不是本仓库 Release 产物
+pnpm tauri android build --aab --ci --target aarch64
 
 # 4) 真机调试
 pnpm android:dev
@@ -362,7 +366,7 @@ pnpm android:dev
 `scripts/setup-android.ps1` 会自动完成五件事：
 
 1. 校验 `JAVA_HOME` / `ANDROID_HOME` / `NDK_HOME`，缺什么就给出具体的安装命令；
-2. 补齐四个 Rust 交叉编译目标（`aarch64` / `armv7` / `i686` / `x86_64-linux-android`）；
+2. 默认只补齐 `aarch64-linux-android`；本地调试其他架构可通过脚本的 `-RustTargets` 参数显式指定，Release 不构建这些架构；
 3. 调用 `pnpm tauri android init` 生成 `src-tauri/gen/android/`；
 4. 生成 `network_security_config.xml` 并注入 `AndroidManifest.xml`
    —— **内网 `http://` 网关在 Android 9+ 上默认被拦截，这一步是必须的**。
@@ -425,17 +429,17 @@ Windows 与 Android 并行产出可下载的构建产物。
 
 | Job | Runner | 产物 | 说明 |
 | --- | --- | --- | --- |
-| `windows` | `windows-latest` | `gpt-image-studio.exe` + NSIS 安装包 | 先跑 `pnpm typecheck` 再 `pnpm tauri:build` |
-| `android` | `ubuntu-latest` × 3 | 每个 ABI 一个 APK | 矩阵并行：`arm64-v8a` / `armeabi-v7a` / `x86_64` |
+| `windows` | `windows-latest` | x86_64 免安装 EXE + NSIS 安装包 | 类型、前端、Rust 离线回归通过后显式构建 `x86_64-pc-windows-msvc` |
+| `android` | `ubuntu-latest` | arm64-v8a 已签名 APK + 公开证书指纹 | 仅构建 `aarch64`；安装与签名回归通过后使用固定 keystore |
 
-产物在 Actions 运行页面的 **Artifacts** 区域下载，保留 14 天。推送 `v*` 版本 tag 时，全部平台构建及回归测试通过后会自动发布 GitHub Release，包含 Windows 免安装 EXE、安装包、三个 ABI 的已签名 APK 和 `SHA256SUMS`。版本需与配置一致，并提供 `release-notes/<tag>.md`。
+产物在 Actions 运行页面的 **Artifacts** 区域下载，保留 14 天。推送 `v*` 版本 tag 时，全部平台构建及回归测试通过后会自动发布 GitHub Release，仅包含 Windows x86_64 免安装 EXE、NSIS 安装包、Android arm64-v8a 已签名 APK、公开证书指纹 `ANDROID_SIGNING_CERT_SHA256` 和 `SHA256SUMS`；不发布其他架构、AAB、macOS 或 Linux 构建。版本需与配置一致，并提供 `release-notes/<tag>.md`。
 
 ### 缓存策略
 
 | 缓存 | 手段 | Key |
 | --- | --- | --- |
 | pnpm 依赖 | `actions/setup-node` 的 `cache: pnpm` | lockfile 哈希 |
-| Rust 依赖 + 编译产物 | `Swatinem/rust-cache@v2` | `Cargo.lock` + job key，Windows 与各 ABI 各一份互不干扰 |
+| Rust 依赖 + 编译产物 | `Swatinem/rust-cache@v2` | `Cargo.lock` + job key，Windows x86_64 与 Android arm64 各一份互不干扰 |
 | Gradle 缓存与 wrapper | `actions/cache@v4` | `tauri.conf.json` 哈希 |
 
 Rust 的 `target` 目录缓存是加速的关键：首次构建约 15–20 分钟，命中缓存后通常 3–5 分钟。
@@ -472,9 +476,11 @@ Tauri 生成的 Gradle 模板**没有配 `signingConfig`**，所以 `tauri andro
 本项目用 **`apksigner` 后置签名**解决，而不是去改 `app/build.gradle.kts`：
 
 ```bash
-pnpm tauri android build --apk --ci
+pnpm android:apk # 仅 arm64
+# 密码在本机环境中设置；不要写进共享日志或 CI 命令行
+export ANDROID_KEY_PASSWORD='<你的密码>'
 pwsh -File scripts/sign-android-apk.ps1 \
-  -KeystorePath ./upload-keystore.jks -KeyAlias upload -KeyPassword <你的密码>
+  -KeystorePath ./release.jks -KeyAlias release
 ```
 
 脚本会依次做 zipalign → apksigner sign → apksigner verify，**校验通过才删掉未签名原件**。
@@ -483,17 +489,27 @@ pwsh -File scripts/sign-android-apk.ps1 \
 > 版本之间还会变，靠正则匹配非常脆。实测就出现过「匹配不到 release 块 → 静默产出未签名 APK」
 > 的情况，而构建日志一路全绿。apksigner 只依赖 Android SDK 自带的稳定命令行工具。
 
-CI 默认**生成一次性 keystore** 并签好 APK，保证产物开箱即可安装。
-但它每次构建都会换一把新密钥，因此**无法覆盖安装**上一次构建的版本。
+CI 的 **main、版本 tag 和手动 Release 构建强制使用固定 keystore**，缺少签名材料会在编译前失败，
+**不会生成一次性密钥，也不会回退到 debug 签名**。Pull Request 只编译和测试，不接触发布密钥、不上传 APK。
+后续 Release 只构建 Windows x86_64 和 Android arm64-v8a；Android 使用固定证书，最终产物只上传经过验证的 `*-signed.apk` 和公开证书指纹。
 
-需要稳定签名（能覆盖升级、能上架）时，在仓库 **Settings → Secrets and variables → Actions**
-里配置三个 secret，三者必须同时配置：
+在仓库 **Settings → Secrets and variables → Actions** 一次性配置并长期保留同一份 keystore：
 
 | Secret | 说明 |
 | --- | --- |
-| `ANDROID_KEY_BASE64` | keystore 的 base64：`base64 -i upload-keystore.jks \| tr -d '\n'` |
-| `ANDROID_KEY_ALIAS` | `keytool` 里的 alias |
-| `ANDROID_KEY_PASSWORD` | keystore 密码 |
+| `ANDROID_KEY_BASE64` | 固定 keystore 的 base64：`base64 -i release.jks \| tr -d '\n'` |
+| `ANDROID_KEY_ALIAS` | keystore 中的固定 alias |
+| `ANDROID_KEY_PASSWORD` | 私钥密码（必填） |
+| `ANDROID_KEY_STORE_PASSWORD` | keystore 密码（可选；未设置时使用私钥密码） |
+
+建议同时设置仓库 **Variable `ANDROID_SIGNING_CERT_SHA256`** 为固定证书的 SHA-256 指纹
+（64 位十六进制，可含冒号）。准备与签名阶段会核验它，防止误换 Secrets 后发布无法覆盖安装的 APK。
+密码只通过子进程环境传递，不放进 `keytool` / `apksigner` 命令行；私钥临时文件在任务结束时清理，禁止入库。
+已签名 APK 也必须匹配固定证书，不会因为“已经签过名”而跳过身份验证。
+
+**覆盖安装旧版必须拥有旧 APK 对应的原始签名私钥。** 如果旧版用的是已经丢失的一次性 CI 密钥，
+新建固定密钥不能使旧版直接升级；需要先备份/导出本地配置和数据，再手动卸载迁移一次。
+之后所有版本保留固定密钥、alias、应用 ID 不变即可延续覆盖更新。不要把 keystore 或密码提交到仓库。
 
 > 注意：`.github/workflows/*` 属于受保护路径。用**经典 PAT** 推送时，
 > token 必须勾选 `workflow` scope，否则 push 会被 GitHub 拒绝（仅 `repo` 不够）。
@@ -538,17 +554,16 @@ outputs/images/*       # 过程图与代码结果，供历史恢复和后续编�
 | 项目 | 结果 |
 | --- | --- |
 | TypeScript / 生产构建 | 通过 |
-| 前端回归 | 67 项通过 |
-| Rust 存储、配置与取消单元测试 | 12 项通过 |
-| Rust 协议测试 | 16 项通过 |
-| Android 工程脚本 | 全部通过 |
-| Chrome 移动端模拟 | 320 / 390 px 无横向溢出，结果在编辑区下方；预览缩放、Goal 输入、排队与插话通过 |
-| 生产 CSP 下的 JS 沙箱 | 实际像素编辑、动态脚本/联网/eval 拦截、超时、取消及清理通过 |
-| 小图真实模型联调 | `gpt-5.6-luna` 写代码 → 64×48 PNG 逐像素校验 → `gpt-5.4` / `gpt-5.6-luna` 与 Chat 独立评审 → Chat 汇总通过；未调用生图 API |
+| 前端回归 | 83 项通过 |
+| Release 文件与签名逻辑回归 | 13 项通过 |
+| 更新检查隔离回归 | 7 项通过 |
+| Android 工程静态检查 | Manifest、Activity、后台服务与签名逻辑通过 |
+| Chrome 移动端模拟 | 320 / 390 px 无横向溢出；历史分页、空气泡隐藏、阅读位置、Goal 评分与更新入口通过 |
+| Gemini 图片协议 | 3 轮真实付费联调通过，覆盖 data URL 解析与多轮编辑 |
+| 完整 Cargo 测试 | 未跑完：本机页面文件不足（`os error 1455`） |
+| Windows 安装版 / Android 真机 | 尚未验收 |
 
-真实模型联调使用本地临时代理读取已忽略的 `test api.md`，没有将密钥写入应用配置或测试产物。UI 验证使用浏览器和模拟 IPC，不代表 Windows 安装版或 Android 真机验收。协议测试首次编译遇到本机内存不足，以 `-j 1 --config 'profile.dev.package.gpt-image-studio.debug=0'` 重跑通过；未改变项目编译配置。
-
-以下本机与 CI 表格是此前版本的历史记录，不代表本次改动已完成原生安装包或 Android 真机验收。
+本轮 UI 验证使用浏览器和模拟 IPC，不代表已安装的 Windows 版或 Android 真机验收。真实模型联调读取了被忽略的本地测试配置，没有把密钥写入应用配置、日志或提交内容。
 
 ### 历史本机实测（Windows 11 + Rust 1.98 + Node 24）
 

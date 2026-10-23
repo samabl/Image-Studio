@@ -14,6 +14,7 @@ import {
   useStudio,
   useToast,
   channelReady,
+  interruptBackgroundTasks,
   type TabKey,
 } from "./lib/store";
 import { importImageFile, setNativeTheme } from "./lib/api";
@@ -44,6 +45,13 @@ export default function App() {
   useEffect(() => watchTheme(theme, (resolved) => {
     if (isAndroid) void setNativeTheme(resolved, theme).catch(() => undefined);
   }), [theme]);
+
+  useEffect(() => {
+    if (!isAndroid) return;
+    const interrupted = (event: Event) => interruptBackgroundTasks((event as CustomEvent<unknown>).detail);
+    window.addEventListener("image-studio-background-error", interrupted);
+    return () => window.removeEventListener("image-studio-background-error", interrupted);
+  }, []);
 
   useEffect(() => {
     bootstrap().catch((err) => setBootError((err as Error).message));

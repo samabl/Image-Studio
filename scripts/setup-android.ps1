@@ -5,16 +5,17 @@
 .DESCRIPTION
     做五件事：
       1. 校验 JAVA_HOME / ANDROID_HOME / NDK_HOME，缺什么给出具体安装命令；
-      2. 补齐 Rust 交叉编译目标；
+      2. 补齐 Rust 交叉编译目标（默认仅 Android arm64）；
       3. 调用 `pnpm tauri android init` 生成 src-tauri/gen/android；
       4. 生成 network_security_config.xml 并注入 AndroidManifest.xml
          —— 内网 http:// 网关在 Android 9+ 上默认被拦截，这一步是必须的。
-      5. 安装原生系统栏、刘海与键盘安全区域处理。
+      5. 安装原生安全区域、后台任务服务及其 Gradle / Manifest 配置。
 
     签名**不在这里做**。Tauri 的 Gradle 模板用的是 `getByName("release") { ... }`
     这类 Kotlin DSL 写法，靠正则去改它非常脆（实测因为匹配不到 release 块而静默产出
     未签名 APK）。签名改用与模板无关的后置方案：
-        pwsh -File scripts/sign-android-apk.ps1 -KeystorePath ... -KeyAlias ... -KeyPassword ...
+        pwsh -File scripts/sign-android-apk.ps1 -KeystorePath ... -KeyAlias ...
+    密码在本机 ANDROID_KEY_PASSWORD 环境变量中设置，不写进命令行。
 
     脚本可重复执行：已打过的补丁不会重复写入。
 
@@ -28,6 +29,10 @@ param(
 
     # 放行全部明文流量（最省事，安全性最低）
     [switch]$AllowAllCleartext,
+
+    # 发布只需要 arm64；其他架构仅在本地调试时显式指定。
+    [ValidateSet("aarch64-linux-android", "armv7-linux-androideabi", "i686-linux-android", "x86_64-linux-android")]
+    [string[]]$RustTargets = @("aarch64-linux-android"),
 
     # 跳过 `tauri android init`
     [switch]$SkipInit
@@ -106,12 +111,7 @@ Ok "NDK_HOME = $ndk"
 
 # --- Rust 交叉目标 ---
 Write-Host "`n=== 2/5 检查 Rust 交叉编译目标 ===" -ForegroundColor White
-$targets = @(
-    "aarch64-linux-android",
-    "armv7-linux-androideabi",
-    "i686-linux-android",
-    "x86_64-linux-android"
-)
+$targets = @($RustTargets | Select-Object -Unique)
 $installed = (& rustup target list --installed) -split "`r?`n"
 foreach ($t in $targets) {
     if ($installed -contains $t) {
@@ -238,9 +238,10 @@ Ok '已同步 Android 启动图标与自适应前景/背景'
 Write-Host "`n完成。`n" -ForegroundColor Green
 Write-Host @"
 后续命令：
-  打包 APK   : pnpm tauri android build --apk --ci
-  签名 APK   : pwsh -File scripts/sign-android-apk.ps1 -KeystorePath <jks> -KeyAlias <alias> -KeyPassword <pwd>
-  打包 AAB   : pnpm tauri android build --ci
+  打包 APK   : pnpm android:apk（仅 arm64）
+  签名 APK   : pwsh -File scripts/sign-android-apk.ps1 -KeystorePath <jks> -KeyAlias <alias>
+               密码从本机 ANDROID_KEY_PASSWORD 环境变量读取
+  打包 AAB   : pnpm tauri android build --aab --ci --target aarch64（仅本地按需）
   真机调试   : pnpm tauri android dev
   产物目录   : src-tauri/gen/android/app/build/outputs/apk/
 

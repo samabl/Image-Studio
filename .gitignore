@@ -17,6 +17,12 @@ src-tauri/gen/
 .env.local
 test api.md
 
+# Android 发布私钥（证书指纹可以公开，keystore 不能入库）
+*.jks
+*.keystore
+*.p12
+*.pfx
+
 # 编辑器
 .vscode/*
 !.vscode/extensions.json

@@ -141,6 +141,8 @@ export interface ToolCall {
   imageStage?: "asset" | "final";
   retryOf?: string;
   requestedSize?: string;
+  requestedQuality?: string;
+  requestedImageSize?: string;
 }
 
 export interface ChatAttachment {
@@ -176,28 +178,48 @@ export interface QueuedMessage {
 
 export type ChatRole = "user" | "assistant" | "tool";
 
-export type GoalLevel = "relaxed" | "standard" | "strict";
+export type GoalScorer = "auto" | "jury" | "chat";
 export interface GoalSettings {
   enabled: boolean;
-  level: GoalLevel;
+  targetScore: number;
+  scorer: GoalScorer;
   maxCorrections: number;
 }
-export interface GoalCheck { requirement: string; passed: boolean; details: string; }
+export interface GoalCheck { requirement: string; passed: boolean; details: string; score?: number; }
+export interface GoalScore {
+  score: number;
+  summary: string;
+  checks: GoalCheck[];
+}
+export interface GoalReviewerScore {
+  memberId: string;
+  name: string;
+  model: string;
+  score: number;
+  summary: string;
+}
 export interface GoalReview {
   status: "satisfied" | "needs_revision" | "blocked";
   summary: string;
   checks: GoalCheck[];
   imageIds: string[];
   answer?: string;
+  score?: number;
+  targetScore?: number;
+  scorer?: Exclude<GoalScorer, "auto">;
+  reviewerScores?: GoalReviewerScore[];
 }
 export interface GoalProgress {
   status: "working" | "satisfied" | "blocked" | "limit" | "stopped" | "error";
-  level: GoalLevel;
+  targetScore: number;
+  scorer: Exclude<GoalScorer, "auto">;
   maxCorrections: number;
   corrections: number;
   attempts: number;
   summary?: string;
   checks?: GoalCheck[];
+  score?: number;
+  reviewerScores?: GoalReviewerScore[];
 }
 
 export interface JuryOpinion {
@@ -207,6 +229,7 @@ export interface JuryOpinion {
   status: "pending" | "complete" | "error" | "stopped";
   text?: string;
   error?: string;
+  goalScore?: GoalScore;
 }
 
 export interface JuryReview {
@@ -292,6 +315,7 @@ export interface ImageRequest {
   n?: number;
   size?: string;
   quality?: string;
+  imageSize?: "1K" | "2K" | "4K";
   background?: string;
   outputFormat?: string;
   extraBody?: Record<string, unknown> | null;
@@ -311,4 +335,17 @@ export interface ChatRequest {
   toolChoice?: unknown;
   extraBody?: Record<string, unknown> | null;
   timeoutSecs?: number | null;
+}
+
+
+export interface SoftwareUpdate {
+  currentVersion: string;
+  latestVersion: string;
+  available: boolean;
+  releaseName: string;
+  releaseUrl: string;
+  publishedAt: string | null;
+  notes: string;
+  platform: string;
+  downloads: { name: string; url: string; size: number; recommended: boolean }[];
 }

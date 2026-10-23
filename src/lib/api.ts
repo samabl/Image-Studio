@@ -9,6 +9,7 @@ import type {
   ImageRequest,
   SaveMeta,
   ThemeMode,
+  SoftwareUpdate,
 } from "../types";
 
 /** 统一的调用错误：把 Rust 侧字符串错误包成 Error，便于 `catch (e) { e.message }`。 */
@@ -28,6 +29,8 @@ export const resetConfig = () => call<AppConfig>("reset_config");
 export const setNativeTheme = (theme: "light" | "dark", mode: ThemeMode) => call<void>("set_native_theme", { theme, mode });
 export const dataDir = () => call<string>("data_dir");
 
+export const checkForUpdates = () => call<SoftwareUpdate>("check_for_updates");
+
 // --- 状态存取 -------------------------------------------------------------
 
 export const loadState = (key: string) => call<string | null>("load_state", { key });
@@ -44,7 +47,7 @@ export function startBackgroundTask() {
   };
 }
 
-export const backgroundTaskStatus = () => call<{ batteryOptimizationIgnored: boolean; notificationsEnabled: boolean }>("background_task_status");
+export const backgroundTaskStatus = () => call<{ batteryOptimizationIgnored: boolean; notificationsEnabled: boolean; activeTasks: number; wakeLockHeld: boolean; lastError?: string | null }>("background_task_status");
 export const configureBackgroundTasks = () => call<void>("background_task_configure");
 export const saveImageToAlbum = (dataUrl: string, fileName: string) => call<string>("save_image_to_album", { dataUrl, fileName });
 

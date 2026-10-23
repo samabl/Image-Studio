@@ -406,6 +406,7 @@ async fn image_pipeline() {
         mask: None,
         n: Some(1),
         size: Some("1024x1024".into()),
+        image_size: None,
         quality: Some("auto".into()),
         background: Some("auto".into()),
         output_format: Some("auto".into()),
@@ -437,6 +438,7 @@ async fn image_pipeline() {
         mask: None,
         n: Some(1),
         size: Some("1024x1024".into()),
+        image_size: None,
         quality: Some("auto".into()),
         background: Some("auto".into()),
         output_format: Some("auto".into()),
@@ -476,6 +478,7 @@ async fn image_pipeline() {
         mask: Some(mask_data_url),
         n: Some(1),
         size: Some("1024x1024".into()),
+        image_size: None,
         quality: Some("auto".into()),
         background: Some("auto".into()),
         output_format: Some("auto".into()),
@@ -553,4 +556,39 @@ fn mask_png_is_valid() {
     assert_eq!(png[24], 8, "位深应为 8");
     assert_eq!(png[25], 6, "颜色类型应为 RGBA");
     assert!(png.len() > 100);
+}
+
+
+/// 真实生产生图路径：连续三轮，后两轮把上一轮的实际结果作为编辑基底。
+/// 使用 GIS_TEST_BASE / GIS_TEST_KEY；仅显式选择本测试才会发起付费调用。
+#[tokio::test]
+async fn gemini_image_multiturn_native_pipeline() {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let cfg = cfg_or_skip!();
+    let model = std::env::var("GIS_TEST_GEMINI_IMAGE_MODEL").unwrap_or_else(|_| "gemini-3-pro-image-preview".into());
+    let mut req: ImageRequest = serde_json::from_value(serde_json::json!({
+        "baseUrl":cfg.base,"apiKey":cfg.key,"model":model,"apiMode":"gemini","n":1,"size":"1024x1024","imageSize":"1K","timeoutSecs":300,
+        "prompt":"Generate one flat illustration of a red teapot centered on a plain pale blue background. No words, no people, no other objects. Return an image."
+    })).unwrap();
+    let edits = [
+        "Change only the teapot to green. Preserve the same shape, viewpoint, composition and pale blue background. No words, no people. Return the edited image.",
+        "Keep the green teapot and pale blue background unchanged. Add one small yellow star in the upper right corner. No words, no people. Return the edited image."
+    ];
+    for round in 0..3 {
+        let started = std::time::Instant::now();
+        let images = ai::run_image_request(&req).await.unwrap_or_else(|err| panic!("Gemini round {} failed: {err}", round + 1));
+        assert!(!images.is_empty(), "Round {} returned no images", round + 1);
+        assert!(images[0].bytes.len() > 100, "Round {} returned invalid image bytes", round + 1);
+        eprintln!("Gemini production round {}: {} image(s), {} bytes, MIME {}, {:.1}s, input images {}", round+1, images.len(), images[0].bytes.len(), images[0].mime, started.elapsed().as_secs_f64(), req.images.len());
+        if let Ok(dir) = std::env::var("GIS_TEST_OUTPUT") {
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = std::path::Path::new(&dir).join(format!("gemini-round-{}.{}",round+1,images[0].ext));
+            std::fs::write(path, &images[0].bytes).unwrap();
+        }
+        if let Some(edit) = edits.get(round) {
+            req.prompt = (*edit).into();
+            req.images = vec![format!("data:{};base64,{}", images[0].mime, STANDARD.encode(&images[0].bytes))];
+            req.image_labels = vec![format!("第 {} 轮实际结果，作为唯一编辑基底", round+1)];
+        }
+    }
 }
