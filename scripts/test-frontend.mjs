@@ -1248,6 +1248,21 @@ test("个别评审失败时忽略该成员继续评分，不结束 Goal，也不
   assert.equal(sessions().current().messages.at(-1).goalProgress.status,"satisfied");
 });
 
+test("成图自动评审后再调用 review_images 不会重复评审同一批图片", async (t) => {
+  const h=await harness(); guardHarness(t,h); const sessions=h.useSessions.getState;
+  h.useConfig.setState({config:withJury(h.useConfig.getState().config)});
+  const pending=sessions().send("生成",[]); callTool(h.streams[0],[{args:{prompt:"生成"}}]); await tick();
+  h.imageCalls[0].resolve([generated("dup","image-test")]); await tick();
+  assert.equal(h.textCalls.length,2,"成图后自动评审一次");
+  h.textCalls[0].resolve("人数正确"); h.textCalls[1].resolve("构图合理"); await tick();
+  callTool(h.streams[1],[{name:"review_images",args:{source_image_ids:["image_dup"],focus:"检查细节"}}]); await tick();
+  assert.equal(h.textCalls.length,2,"同一批图片不再调用评审团");
+  const tool=sessions().current().messages.at(-1);
+  assert.equal(tool.juryReview,undefined,"不再生成第二个评审面板");
+  assert.match(tool.content,/已经评审过/);
+  complete(h.streams[2]); await pending;
+});
+
 test("同一批成果只评分一次：重复提交被拒绝，屡次重复则结束自动执行", async (t) => {
   const h=await harness(); guardHarness(t,h); const sessions=h.useSessions.getState;
   h.useConfig.setState({config:withJury(h.useConfig.getState().config)});

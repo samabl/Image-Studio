@@ -956,6 +956,8 @@ async function runTurn(sessionId: string, set: Setter, get: () => SessionState):
   let inCorrection = false;
   // 本次运行内的评审缓存：同一批实际成果只评审一次，避免模型对同一张图反复付费评审。
   const reviewCache = new Map<string, JuryReview>();
+  /** 只按图片集合索引：即使模型换了 focus 再问一遍，也直接复用已有评审。 */
+  const reviewedImages = new Map<string, JuryReview>();
   const failedJuryMembers = new Set<string>();
   let lastScoreSignature = "";
   let lastScoreLabel = "";
@@ -1004,12 +1006,21 @@ async function runTurn(sessionId: string, set: Setter, get: () => SessionState):
     prompt = "", references: ReturnType<typeof selectImageSources> = [], focus = "", scoring = false, answer?: string) => {
     let report: JuryReview;
     const reviewConfig = scoring ? scoringConfig : cfg;
-    const cacheKey = reviewSignature(sources.map((source) => source.id), focus, scoring, answer);
+    const imageIds = sources.map((source) => source.id);
+    const imageKey = [...imageIds].sort().join(",");
+    const cacheKey = reviewSignature(imageIds, focus, scoring, answer);
     const cachedReview = reviewCache.get(cacheKey);
     if (cachedReview) {
       // 直接复用本次运行已经拿到的真实评审，既不重复付费，也不让同一批成果反复出现在历史里。
       update(toolId, { pending: false, content: `${text}\n${juryFeedback(cachedReview)}`, juryReview: cachedReview });
       return cachedReview;
+    }
+    // 成图已自动评审后模型常会再调一次 review_images：同一批图片在本次运行里只评一次，
+    // 直接指向已有结果，不再开一个新面板、也不再付费。
+    const previousReview = scoring ? undefined : reviewedImages.get(imageKey);
+    if (previousReview) {
+      update(toolId, { pending: false, content: `${text}\n本批图片本次运行已经评审过，评审意见见上一条图像工具结果，未重复调用评审团。` });
+      return previousReview;
     }
     try {
       // 图片可以只带 path：Rust 会在发送前读盘并转成 data URL，JS 不再搬运 base64。
@@ -1036,7 +1047,10 @@ async function runTurn(sessionId: string, set: Setter, get: () => SessionState):
       };
     }
     // 取消（stopped）不入缓存：用户停止后重新提交应当真的再评一次。
-    if (report.status !== "stopped") reviewCache.set(cacheKey, report);
+    if (report.status !== "stopped") {
+      reviewCache.set(cacheKey, report);
+      reviewedImages.set(imageKey, report);
+    }
     // 确认失败的成员本轮不再重复等待；其余评审继续完成验收。
     for (const opinion of report.opinions) {
       if (opinion.status === "error") failedJuryMembers.add(opinion.memberId);
