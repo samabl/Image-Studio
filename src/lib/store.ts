@@ -647,6 +647,28 @@ function newSessionObj(): ChatSession {
 let persistenceQueue: Promise<void> = Promise.resolve();
 let draftSaveTimer: ReturnType<typeof setTimeout> | null = null;
 
+/**
+ * 落盘前去掉能由 path 重建的 base64 图片。
+ * 一张 1024² 的 PNG data URL 可达数 MB，几十张历史图会让 sessions.json 膨胀到几十 MB：
+ * 启动时解析它、每次保存序列化它都会卡住 WebView，并让内存常驻大量顶点字符串。
+ * 图片本身仍在 outputs 目录里，图片 ID 和 path 都保留，展示走 asset 协议、编辑/评审按需读盘。
+ */
+function persistedSessions(sessions: ChatSession[]): ChatSession[] {
+  let changed = false;
+  const slim = sessions.map((session) => {
+    let sessionChanged = false;
+    const messages = session.messages.map((message) => {
+      if (!message.images?.some((image) => image.dataUrl)) return message;
+      sessionChanged = true;
+      return { ...message, images: message.images.map((image) => (image.dataUrl ? { ...image, dataUrl: undefined } : image)) };
+    });
+    if (!sessionChanged) return session;
+    changed = true;
+    return { ...session, messages };
+  });
+  return changed ? slim : sessions;
+}
+
 /** 提供给对话模型的图像工具定义。 */
 export function imageTools(config?: ImageConfig, pinned = ""): unknown[] {
   const pool = config ? configuredImageModels(config) : [];
@@ -809,6 +831,9 @@ export const useSessions = create<SessionState>((set, get) => {
               }),
             }));
             set({ sessions, currentId: sessions.some((s) => s.id === parsed.currentId) ? parsed.currentId : sessions[0].id });
+            // 旧版本的 sessions.json 可能把几十张图的 base64 一起存了下来：立刻用瘦身版本覆盖，
+            // 之后每次启动都不必再解析这些字符串。
+            if (persistedSessions(sessions) !== sessions) void get().persist();
             return;
           }
         }
@@ -819,7 +844,7 @@ export const useSessions = create<SessionState>((set, get) => {
     persist: () => {
       if (draftSaveTimer) { clearTimeout(draftSaveTimer); draftSaveTimer = null; }
       const { sessions, currentId } = get();
-      const value = JSON.stringify({ sessions, currentId });
+      const value = JSON.stringify({ sessions: persistedSessions(sessions), currentId });
       persistenceQueue = persistenceQueue.catch(() => undefined).then(() => api.saveState("sessions", value)).catch((err) => {
         toast.error(`对话保存失败：${(err as Error).message}`);
       });
@@ -929,7 +954,11 @@ async function runTurn(sessionId: string, set: Setter, get: () => SessionState):
   const failedRequests = new Map<string, PreparedImage>();
   let lastFinalIds: string[] = [];
   let inCorrection = false;
-  let lastScoredImages: JuryReview | undefined;
+  // 本次运行内的评审缓存：同一批实际成果只评审一次，避免模型对同一张图反复付费评审。
+  const reviewCache = new Map<string, JuryReview>();
+  let lastScoreSignature = "";
+  let lastScoreLabel = "";
+  let repeatedScores = 0;
   let terminal = false;
   let continuation = "";
   let stopped = false;
@@ -948,10 +977,20 @@ async function runTurn(sessionId: string, set: Setter, get: () => SessionState):
   const update = (id: string, patch: Partial<ChatMessage>) => set((state) => ({ sessions: state.sessions.map((s) => s.id === sessionId ? { ...s, messages: s.messages.map((m) => m.id === id ? { ...m, ...patch } : m) } : s) }));
   const syncGoal = () => { if (goal.enabled) patchRun({ goalProgress: { ...progress } }); };
   const endGoal = (status: GoalProgress["status"], summary: string) => { progress.status = status; progress.summary = summary; terminal = true; syncGoal(); };
+  /** 同一批成果 + 同一评审模式的签名；参考图只影响意见措辞，不改变被评分的成果，因此不进签名。 */
+  const reviewSignature = (ids: string[], focus: string, scoring: boolean, answer?: string) =>
+    `${scoring ? "score" : "review"}|${[...ids].sort().join(",")}|${focus}|${answer ?? ""}`;
   const reviewImages = async (toolId: string, sources: ReturnType<typeof selectImageSources>, text: string,
     prompt = "", references: ReturnType<typeof selectImageSources> = [], focus = "", scoring = false, answer?: string) => {
     let report: JuryReview;
     const reviewConfig = scoring ? scoringConfig : cfg;
+    const cacheKey = reviewSignature(sources.map((source) => source.id), focus, scoring, answer);
+    const cachedReview = reviewCache.get(cacheKey);
+    if (cachedReview) {
+      // 直接复用本次运行已经拿到的真实评审，既不重复付费，也不让同一批成果反复出现在历史里。
+      update(toolId, { pending: false, content: `${text}\n${juryFeedback(cachedReview)}`, juryReview: cachedReview });
+      return cachedReview;
+    }
     try {
       patchRun({ toolNote: "正在读取评审图片…" });
       const images = await Promise.all(sources.map(async (source) => ({ ...source,
@@ -978,8 +1017,9 @@ async function runTurn(sessionId: string, set: Setter, get: () => SessionState):
         opinions: [{ memberId: "jury_input", name: "图片读取", model: "", status: stopped ? "stopped" : "error", error: jurySafeText(error, cfg) }],
       };
     }
+    // 取消（stopped）不入缓存：用户停止后重新提交应当真的再评一次。
+    if (report.status !== "stopped") reviewCache.set(cacheKey, report);
     update(toolId, { pending: false, content: `${text}\n${juryFeedback(report)}`, juryReview: report });
-    if (scoring && !answer && sources.length && report.status === "complete") lastScoredImages = report;
     if (active()) patchRun({ toolNote: "评审完成，正在交给 Chat 汇总…" });
     void get().persist();
     return report;
@@ -1057,7 +1097,7 @@ async function runTurn(sessionId: string, set: Setter, get: () => SessionState):
       if (!useTools) break;
       if (!streamed.toolCalls.length) {
         if (!goal.enabled || terminal) break;
-        continuation = "Goal 仍在运行。请检查实际成果并调用 review_goal 提交独立评分；不满足则自主修正，遇到不能解决的障碍则用 blocked_reason 说明。不能只用文字声称已经满足。";
+        continuation = "Goal 仍在运行。请检查实际成果并调用 review_goal 提交独立评分；不满足则自主修正，遇到不能解决的障碍则用 blocked_reason 说明。同一批成果只能评分一次，未达标必须先生成/编辑出新的图片或改写答案，不能重复提交同一批成果。不能只用文字声称已经满足。";
         continue;
       }
       continuation = "";
@@ -1106,7 +1146,7 @@ async function runTurn(sessionId: string, set: Setter, get: () => SessionState):
               images: items.map((item) => ({ galleryId: item.id, path: item.path, dataUrl: item.dataUrl ?? undefined, prompt: item.prompt, size: item.size, model: item.model,
                 kind: item.kind, createdAt: item.createdAt, parentId: item.parentId, revisedPrompt: item.revisedPrompt })),
             });
-            if (imageStage === "final") { lastFinalIds = items.map((item) => `image_${item.id}`); inCorrection = false; lastScoredImages = undefined; }
+            if (imageStage === "final") { lastFinalIds = items.map((item) => `image_${item.id}`); inCorrection = false; lastScoreSignature = ""; repeatedScores = 0; }
             if (jury.enabled && imageStage === "final" && (!goal.enabled || goalScorer === "jury")) {
               update(toolId, { pending: true });
               await reviewImages(toolId, items.map((item, index) => ({ id: `image_${item.id}`, label: `代码结果 ${index + 1}（图片 ID：image_${item.id}）`, path: item.path, dataUrl: item.dataUrl ?? undefined })),
@@ -1133,10 +1173,25 @@ async function runTurn(sessionId: string, set: Setter, get: () => SessionState):
               review = { status: "blocked", summary: submission.blockedReason, checks: [], imageIds: submission.imageIds,
                 targetScore: goal.targetScore, scorer: goalScorer, answer: submission.answer };
             } else {
-              const cached = !submission.answer && lastScoredImages?.status === "complete" && lastScoredImages.imageIds.length === submission.imageIds.length
-                && submission.imageIds.every((id) => lastScoredImages!.imageIds.includes(id));
-              const report = cached ? lastScoredImages! : await reviewImages(toolId, sources, "Goal 正在为实际成果评分。", "", [], "", true, submission.answer);
+              const signature = reviewSignature(submission.imageIds, "", true, submission.answer);
+              // 同一批成果只给一次独立评分。重复提交必须先产出新成果，否则会对着同一张图无限重评。
+              if (signature === lastScoreSignature) {
+                repeatedScores += 1;
+                if (repeatedScores >= 2) endGoal("limit", "模型反复提交同一批成果评分，没有产出新的成果，自动执行已停止。");
+                update(toolId, { pending: false, content: `同一批成果已经评分（${lastScoreLabel}），不会重复评审。请先按评分意见生成/编辑出新的最终图片，或改写文字答案，再提交 review_goal。` });
+                continue;
+              }
+              const report = await reviewImages(toolId, sources, "Goal 正在为实际成果评分。", "", [], "", true, submission.answer);
               if (!active()) throw new Error(stoppedMessage());
+              if (report.status !== "complete") {
+                // 评审成员报错或返回无效评分时重复评审只会永远失败，直接结束并说明真实障碍。
+                const failed = report.opinions.filter((opinion) => opinion.status !== "complete")
+                  .map((opinion) => `${opinion.name || opinion.model || "评审"}${opinion.error ? `：${opinion.error}` : ""}`).join("；");
+                const summary = `评审未能完成（${failed || "没有可用的评审模型"}），不能判定 Goal 通过；已停止重复评审同一批成果，请检查评审模型配置后重试。`;
+                endGoal("blocked", summary);
+                update(toolId, { pending: false, content: `Goal 无法判定：${summary}`, juryReview: report });
+                continue;
+              }
               review = goalReviewFromScores(report, goal, goalScorer, submission.answer);
             }
             progress.checks = review.checks; progress.summary = review.summary; progress.score = review.score; progress.reviewerScores = review.reviewerScores;
@@ -1146,6 +1201,9 @@ async function runTurn(sessionId: string, set: Setter, get: () => SessionState):
             else if (progress.corrections >= goal.maxCorrections) endGoal("limit", `已达到 ${goal.maxCorrections} 次修正上限，仍未达标：${review.summary}`);
             else if (!review.imageIds.length) { progress.corrections += 1; syncGoal(); }
             else syncGoal();
+            lastScoreSignature = reviewSignature(submission.imageIds, "", true, submission.answer);
+            lastScoreLabel = `${review.score ?? "?"}/100，${review.status === "needs_revision" ? "未达标" : review.status}`;
+            repeatedScores = 0;
             continue;
           }
           if (call.name === "retry_image") {
@@ -1192,7 +1250,7 @@ async function runTurn(sessionId: string, set: Setter, get: () => SessionState):
           abort = null;
           if (!active()) throw new Error(stoppedMessage());
           if (!items.length) throw new Error("服务没有返回图片");
-          if (imageStage === "final") { lastFinalIds = items.map((item) => `image_${item.id}`); inCorrection = false; lastScoredImages = undefined; }
+          if (imageStage === "final") { lastFinalIds = items.map((item) => `image_${item.id}`); inCorrection = false; lastScoreSignature = ""; repeatedScores = 0; }
           update(toolId, { pending: false, content: `已生成 ${items.length} 张${imageStage === "asset" ? "中间素材，请继续剩余生成/合成步骤" : "图片"}。`, images: items.map((item) => ({
             galleryId: item.id, path: item.path, dataUrl: item.dataUrl ?? undefined, prompt: item.prompt, size: item.size, model: item.model,
             kind: item.kind, createdAt: item.createdAt, parentId: item.parentId, revisedPrompt: item.revisedPrompt,

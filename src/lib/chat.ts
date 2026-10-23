@@ -48,10 +48,10 @@ export function userImageContent(text: string, images: ImageSource[]): unknown[]
   ];
 }
 
-export function toApiMessages(m: ChatMessage): unknown[] {
+export function toApiMessages(m: ChatMessage, withImages = true): unknown[] {
   if (m.role === "tool") {
     const tool = { role: "tool", tool_call_id: m.toolCallId, content: m.content || "已完成" };
-    const images = imageSources(m).filter((image) => image.dataUrl);
+    const images = withImages ? imageSources(m).filter((image) => image.dataUrl) : [];
     return images.length ? [tool, { role: "user", content: userImageContent("以下是图像工具实际输出，请检查是否满足我的要求。", images) }] : [tool];
   }
   if (m.role === "assistant") {
@@ -59,16 +59,37 @@ export function toApiMessages(m: ChatMessage): unknown[] {
       tool_calls: m.toolCalls.map((tc) => ({ id: tc.id, type: "function", function: { name: tc.name, arguments: tc.arguments }, ...(tc.providerData ? { provider_data: tc.providerData } : {}) })),
     } : {}) }];
   }
-  const images = imageSources(m);
+  const images = withImages ? imageSources(m) : [];
   return [{ role: "user", content: images.length ? userImageContent(m.content, images) : m.content }];
 }
 
+/**
+ * 每次请求最多携带的历史图片数。整段历史都塞进去会让每个请求的体积随对话线性增长
+ * （一张 1024² 的 data URL 就有数 MB），在安卓上直接表现为发消息卡顿和内存飙升。
+ * 更早的图片仍保留 ID 与 path，模型可以继续用 edit_image / review_images 按 ID 读取。
+ */
+export const MAX_CONTEXT_IMAGES = 8;
+
+function contextImageMessages(messages: ChatMessage[]): Set<string> {
+  const keep = new Set<string>();
+  let budget = MAX_CONTEXT_IMAGES;
+  for (let i = messages.length - 1; i >= 0 && budget > 0; i -= 1) {
+    const count = imageSources(messages[i]).filter((image) => image.dataUrl).length;
+    if (!count) continue;
+    if (count > budget && keep.size) break;
+    keep.add(messages[i].id);
+    budget -= count;
+  }
+  return keep;
+}
+
 export function conversationMessages(messages: ChatMessage[]): unknown[] {
+  const withImages = contextImageMessages(messages);
   const out: unknown[] = [];
   let feedback: unknown[] = [];
   for (const message of messages) {
     if (message.role !== "tool" && feedback.length) { out.push(...feedback); feedback = []; }
-    const [first, ...images] = toApiMessages(message);
+    const [first, ...images] = toApiMessages(message, withImages.has(message.id));
     out.push(first);
     if (message.role === "tool") feedback.push(...images);
     else out.push(...images);

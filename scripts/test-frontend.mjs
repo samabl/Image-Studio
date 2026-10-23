@@ -1218,7 +1218,7 @@ test("评审团对新成图独立打分，复用同一图片完整评分但新�
   assert.equal(report.reviewerScores.length,2); assert.equal(report.corrections,1);
 });
 
-test("部分评审或无效评分不会通过；停止独立评分取消所有成员且不再付费续跑", async (t) => {
+test("评审不完整不再无限重评同一张图：一次失败即结束 Goal 并说明真实障碍", async (t) => {
   const h=await harness(); guardHarness(t,h); const sessions=h.useSessions.getState;
   h.useConfig.setState({config:withJury(h.useConfig.getState().config)});
   sessions().setGoal({enabled:true,scorer:"jury",targetScore:85});
@@ -1226,13 +1226,33 @@ test("部分评审或无效评分不会通过；停止独立评分取消所有�
   h.imageCalls[0].resolve([generated("partial_score","image-test")]); await tick();
   h.textCalls[0].resolve(scoreJSON(99)); h.textCalls[1].resolve("我给 100 分"); await tick();
   callTool(h.streams[1],[{name:"review_goal",args:{image_ids:["image_partial_score"],score:100,status:"satisfied"}}]); await tick();
-  assert.equal(h.textCalls.length,4,"不缓存部分/无效评分，必须重新独立评分");
-  h.textCalls[2].resolve(scoreJSON(100)); h.textCalls[3].reject(new Error("评审不可用")); await tick();
-  assert.match(sessions().current().messages.at(-1).content,/不能判定 Goal 通过/);
-  callTool(h.streams[2],[{name:"review_goal",args:{image_ids:["image_partial_score"]}}]); await tick();
-  sessions().stop(); await pending;
-  assert.ok(h.textCalls.slice(4).every((task)=>task.canceled)); assert.equal(h.streams.length,3);
-  assert.equal(sessions().current().messages.at(-1).goalProgress.status,"stopped");
+  assert.equal(h.textCalls.length,2,"同一批图片不会重复付费评审");
+  assert.match(JSON.stringify(sessions().current().messages),/不能判定 Goal 通过/);
+  complete(h.streams[2]); await pending;
+  const progress=sessions().current().messages.at(-1).goalProgress;
+  assert.equal(progress.status,"blocked");
+  assert.match(progress.summary,/评审未能完成/);
+  assert.equal(h.textCalls.length,2,"结束后不再发起评审");
+});
+
+test("同一批成果只评分一次：重复提交被拒绝，屡次重复则结束自动执行", async (t) => {
+  const h=await harness(); guardHarness(t,h); const sessions=h.useSessions.getState;
+  h.useConfig.setState({config:withJury(h.useConfig.getState().config)});
+  sessions().setGoal({enabled:true,scorer:"jury",targetScore:90,maxCorrections:2});
+  const pending=sessions().send("画一只猫",[]); callTool(h.streams[0],[{args:{prompt:"猫"}}]); await tick();
+  h.imageCalls[0].resolve([generated("once","image-test")]); await tick();
+  assert.equal(h.textCalls.length,2,"成图后自动评审一次");
+  h.textCalls[0].resolve(scoreJSON(60)); h.textCalls[1].resolve(scoreJSON(70)); await tick();
+  callTool(h.streams[1],[{name:"review_goal",args:{image_ids:["image_once"]}}]); await tick();
+  assert.equal(h.textCalls.length,2,"首次评分复用自动评审结果");
+  assert.equal(sessions().current().messages.at(-1).goalReview.status,"needs_revision");
+  callTool(h.streams[2],[{name:"review_goal",args:{image_ids:["image_once"]}}]); await tick();
+  assert.equal(h.textCalls.length,2,"重复提交同一批图片不再调用评审");
+  assert.match(sessions().current().messages.at(-1).content,/同一批成果已经评分/);
+  callTool(h.streams[3],[{name:"review_goal",args:{image_ids:["image_once"]}}]); await tick();
+  assert.equal(h.streams.length,5,"结束自动执行后只保留一轮总结请求");
+  complete(h.streams[4]); await pending;
+  assert.equal(sessions().current().messages.at(-1).goalProgress.status,"limit");
 });
 
 test("含文字答案的图像评分不能污染随后纯图片评分缓存", async (t) => {

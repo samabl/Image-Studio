@@ -21,7 +21,7 @@ export function goalSettings(value?: Partial<GoalSettings> & { level?: unknown }
 export function goalInstructions(settings: GoalSettings, corrections: number): string {
   return `Goal 模式已开启，采用 100 分制，目标分数：${settings.targetScore}/100，评分来源：${GOAL_SCORERS[settings.scorer]}。达到目标分数且没有违反明确要求才算达标。最多修正 ${settings.maxCorrections} 次，当前已修正 ${corrections} 次。
 先整理当前用户目标及必须遵守的要求，再完成任务。涉及图片时必须检查实际回图；编号只是图片引用，不能仅凭生图提示词判断达标。每次成图后调用 review_goal，提交本次最新全部最终图片的真实 image_ids，由客户端交给评审团或 Chat 模型独立打分；你不能自行填写分数、宣称通过或篡改评审分数。
-收到 needs_revision 后根据评分和逐项依据自行修正，再提交新成果评分，不要等用户催促。文字任务提交完整 answer 和空 image_ids；未达分时自行改写答案，再重新评分。真实能力或服务限制无法继续时用 blocked_reason 说明实际障碍，不能假称成功。修正不能改变原始要求、扩大任务或添加无关元素。不要编造图片 ID，也不能用仅文生图的模型编辑参考图。`;
+收到 needs_revision 后根据评分和逐项依据自行修正，再提交新成果评分，不要等用户催促。同一批成果只能评分一次：必须先产出新的最终图片或改写答案再提交 review_goal，反复提交同一批成果会被客户端拒绝。文字任务提交完整 answer 和空 image_ids；未达分时自行改写答案，再重新评分。真实能力或服务限制无法继续时用 blocked_reason 说明实际障碍，不能假称成功。修正不能改变原始要求、扩大任务或添加无关元素。不要编造图片 ID，也不能用仅文生图的模型编辑参考图。`;
 }
 
 export const goalReviewTool = {
