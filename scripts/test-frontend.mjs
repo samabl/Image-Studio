@@ -1121,6 +1121,7 @@ test("Goal 等级迁移为分数，新增设置约束范围且不接受伪造评
 test("独立评分必须是有依据的有限 0–100 分和非空逐项约束", () => {
   const valid = JSON.parse(scoreJSON(84.995));
   assert.equal(goal.parseGoalScore("```json\n" + JSON.stringify(valid) + "\n```").score, 84.995);
+  assert.equal(goal.parseGoalScore("这是我的评分：\n" + JSON.stringify(valid) + "\n希望有帮助").score, 84.995);
   for (const value of [null, [], {}, { ...valid, score: "99" }, { ...valid, score: -1 }, { ...valid, score: 101 },
     { ...valid, summary: " " }, { ...valid, checks: [] }, { ...valid, checks: Array(41).fill(valid.checks[0]) },
     { ...valid, checks: [{ ...valid.checks[0], passed: "true" }] }, { ...valid, checks: [{ ...valid.checks[0], score: 101 }] },

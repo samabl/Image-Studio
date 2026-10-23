@@ -52,13 +52,26 @@ export function parseGoalSubmission(args: Record<string, unknown>) {
   return { imageIds: ids as string[], answer, blockedReason };
 }
 
-/** 只接受评分模型返回的结构化结果，拒绝空意见、越界分数和编造的通过状态。 */
+/**
+ * 只接受评分模型返回的结构化结果，拒绝空意见、越界分数和编造的通过状态。
+ * 部分模型会把 JSON 裹在“这是我的评分：…”之类的说明里，这里先尝试整体解析，
+ * 再尝试截取最外层的 JSON 对象，避免因为几行客套话就整次评分作废。
+ */
 export function parseGoalScore(text: string): GoalScore {
   const trimmed = text.trim();
   const fenced = /^```(?:json)?\s*([\s\S]*?)\s*```$/i.exec(trimmed);
-  let result: Record<string, unknown>;
-  try { result = JSON.parse(fenced ? fenced[1] : trimmed); } catch { throw new Error("评分模型未返回有效 JSON，请重新评分"); }
-  if (!result || typeof result !== "object" || Array.isArray(result)) throw new Error("评分结果必须是 JSON 对象");
+  const candidates = [fenced ? fenced[1] : trimmed];
+  const start = trimmed.indexOf("{");
+  const end = trimmed.lastIndexOf("}");
+  if (start >= 0 && end > start) candidates.push(trimmed.slice(start, end + 1));
+  let result: Record<string, unknown> | undefined;
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) { result = parsed as Record<string, unknown>; break; }
+    } catch { /* 换下一个候选片段继续解析。 */ }
+  }
+  if (!result) throw new Error("评分模型未返回有效 JSON，请重新评分");
   const validScore = (score: unknown): score is number => typeof score === "number" && Number.isFinite(score) && score >= 0 && score <= 100;
   if (!validScore(result.score)) throw new Error("评分必须是 0–100 之间的有限数值");
   if (typeof result.summary !== "string" || !result.summary.trim()) throw new Error("评分必须说明实际依据");
