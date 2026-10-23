@@ -1,14 +1,16 @@
 import { useEffect, useState } from "react";
-import { Field, Switch } from "./ui";
+import { Field, NumberInput, Panel, Switch } from "./ui";
 import { ModelPicker } from "./ModelPicker";
 import { ImageModelPool } from "./ImageModelPool";
+import { JurySettings } from "./JurySettings";
 import { availableImageModelIds, defaultImageConnection, IMAGE_API_LABELS, resolveImageApiMode } from "../lib/imageModels";
-import { useConfig, useGallery, useToast } from "../lib/store";
+import { channelReady, useConfig, useGallery, useToast } from "../lib/store";
 import { backgroundTaskStatus, configureBackgroundTasks, listModels } from "../lib/api";
 import { openLocalPath } from "../lib/shell";
 import { isAndroid, isDesktop } from "../lib/platform";
 import type { ChatProtocol, ImageApiMode, ThemeMode } from "../types";
 import { normalizeTheme, THEME_LABELS } from "../lib/theme";
+import { codeRuntimeSettings } from "../lib/codeRuntime";
 
 export function SettingsView() {
   const cfg = useConfig((s) => s.config);
@@ -59,10 +61,9 @@ export function SettingsView() {
     <div className="settings">
       <div className="settings-inner">
         {isAndroid && (
-          <div className="card">
-            <div className="card-title">后台与锁屏任务</div>
+          <Panel title="后台与锁屏任务" className="settings-panel">
             <div className="hint" style={{ marginBottom: 10 }}>
-              对话、生图和回图检查运行期间会显示任务通知。为减少熄屏后网络被系统暂停，请允许应用忽略电池优化，并开启任务通知。
+              锁屏继续任务需允许忽略电池优化，并开启任务通知。
             </div>
             <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
               <span className="chip">锁屏运行：{background ? background.batteryOptimizationIgnored ? "已允许" : "待允许" : "读取中"}</span>
@@ -71,14 +72,10 @@ export function SettingsView() {
             <button type="button" className="btn" onClick={() => void configureBackgroundTasks().catch((err: Error) => note("error", err.message))}>
               {!background?.batteryOptimizationIgnored ? "允许锁屏继续运行" : !background.notificationsEnabled ? "开启任务通知" : "后台权限设置"}
             </button>
-          </div>
+          </Panel>
         )}
         {/* ---------------- 对话模型 ---------------- */}
-        <div className="card">
-          <div className="card-title">
-            💬 对话模型
-            <span className="tag">用于聊天、看图、优化提示词</span>
-          </div>
+        <Panel title="💬 对话模型" defaultOpen={!channelReady("chat")} className="settings-panel">
           <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
             <Field label="接口协议">
               <select className="input" value={cfg.chat.protocol ?? "openai"}
@@ -90,7 +87,7 @@ export function SettingsView() {
             </Field>
             <Field
               label="Base URL"
-              hint={cfg.chat.protocol === "gemini" ? "填写 Gemini 服务地址，如 https://generativelanguage.googleapis.com/v1beta，支持兼容的原生网关。" : cfg.chat.protocol === "anthropic" ? "填写 Anthropic 服务地址，如 https://api.anthropic.com；请求 /v1/messages。" : "填到 /v1 或不填都可以，也支持完整 /chat/completions 端点。"}
+              hint={cfg.chat.protocol === "gemini" ? "Gemini 地址需包含 /v1beta" : cfg.chat.protocol === "anthropic" ? "使用 Messages 接口" : "支持根地址、/v1 或完整接口地址"}
             >
               <input
                 className="input"
@@ -100,7 +97,7 @@ export function SettingsView() {
                 onBlur={() => void flush()}
               />
             </Field>
-            <Field label="API Key" hint="仅保存在本机应用数据目录的 config.json 中，不会上传到任何第三方。">
+            <Field label="API Key" hint="保存在本机；请求时发送给所配置服务。">
               <input
                 className="input"
                 type="password"
@@ -127,7 +124,8 @@ export function SettingsView() {
                 onChange={(model) => patchChat({ model })} onBlur={() => void flush()} />
             </Field>
 
-            <Field label="系统提示词" hint="决定助手的角色与行为。留空则不发送 system 消息。">
+            <Panel title="高级参数">
+            <Field label="系统提示词" hint="留空不发送 system 消息">
               <textarea
                 className="textarea"
                 style={{ minHeight: 110 }}
@@ -141,9 +139,7 @@ export function SettingsView() {
               <Field
                 label="采样温度"
                 hint={
-                  cfg.chat.temperature === null
-                    ? "当前不下发该参数。gpt-5.6 等推理模型拒绝 temperature，需要时再打开。"
-                    : "数值越低越稳定，越高越发散。"
+                  cfg.chat.temperature === null ? "部分模型不支持该参数" : "越低越稳定，越高越发散"
                 }
               >
                 <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
@@ -175,19 +171,17 @@ export function SettingsView() {
               </Field>
               <Field
                 label="最大输出 Tokens"
-                hint="若网关要求新命名，会自动改用 max_completion_tokens 重试。"
               >
-                <input
+                <NumberInput
                   className="input"
-                  type="number"
                   min={64}
                   max={200000}
                   value={cfg.chat.maxTokens}
-                  onChange={(e) => patchChat({ maxTokens: Number(e.target.value) || 4096 })}
+                  onValueChange={(maxTokens) => patchChat({ maxTokens })}
                   onBlur={() => void flush()}
                 />
               </Field>
-              <Field label="流式输出" hint="关闭后一次性返回完整回答。">
+              <Field label="流式输出">
                 <Switch
                   checked={cfg.chat.stream}
                   onChange={(v) => {
@@ -198,29 +192,25 @@ export function SettingsView() {
                 />
               </Field>
               <Field label="请求超时（秒）">
-                <input
+                <NumberInput
                   className="input"
-                  type="number"
                   min={30}
                   max={1800}
                   value={cfg.chat.timeoutSecs}
-                  onChange={(e) => patchChat({ timeoutSecs: Number(e.target.value) || 300 })}
+                  onValueChange={(timeoutSecs) => patchChat({ timeoutSecs })}
                   onBlur={() => void flush()}
                 />
               </Field>
             </div>
+            </Panel>
           </div>
-        </div>
+        </Panel>
 
         {/* ---------------- 图像模型 ---------------- */}
-        <div className="card">
-          <div className="card-title">
-            🎨 图像模型
-            <span className="tag">用于文生图 / 图生图 / 局部重绘</span>
-          </div>
+        <Panel title="🎨 图像模型" defaultOpen={!channelReady("image")} className="settings-panel">
           <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
             <div className="grid-2">
-              <Field label="Base URL" hint={cfg.image.apiMode === "gemini" ? "Gemini 原生地址，如 https://generativelanguage.googleapis.com/v1beta。" : "可以和对话模型不同，完全独立配置。"}>
+              <Field label="Base URL" hint={cfg.image.apiMode === "gemini" ? "Gemini 地址需包含 /v1beta" : undefined}>
                 <input
                   className="input"
                   value={cfg.image.baseUrl}
@@ -260,7 +250,7 @@ export function SettingsView() {
 
             <Field
               label="默认接口类型"
-              hint={`当前默认模型使用 ${IMAGE_API_LABELS[defaultImageConnection(cfg.image).apiMode]}。自动按模型 ID 与服务地址预判，模型池中的单独配置优先。`}
+              hint={`当前：${IMAGE_API_LABELS[defaultImageConnection(cfg.image).apiMode]}`}
             >
               <select
                 className="input"
@@ -270,7 +260,7 @@ export function SettingsView() {
                   void flush();
                 }}
               >
-                <option value="auto">自动识别 · 根据模型 ID 和服务地址</option>
+                <option value="auto">自动识别</option>
                 <option value="images">images —— 标准图像接口</option>
                 <option value="gemini">Gemini 原生 · Generate Content</option>
                 <option value="chat">chat —— 多模态对话出图</option>
@@ -283,6 +273,7 @@ export function SettingsView() {
                 onChange={(modelPool) => patchImage({ modelPool })} onBlur={() => void flush()} />
             </Field>
 
+            <Panel title="默认生成参数">
             <div className="grid-2">
               <Field label="默认尺寸">
                 <input
@@ -293,13 +284,12 @@ export function SettingsView() {
                 />
               </Field>
               <Field label="默认数量">
-                <input
+                <NumberInput
                   className="input"
-                  type="number"
                   min={1}
                   max={10}
                   value={cfg.image.n}
-                  onChange={(e) => patchImage({ n: Number(e.target.value) || 1 })}
+                  onValueChange={(n) => patchImage({ n })}
                   onBlur={() => void flush()}
                 />
               </Field>
@@ -307,27 +297,23 @@ export function SettingsView() {
 
             <Field
               label="请求超时（秒）"
-              hint="gpt-image-2.5 这类模型单张可能超过 2 分钟，建议 600 秒以上。"
+              hint="慢速模型可适当延长超时"
             >
-              <input
+              <NumberInput
                 className="input"
-                type="number"
                 min={30}
                 max={3600}
                 value={cfg.image.timeoutSecs}
-                onChange={(e) => patchImage({ timeoutSecs: Number(e.target.value) || 600 })}
+                onValueChange={(timeoutSecs) => patchImage({ timeoutSecs })}
                 onBlur={() => void flush()}
               />
             </Field>
+            </Panel>
           </div>
-        </div>
+        </Panel>
 
         {/* ---------------- 联动 ---------------- */}
-        <div className="card">
-          <div className="card-title">
-            🔗 对话 ⇄ 图像 联动
-            <span className="tag">两个模型如何互相调用</span>
-          </div>
+        <Panel title="🔗 图像联动" className="settings-panel">
           <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
             <Switch
               checked={cfg.linkage.enabled}
@@ -343,7 +329,7 @@ export function SettingsView() {
                 patchLinkage({ useTools: v });
                 void flush();
               }}
-              label="允许对话模型直接调用图像工具（function calling）"
+              label="允许对话模型调用图像工具"
             />
             <Switch
               checked={cfg.linkage.autoOptimizePrompt}
@@ -351,11 +337,11 @@ export function SettingsView() {
                 patchLinkage({ autoOptimizePrompt: v });
                 void flush();
               }}
-              label="出图前自动用对话模型润色提示词"
+              label="生成前自动优化提示词"
             />
             <Field
               label="视觉 / 提示词模型"
-              hint="留空则沿用上面的对话模型。反推图片、图片优化时会用这个模型（需要支持视觉输入）。"
+              hint="留空使用对话模型；需支持看图"
             >
               <input
                 className="input"
@@ -382,13 +368,23 @@ export function SettingsView() {
               />
             </Field>
           </div>
-        </div>
+        </Panel>
+
+        <JurySettings />
+        <Panel title={`代码图像编辑${cfg.codeRuntime?.enabled ? " · 已开启" : ""}`} className="settings-panel">
+          <div className="settings-stack">
+            <Switch checked={codeRuntimeSettings(cfg.codeRuntime).enabled} label="允许 Chat 使用内置 JavaScript 修改图片"
+              onChange={(enabled) => { useConfig.getState().patchCodeRuntime({ enabled }); void flush(); }} />
+            <Field label="单次执行上限（秒）"><NumberInput className="input" aria-label="代码执行上限（秒）" min={1} max={30}
+              value={codeRuntimeSettings(cfg.codeRuntime).timeoutSecs} onValueChange={(timeoutSecs) => useConfig.getState().patchCodeRuntime({ timeoutSecs })} onBlur={() => void flush()} /></Field>
+            <p className="hint">不开放网络、文件或应用接口；支持停止。请仅为可信模型开启，无法硬限任意 JS 内存分配。结果不自动入库。</p>
+          </div>
+        </Panel>
 
         {/* ---------------- 界面 ---------------- */}
-        <div className="card">
-          <div className="card-title">🖥 界面</div>
+        <Panel title="🖥 界面" className="settings-panel">
           <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-            <Field label="主题" hint="跟随系统会随设备外观自动切换；顶部也可快速切换。">
+            <Field label="主题">
               <select className="input" aria-label="界面主题" value={normalizeTheme(cfg.ui.theme)}
                 onChange={(e) => { patchUi({ theme: e.target.value as ThemeMode }); void flush(); }}>
                 {Object.entries(THEME_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
@@ -400,15 +396,15 @@ export function SettingsView() {
                 patchUi({ sendOnEnter: v });
                 void flush();
               }}
-              label="Enter 发送（关闭后用 Ctrl/⌘ + Enter 发送）"
+              label="Enter 发送（Shift + Enter 换行）"
             />
+            <div className="hint">Ctrl / ⌘ + Enter 发送；回复中为插话，普通 Enter 为排队。</div>
           </div>
-        </div>
+        </Panel>
 
         {/* ---------------- 数据 ---------------- */}
-        <div className="card">
-          <div className="card-title">🗂 数据与存储</div>
-          <Field label="应用数据目录" hint="配置、对话历史与图库原图都保存在这里。">
+        <Panel title="🗂 数据与存储" className="settings-panel">
+          <Field label="应用数据目录" hint="配置、对话、生成结果与已入库图片">
             <input className="input" value={dir} readOnly />
           </Field>
           <div className="row" style={{ marginTop: 12 }}>
@@ -434,10 +430,10 @@ export function SettingsView() {
             </button>
           </div>
           <div className="hint" style={{ marginTop: 10 }}>
-            提示：API Key 以明文存放在 config.json 中。请勿把该文件分享给他人；在共享电脑上使用后建议清空。
-            {!isDesktop && " 安卓端图片保存在应用私有目录，卸载应用会一并删除。"}
+            API Key 明文保存在 config.json，请勿分享该文件。
+            {!isDesktop && " 卸载会删除应用私有数据，请先保存需要保留的图片。"}
           </div>
-        </div>
+        </Panel>
       </div>
     </div>
   );

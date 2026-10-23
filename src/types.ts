@@ -57,6 +57,30 @@ export interface LinkageConfig {
   reverseSystemPrompt: string;
 }
 
+export interface JuryMemberConfig {
+  id: string;
+  name: string;
+  enabled: boolean;
+  model: string;
+  inheritChat: boolean;
+  protocol: ChatProtocol;
+  baseUrl: string;
+  apiKey: string;
+  focus: string;
+  models: string[];
+}
+
+export interface JuryConfig {
+  enabled: boolean;
+  includeChat: boolean;
+  members: JuryMemberConfig[];
+}
+
+export interface CodeRuntimeConfig {
+  enabled: boolean;
+  timeoutSecs: number;
+}
+
 export type ThemeMode = "system" | "light" | "dark";
 
 export interface UiConfig {
@@ -70,6 +94,9 @@ export interface AppConfig {
   chat: ChatConfig;
   image: ImageConfig;
   linkage: LinkageConfig;
+  /** 旧配置缺失时默认关闭；不会自动增加模型请求。 */
+  jury?: JuryConfig;
+  codeRuntime?: CodeRuntimeConfig;
   ui: UiConfig;
 }
 
@@ -131,6 +158,20 @@ export interface GeneratedRef {
   prompt: string;
   size?: string;
   model?: string;
+  kind?: GalleryKind;
+  createdAt?: number;
+  parentId?: string | null;
+  revisedPrompt?: string | null;
+}
+
+export type SendMode = "send" | "interrupt" | "queue";
+
+export interface QueuedMessage {
+  id: string;
+  text: string;
+  attachments: ChatAttachment[];
+  createdAt: number;
+  mode: "interrupt" | "queue";
 }
 
 export type ChatRole = "user" | "assistant" | "tool";
@@ -159,6 +200,34 @@ export interface GoalProgress {
   checks?: GoalCheck[];
 }
 
+export interface JuryOpinion {
+  memberId: string;
+  name: string;
+  model: string;
+  status: "pending" | "complete" | "error" | "stopped";
+  text?: string;
+  error?: string;
+}
+
+export interface JuryReview {
+  imageIds: string[];
+  opinions: JuryOpinion[];
+  status: "reviewing" | "complete" | "partial" | "failed" | "stopped";
+  createdAt: number;
+}
+
+export interface CodeExecution {
+  language: "javascript";
+  code: string;
+  description: string;
+  sourceLabels: string[];
+  status: "running" | "complete" | "error" | "stopped";
+  logs: string[];
+  elapsedMs?: number;
+  outputSizes?: string[];
+  error?: string;
+}
+
 export interface ChatMessage {
   id: string;
   role: ChatRole;
@@ -176,6 +245,8 @@ export interface ChatMessage {
   usage?: Record<string, unknown> | null;
   goalReview?: GoalReview;
   goalProgress?: GoalProgress;
+  juryReview?: JuryReview;
+  codeExecution?: CodeExecution;
 }
 
 export interface ChatSession {
@@ -186,6 +257,8 @@ export interface ChatSession {
   updatedAt: number;
   draftText?: string;
   draftAtts?: ChatAttachment[];
+  queuedMessages?: QueuedMessage[];
+  queuePaused?: boolean;
   /** 空值表示让 Chat 从已启用的模型池中选择。 */
   imageModel?: string;
   goal?: GoalSettings;

@@ -76,11 +76,15 @@ export function conversationMessages(messages: ChatMessage[]): unknown[] {
   return [...out, ...feedback];
 }
 
-export function imageToolInstructions(messages: ChatMessage[]): string {
+export function imageCatalogInstructions(messages: ChatMessage[]): string {
   const catalog = messages.flatMap((m, i) => imageSources(m).map((image) => `消息 ${i + 1} · ${image.label}`));
+  return `可用图片：\n${catalog.join("\n") || "暂无图片"}`;
+}
+
+export function imageToolInstructions(messages: ChatMessage[]): string {
   return `严格执行用户最新要求，保留指定文字、语言、数量、主体关系、构图与禁止项；不要擅自添加风格或元素。
 需要保留、修改或组合素材时使用 edit_image，并通过 source_image_ids 明确选择全部所需图片，按用户要求的顺序排列。
 素材编号按各条消息里的展示顺序，从 1 开始；图片 ID 是唯一引用。图像请求中的输入顺序与你选择的 ID 顺序一致。
 编辑时明确哪些部分改变、哪些部分保持。工具成功返回实际图像后才能宣称已完成。工具失败时如实说明。
-可用图片：\n${catalog.join("\n") || "暂无图片"}`;
+${imageCatalogInstructions(messages)}`;
 }

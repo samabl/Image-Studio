@@ -208,7 +208,6 @@ async fn set_native_theme(app: AppHandle, theme: String, mode: String) -> AppRes
 #[tauri::command]
 async fn generate_image(
     app: AppHandle,
-    lock: State<'_, GalleryLock>,
     request: ImageRequest,
     parent_id: Option<String>,
     request_id: Option<String>,
@@ -246,7 +245,7 @@ async fn generate_image(
         streams.finish(id);
     }
     let images = result?;
-    gallery::save_images(&app, &lock, &meta, images)
+    gallery::save_outputs(&app, &meta, images)
 }
 
 #[cfg(test)]
@@ -281,6 +280,15 @@ mod request_tests {
 #[tauri::command]
 fn gallery_list(app: AppHandle) -> Vec<GalleryItem> {
     gallery::list(&app)
+}
+
+#[tauri::command]
+fn gallery_archive(
+    app: AppHandle,
+    lock: State<'_, GalleryLock>,
+    item: GalleryItem,
+) -> AppResult<GalleryItem> {
+    gallery::archive(&app, &lock, item)
 }
 
 #[tauri::command]
@@ -330,6 +338,17 @@ fn save_data_url(
         source_url: None,
     };
     gallery::save_images(&app, &lock, &meta, vec![raw])
+}
+
+/// 内置代码编辑结果持久化；只有用户明确入库时才创建图库副本。
+#[tauri::command]
+fn save_image_outputs(
+    app: AppHandle,
+    data_urls: Vec<String>,
+    meta: SaveMeta,
+) -> AppResult<Vec<GalleryItem>> {
+    let images = gallery::parse_code_outputs(data_urls)?;
+    gallery::save_outputs(&app, &meta, images)
 }
 
 /// 读取本地图片文件为 data URL（拖拽导入 / 文件选择器导入用）。
@@ -386,11 +405,13 @@ pub fn run() {
             set_native_theme,
             generate_image,
             gallery_list,
+            gallery_archive,
             gallery_delete,
             gallery_clear,
             gallery_export,
             read_image_data_url,
             save_data_url,
+            save_image_outputs,
             import_image_file,
         ])
         .run(tauri::generate_context!())

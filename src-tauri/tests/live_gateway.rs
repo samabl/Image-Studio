@@ -272,18 +272,43 @@ async fn chat_image_review_roundtrip() {
     });
     let mut req = chat_req(&cfg, "请调用 generate_image 生成一张白色背景、单个红苹果的图片。调用前用包含粗体的简短中文说明，完成后检查实际图片，勿重复生图。");
     req.max_tokens = Some(2048);
-    req.tool_choice = Some(serde_json::json!({ "type": "function", "function": { "name": "generate_image" } }));
+    req.tool_choice =
+        Some(serde_json::json!({ "type": "function", "function": { "name": "generate_image" } }));
     req.tools = Some(vec![serde_json::json!({ "type": "function", "function": {
         "name": "generate_image", "description": "根据用户要求生成图片", "parameters": {
             "type": "object", "properties": { "prompt": { "type": "string" } }, "required": ["prompt"]
         }
     } })]);
-    ai::chat_stream(req.clone(), channel, std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
-        .await.expect("对话工具调用失败");
+    ai::chat_stream(
+        req.clone(),
+        channel,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .await
+    .expect("对话工具调用失败");
     let (explanation, calls) = {
         let events = events.lock().unwrap();
-        let explanation: String = events.iter().filter_map(|ev| if let ChatEvent::Delta { text } = ev { Some(text.as_str()) } else { None }).collect();
-        let calls: Vec<ai::ToolCall> = events.iter().filter_map(|ev| if let ChatEvent::ToolCalls { calls } = ev { Some(calls.clone()) } else { None }).flatten().collect();
+        let explanation: String = events
+            .iter()
+            .filter_map(|ev| {
+                if let ChatEvent::Delta { text } = ev {
+                    Some(text.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let calls: Vec<ai::ToolCall> = events
+            .iter()
+            .filter_map(|ev| {
+                if let ChatEvent::ToolCalls { calls } = ev {
+                    Some(calls.clone())
+                } else {
+                    None
+                }
+            })
+            .flatten()
+            .collect();
         (explanation, calls)
     };
     assert_eq!(calls.len(), 1, "预期只调用一次生图工具");
@@ -293,7 +318,8 @@ async fn chat_image_review_roundtrip() {
         "baseUrl": cfg.base, "apiKey": cfg.key, "model": cfg.image_model,
         "apiMode": std::env::var("GIS_TEST_IMAGE_MODE").unwrap_or_else(|_| "images".into()),
         "prompt": args["prompt"], "images": [], "n": 1, "size": "1024x1024", "timeoutSecs": 600
-    })).unwrap();
+    }))
+    .unwrap();
     let images = ai::run_image_request(&image_req).await.expect("生图失败");
     assert_eq!(images.len(), 1);
     assert!(images[0].bytes.len() > 1024);
@@ -314,8 +340,19 @@ async fn chat_image_review_roundtrip() {
     assert!(!review.trim().is_empty());
     let output = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/live-image-review");
     std::fs::create_dir_all(&output).unwrap();
-    std::fs::write(output.join("responses.json"), serde_json::to_vec(&serde_json::json!({ "explanation": explanation, "review": review })).unwrap()).unwrap();
-    println!("{} -> {} -> 回图检查完成；图片 {} bytes，检查文本 {} chars", cfg.chat_model, cfg.image_model, images[0].bytes.len(), review.chars().count());
+    std::fs::write(
+        output.join("responses.json"),
+        serde_json::to_vec(&serde_json::json!({ "explanation": explanation, "review": review }))
+            .unwrap(),
+    )
+    .unwrap();
+    println!(
+        "{} -> {} -> 回图检查完成；图片 {} bytes，检查文本 {} chars",
+        cfg.chat_model,
+        cfg.image_model,
+        images[0].bytes.len(),
+        review.chars().count()
+    );
 }
 
 /// 兼容性兜底：故意发一个模型不支持的参数，请求应当自动降级并成功。

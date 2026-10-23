@@ -89,7 +89,7 @@ export function GalleryView() {
         <Empty
           icon="🖼"
           title={items.length === 0 ? "图库还是空的" : "该分类下没有图片"}
-          hint="生成或编辑的图片会自动归档到这里，文件保存在应用数据目录中。"
+          hint="在生成结果或对话图片上选择「加入图库」"
         />
       ) : (
         <div className="scroll">

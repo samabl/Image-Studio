@@ -1,10 +1,12 @@
 import { create } from "zustand";
 import * as api from "./api";
 import { renderMask, uid, type Stroke } from "./image";
-import { attachmentLabel, conversationMessages, imageToolInstructions, selectImageSources, userImageContent } from "./chat";
+import { attachmentLabel, conversationMessages, imageCatalogInstructions, imageToolInstructions, selectImageSources, userImageContent } from "./chat";
 import { canEditImageModel, configuredImageModels, defaultImageConnection, imageModelConnection, imageModelInstructions, selectImageModel } from "./imageModels";
 import { imageToolSize } from "./imageSize";
-import { goalInstructions, goalReviewTool, goalSettings, imageFailureMessage, parseGoalReview } from "./goal";
+import { GOAL_LEVELS, goalInstructions, goalReviewTool, goalSettings, imageFailureMessage, parseGoalReview } from "./goal";
+import { juryFeedback, juryInstructions, juryMembers, juryReviewTool, jurySafeText, jurySettings, startJuryReview } from "./jury";
+import { codeImageInstructions, codeImageTool, codeRuntimeSettings, startCodeEdit } from "./codeRuntime";
 import type {
   AppConfig,
   ChatAttachment,
@@ -20,6 +22,12 @@ import type {
   GoalProgress,
   GoalSettings,
   ImageRequest,
+  QueuedMessage,
+  SendMode,
+  JuryConfig,
+  JuryReview,
+  CodeRuntimeConfig,
+  CodeExecution,
 } from "../types";
 
 // ---------------------------------------------------------------------------
@@ -71,6 +79,8 @@ interface ConfigState {
   patchChat: (patch: Partial<ChatConfig>) => void;
   patchImage: (patch: Partial<ImageConfig>) => void;
   patchLinkage: (patch: Partial<LinkageConfig>) => void;
+  patchJury: (patch: Partial<JuryConfig>) => void;
+  patchCodeRuntime: (patch: Partial<CodeRuntimeConfig>) => void;
   patchUi: (patch: Partial<UiConfig>) => void;
   flush: () => Promise<void>;
   resetAll: () => Promise<void>;
@@ -113,6 +123,8 @@ export const useConfig = create<ConfigState>((set, get) => {
     patchChat: (patch) => apply((c) => ({ ...c, chat: { ...c.chat, ...patch } })),
     patchImage: (patch) => apply((c) => ({ ...c, image: { ...c.image, ...patch } })),
     patchLinkage: (patch) => apply((c) => ({ ...c, linkage: { ...c.linkage, ...patch } })),
+    patchJury: (patch) => apply((c) => ({ ...c, jury: { ...jurySettings(c.jury), ...patch } })),
+    patchCodeRuntime: (patch) => apply((c) => ({ ...c, codeRuntime: codeRuntimeSettings({ ...codeRuntimeSettings(c.codeRuntime), ...patch }) })),
     patchUi: (patch) => apply((c) => ({ ...c, ui: { ...c.ui, ...patch } })),
 
     flush: async () => {
@@ -156,18 +168,22 @@ interface GalleryState {
   items: GalleryItem[];
   loading: boolean;
   selected: string[];
+  archiving: string[];
   refresh: () => Promise<void>;
   add: (items: GalleryItem[]) => void;
+  archive: (item: GalleryItem) => Promise<GalleryItem>;
   remove: (ids: string[]) => Promise<void>;
   clear: () => Promise<void>;
   toggleSelect: (id: string) => void;
   clearSelection: () => void;
 }
 
+const archiveRequests = new Map<string, Promise<GalleryItem>>();
 export const useGallery = create<GalleryState>((set, get) => ({
   items: [],
   loading: false,
   selected: [],
+  archiving: [],
 
   refresh: async () => {
     set({ loading: true });
@@ -180,7 +196,24 @@ export const useGallery = create<GalleryState>((set, get) => ({
     }
   },
 
-  add: (items) => set({ items: [...items, ...get().items] }),
+  add: (items) => set({ items: [...items, ...get().items.filter((old) => !items.some((item) => item.id === old.id))] }),
+
+  archive: async (item) => {
+    const existing = get().items.find((saved) => saved.id === item.id);
+    if (existing) return existing;
+    const pending = archiveRequests.get(item.id);
+    if (pending) return pending;
+    set({ archiving: [...get().archiving, item.id] });
+    const request = api.galleryArchive(item).then((saved) => {
+      get().add([saved]);
+      return saved;
+    }).finally(() => {
+      archiveRequests.delete(item.id);
+      set({ archiving: get().archiving.filter((id) => id !== item.id) });
+    });
+    archiveRequests.set(item.id, request);
+    return request;
+  },
 
   remove: async (ids) => {
     await api.galleryDelete(ids);
@@ -388,8 +421,8 @@ export const useStudio = create<StudioState>((set, get) => ({
       );
       studioCancel = request.cancel;
       const items = await request.promise;
+      if (studioStopped) return;
       set({ results: items, note: "" });
-      useGallery.getState().add(items);
       toast.success(`已生成 ${items.length} 张图片`);
     } catch (err) {
       if (studioStopped) { set({ note: "已停止" }); return; }
@@ -581,14 +614,20 @@ interface SessionState {
   clearDraftAtts: () => void;
   setImageModel: (model: string) => void;
   setGoal: (patch: Partial<GoalSettings>) => void;
-  send: (text: string, attachments: ChatAttachment[]) => Promise<void>;
+  send: (text: string, attachments: ChatAttachment[], mode?: SendMode) => Promise<void>;
+  removeQueued: (id: string) => void;
+  clearQueue: () => void;
+  pauseQueue: () => void;
+  resumeQueue: () => Promise<void>;
+  /** 当前任务完成后只推进它所属会话的队列。 */
+  advanceQueue: (sessionId: string) => Promise<void>;
   stop: (sessionId?: string) => void;
   regenerate: () => Promise<void>;
 }
 
 function newSessionObj(): ChatSession {
   const now = Date.now();
-  return { id: uid("sess"), title: "新对话", messages: [], createdAt: now, updatedAt: now, draftText: "", draftAtts: [] };
+  return { id: uid("sess"), title: "新对话", messages: [], createdAt: now, updatedAt: now, draftText: "", draftAtts: [], queuedMessages: [], queuePaused: false };
 }
 
 // 串行保存快照，避免并发会话较旧的快照覆盖较新的历史。
@@ -685,6 +724,27 @@ export const useSessions = create<SessionState>((set, get) => {
     if (draftSaveTimer) clearTimeout(draftSaveTimer);
     draftSaveTimer = setTimeout(() => { draftSaveTimer = null; void get().persist(); }, 500);
   };
+  const canSend = (session: ChatSession) => {
+    if (!channelReady("chat")) { toast.error("请先配置对话模型"); return false; }
+    const linkage = useConfig.getState().config?.linkage;
+    if (goalSettings(session.goal).enabled && (!linkage?.enabled || !linkage.useTools) && !codeRuntimeSettings(useConfig.getState().config?.codeRuntime).enabled) {
+      toast.error("Goal 模式需要启用图像工具或内置 JS 编辑"); return false;
+    }
+    const cfg = useConfig.getState().config;
+    if (cfg?.jury?.enabled && !juryMembers(cfg).length) {
+      toast.error("请先添加并启用评审模型，或让 Chat 参与评审"); return false;
+    }
+    return true;
+  };
+  const startMessage = async (sessionId: string, text: string, attachments: ChatAttachment[], clearDraft: boolean) => {
+    const userMsg: ChatMessage = { id: uid("m"), role: "user", content: text, attachments, createdAt: Date.now() };
+    set((state) => ({ sessions: state.sessions.map((s) => s.id === sessionId ? {
+      ...s, title: s.messages.length ? s.title : text.trim().slice(0, 24) || "图片对话",
+      messages: [...s.messages, userMsg], ...(clearDraft ? { draftText: "", draftAtts: [] } : {}), updatedAt: Date.now(),
+    } : s) }));
+    void get().persist();
+    await runTurn(sessionId, set, get);
+  };
   return {
     sessions: [], currentId: null, runs: {},
     setDraftText: (draftText, sessionId) => draft({ draftText }, sessionId),
@@ -715,7 +775,22 @@ export const useSessions = create<SessionState>((set, get) => {
         if (raw) {
           const parsed = JSON.parse(raw) as { sessions: ChatSession[]; currentId: string | null };
           if (Array.isArray(parsed.sessions) && parsed.sessions.length) {
-            set({ sessions: parsed.sessions, currentId: parsed.sessions.some((s) => s.id === parsed.currentId) ? parsed.currentId : parsed.sessions[0].id });
+            // 重启后恢复待发送内容，但不擅自继续付费请求。
+            const sessions = parsed.sessions.map((s) => ({ ...s, queuePaused: s.queuedMessages?.length ? true : s.queuePaused,
+              messages: s.messages.map((message) => {
+                const interrupted = message.juryReview?.status === "reviewing";
+                const juryReview: JuryReview | undefined = interrupted ? { ...message.juryReview!, status: "stopped",
+                  opinions: message.juryReview!.opinions.map((opinion) => opinion.status === "pending" ? { ...opinion, status: "stopped" } : opinion),
+                } : message.juryReview;
+                const codeInterrupted = message.codeExecution?.status === "running";
+                return message.pending || interrupted || codeInterrupted ? { ...message, pending: false,
+                  content: `${message.content || "应用重启，未完成的工具调用已停止。"}${interrupted ? "\n评审已因应用重启停止，请重新评审。" : ""}`,
+                  ...(juryReview ? { juryReview } : {}),
+                  ...(codeInterrupted ? { codeExecution: { ...message.codeExecution!, status: "stopped" as const, error: "应用重启，代码执行已停止" } } : {}),
+                } : message;
+              }),
+            }));
+            set({ sessions, currentId: sessions.some((s) => s.id === parsed.currentId) ? parsed.currentId : sessions[0].id });
             return;
           }
         }
@@ -754,25 +829,53 @@ export const useSessions = create<SessionState>((set, get) => {
       void get().persist();
     },
     current: () => get().sessions.find((s) => s.id === get().currentId) ?? null,
+    removeQueued: (id) => {
+      draft({ queuedMessages: (get().current()?.queuedMessages ?? []).filter((message) => message.id !== id) });
+      void get().persist();
+    },
+    clearQueue: () => { draft({ queuedMessages: [] }); void get().persist(); },
+    pauseQueue: () => { draft({ queuePaused: true }); void get().persist(); },
+    resumeQueue: async () => {
+      const session = get().current();
+      if (!session || !canSend(session)) return;
+      draft({ queuePaused: false });
+      void get().persist();
+      await get().advanceQueue(session.id);
+    },
+    advanceQueue: async (sessionId) => {
+      const session = get().sessions.find((s) => s.id === sessionId);
+      const next = session?.queuedMessages?.[0];
+      if (!session || !next || session.queuePaused || get().runs[sessionId]) return;
+      if (!canSend(session)) { draft({ queuePaused: true }, sessionId); void get().persist(); return; }
+      draft({ queuedMessages: session.queuedMessages!.slice(1) }, sessionId);
+      await startMessage(sessionId, next.text, next.attachments, false);
+    },
     stop: (id) => {
       const sessionId = id ?? get().currentId;
       if (!sessionId) return;
+      // 停止是停止整个自动发送流程；队列保留，等待用户继续。
+      draft({ queuePaused: true }, sessionId);
       get().runs[sessionId]?.cancel?.();
-    },
-    send: async (text, attachments) => {
-      const session = get().current();
-      if (!session || get().runs[session.id]) return;
-      if (!channelReady("chat")) { toast.error("请先配置对话模型"); return; }
-      if (goalSettings(session.goal).enabled && (!useConfig.getState().config?.linkage.enabled || !useConfig.getState().config?.linkage.useTools)) {
-        toast.error("Goal 模式需要在设置中启用图像联动和工具调用"); return;
-      }
-      const userMsg: ChatMessage = { id: uid("m"), role: "user", content: text, attachments, createdAt: Date.now() };
-      set({ sessions: get().sessions.map((s) => s.id === session.id ? {
-        ...s, title: s.messages.length ? s.title : text.trim().slice(0, 24) || "图片对话",
-        messages: [...s.messages, userMsg], draftText: "", draftAtts: [], updatedAt: Date.now(),
-      } : s) });
       void get().persist();
-      await runTurn(session.id, set, get);
+    },
+    send: async (text, attachments, mode = "send") => {
+      const session = get().current();
+      if (!session || (!text.trim() && !attachments.length)) return;
+      const busy = Boolean(get().runs[session.id]);
+      if (busy && mode === "send") return;
+      if (!canSend(session)) return;
+      const copied = attachments.map((attachment) => ({ ...attachment }));
+      if (mode !== "send") {
+        const next: QueuedMessage = { id: uid("queued"), text: text.trim(), attachments: copied, createdAt: Date.now(), mode };
+        const queue = session.queuedMessages ?? [];
+        draft({ queuedMessages: mode === "interrupt" ? [next, ...queue] : [...queue, next], queuePaused: mode === "interrupt" ? false : session.queuePaused ?? false, draftText: "", draftAtts: [] }, session.id);
+        void get().persist();
+        // 插话先结束旧轮（含未完成的工具响应），再优先发送，避免破坏工具调用顺序。
+        if (mode === "interrupt" && busy) get().runs[session.id]?.cancel?.();
+        if (!busy) await get().advanceQueue(session.id);
+        return;
+      }
+      await startMessage(session.id, text.trim(), copied, true);
     },
     regenerate: async () => {
       const session = get().current();
@@ -795,6 +898,8 @@ async function runTurn(sessionId: string, set: Setter, get: () => SessionState):
   const initialSession = get().sessions.find((session) => session.id === sessionId);
   const pinnedImageModel = initialSession?.imageModel ?? "";
   const goal = goalSettings(initialSession?.goal);
+  const jury = jurySettings(cfg.jury);
+  const codeRuntime = codeRuntimeSettings(cfg.codeRuntime);
   const original = [...(initialSession?.messages ?? [])].reverse().find((m) => m.role === "user")?.content ?? "";
   const maxRounds = goal.enabled ? 6 + goal.maxCorrections * 3 : MAX_TOOL_ROUNDS;
   const maxImageCalls = goal.enabled ? 4 + goal.maxCorrections * 4 : 16;
@@ -819,6 +924,38 @@ async function runTurn(sessionId: string, set: Setter, get: () => SessionState):
   const update = (id: string, patch: Partial<ChatMessage>) => set((state) => ({ sessions: state.sessions.map((s) => s.id === sessionId ? { ...s, messages: s.messages.map((m) => m.id === id ? { ...m, ...patch } : m) } : s) }));
   const syncGoal = () => { if (goal.enabled) patchRun({ goalProgress: { ...progress } }); };
   const endGoal = (status: GoalProgress["status"], summary: string) => { progress.status = status; progress.summary = summary; terminal = true; syncGoal(); };
+  const reviewImages = async (toolId: string, sources: ReturnType<typeof selectImageSources>, text: string,
+    prompt = "", references: ReturnType<typeof selectImageSources> = [], focus = "") => {
+    let report: JuryReview;
+    try {
+      patchRun({ toolNote: "正在读取评审图片…" });
+      const images = await Promise.all(sources.map(async (source) => ({ ...source,
+        dataUrl: source.dataUrl || (source.path ? await api.readImageDataUrl(source.path) : ""),
+      })));
+      if (!active()) throw new Error("已停止");
+      patchRun({ toolNote: `评审团 · ${juryMembers(cfg).length} 位评审正在独立看图…` });
+      const task = startJuryReview(cfg, {
+        requirements: (readSession()?.messages ?? []).filter((message) => message.role === "user")
+          .map((message, index) => `用户消息 ${index + 1}：${message.content}`).join("\n\n"),
+        prompt, images, references, focus, goal: goal.enabled ? GOAL_LEVELS[goal.level].description : undefined,
+      }, api.cancellableText, (juryReview) => {
+        if (get().runs[sessionId]?.runId !== runId) return;
+        update(toolId, { juryReview });
+        void get().persist();
+      });
+      abort = task.cancel;
+      if (stopped) task.cancel();
+      report = await task.promise;
+      abort = null;
+    } catch (error) {
+      abort = null;
+      report = { imageIds: sources.map((source) => source.id), status: stopped ? "stopped" : "failed", createdAt: Date.now(),
+        opinions: [{ memberId: "jury_input", name: "图片读取", model: "", status: stopped ? "stopped" : "error", error: jurySafeText(error, cfg) }],
+      };
+    }
+    update(toolId, { pending: false, content: `${text}\n${juryFeedback(report)}`, juryReview: report });
+    if (active()) patchRun({ toolNote: "评审完成，正在交给 Chat 汇总…" });
+  };
   const background = api.startBackgroundTask();
   try {
     if (background) await background.ready;
@@ -826,7 +963,8 @@ async function runTurn(sessionId: string, set: Setter, get: () => SessionState):
       const session = readSession();
       if (!session) break;
       if (goal.enabled && !terminal && round === maxRounds) endGoal("limit", "已达到自动执行轮次上限，目标尚未完成验收。");
-      const useTools = cfg.linkage.enabled && cfg.linkage.useTools && round < maxRounds && !terminal;
+      const imageToolsEnabled = cfg.linkage.enabled && cfg.linkage.useTools;
+      const useTools = (imageToolsEnabled || jury.enabled || codeRuntime.enabled) && round < maxRounds && !terminal;
       const history = conversationMessages(session.messages);
       const messageId = uid("m");
       patchRun({ streaming: { messageId, content: "", reasoning: "", toolCalls: [] }, toolNote: round ? "正在检查图像结果…" : "" });
@@ -846,12 +984,15 @@ async function runTurn(sessionId: string, set: Setter, get: () => SessionState):
           messages: [
             ...(cfg.chat.systemPrompt.trim() ? [{ role: "system", content: cfg.chat.systemPrompt }] : []),
             ...(cfg.linkage.enabled && cfg.linkage.useTools ? [{ role: "system", content: `${imageToolInstructions(session.messages)}\n\n${imageModelInstructions(cfg.image, pinnedImageModel)}` }] : []),
+            ...(!imageToolsEnabled && (jury.enabled || codeRuntime.enabled) ? [{ role: "system", content: imageCatalogInstructions(session.messages) }] : []),
+            ...(jury.enabled ? [{ role: "system", content: juryInstructions }] : []),
+            ...(codeRuntime.enabled ? [{ role: "system", content: `${codeImageInstructions}\n本次代码超时上限：${codeRuntime.timeoutSecs} 秒。` }] : []),
             ...(goal.enabled ? [{ role: "system", content: `${goalInstructions(goal, progress.corrections)}${terminal ? `\n自动执行已结束：${progress.summary}。诚实总结已完成成果和未解决问题，不再调用工具。` : ""}` }] : []),
             ...history,
             ...(continuation ? [{ role: "user", content: continuation }] : []),
           ],
           temperature: cfg.chat.temperature, maxTokens: cfg.chat.maxTokens,
-          tools: useTools ? [...imageTools(cfg.image, pinnedImageModel), ...(goal.enabled ? [goalReviewTool] : [])] : null, timeoutSecs: cfg.chat.timeoutSecs,
+          tools: useTools ? [...(imageToolsEnabled ? imageTools(cfg.image, pinnedImageModel) : []), ...(goal.enabled ? [goalReviewTool] : []), ...(jury.enabled ? [juryReviewTool] : []), ...(codeRuntime.enabled ? [codeImageTool] : [])] : null, timeoutSecs: cfg.chat.timeoutSecs,
         }, (event) => {
           if (settled || !active()) return;
           const cur = get().runs[sessionId]?.streaming;
@@ -893,10 +1034,61 @@ async function runTurn(sessionId: string, set: Setter, get: () => SessionState):
         const toolId = uid("m");
         append({ id: toolId, role: "tool", content: "", toolCallId: call.id, pending: true, createdAt: Date.now() });
         let prepared: PreparedImage | undefined;
+        let codeExecution: CodeExecution | undefined;
         try {
           if (!active()) throw new Error("已停止");
           if (terminal) { update(toolId, { pending: false, content: "Goal 自动执行已经结束，此调用未执行。" }); continue; }
           const args = JSON.parse(call.arguments || "{}") as Record<string, unknown>;
+          if (call.name === "edit_image_code") {
+            if (!codeRuntime.enabled) throw new Error("当前未启用代码图像编辑");
+            if (typeof args.code !== "string" || !args.code.trim() || typeof args.description !== "string" || !args.description.trim()) throw new Error("代码编辑必须包含代码和处理说明");
+            if (!Array.isArray(args.source_image_ids) || !args.source_image_ids.length || args.source_image_ids.length > 4) throw new Error("请选择 1–4 张实际输入图片 ID");
+            if (args.stage !== undefined && args.stage !== "asset" && args.stage !== "final") throw new Error("代码图像阶段无效");
+            const imageStage = args.stage === "asset" ? "asset" : "final";
+            const sources = selectImageSources(readSession()?.messages ?? [], args.source_image_ids);
+            const sourceLabels = sources.map((source) => source.label);
+            codeExecution = { language: "javascript", code: args.code, description: args.description.trim(), sourceLabels, status: "running", logs: [] };
+            update(toolId, { codeExecution });
+            update(messageId, { toolCalls: readSession()?.messages.find((message) => message.id === messageId)?.toolCalls?.map((tc) => tc.id === call.id ? { ...tc, sourceLabels, imageStage } : tc) });
+            if (progress.attempts >= maxImageCalls) { if (goal.enabled) endGoal("limit", "已达到图像调用保护上限。"); throw new Error("已达到本轮图像调用上限"); }
+            if (goal.enabled && lastFinalIds.length && !inCorrection) {
+              if (progress.corrections >= goal.maxCorrections) { endGoal("limit", "已达到修正上限，未执行代码修改。"); throw new Error("已达到 Goal 修正上限"); }
+              progress.corrections += 1; inCorrection = true;
+            }
+            progress.attempts += 1; syncGoal();
+            patchRun({ toolNote: "内置 JS · 正在处理图片…" });
+            const inputs = await Promise.all(sources.map(async (source) => ({ ...source, dataUrl: source.dataUrl || (source.path ? await api.readImageDataUrl(source.path) : "") })));
+            if (!active()) throw new Error("已停止");
+            const task = startCodeEdit(inputs, args.code, codeRuntime);
+            abort = task.cancel;
+            if (stopped) task.cancel();
+            const output = await task.promise;
+            abort = null;
+            if (!active()) throw new Error("已停止");
+            const items = await api.saveImageOutputs(output.dataUrls, { kind: "edit", prompt: codeExecution.description, model: "builtin-js", size: "auto", parentId: sources[0]?.galleryId ?? null });
+            if (!active()) throw new Error("已停止");
+            if (!items.length) throw new Error("代码没有返回实际图片");
+            codeExecution = { ...codeExecution, status: "complete", logs: output.logs.map((log) => jurySafeText(log, cfg)), elapsedMs: output.elapsedMs, outputSizes: output.sizes };
+            update(toolId, { pending: false, content: `代码已处理 ${items.length} 张图片：${codeExecution.description}`, codeExecution,
+              images: items.map((item) => ({ galleryId: item.id, path: item.path, dataUrl: item.dataUrl ?? undefined, prompt: item.prompt, size: item.size, model: item.model,
+                kind: item.kind, createdAt: item.createdAt, parentId: item.parentId, revisedPrompt: item.revisedPrompt })),
+            });
+            if (imageStage === "final") { lastFinalIds = items.map((item) => `image_${item.id}`); inCorrection = false; }
+            if (jury.enabled && imageStage === "final") {
+              update(toolId, { pending: true });
+              await reviewImages(toolId, items.map((item, index) => ({ id: `image_${item.id}`, label: `代码结果 ${index + 1}（图片 ID：image_${item.id}）`, path: item.path, dataUrl: item.dataUrl ?? undefined })),
+                `代码已处理 ${items.length} 张图片：${codeExecution.description}`, codeExecution.description, inputs);
+            }
+            continue;
+          }
+          if (call.name === "review_images") {
+            if (!jury.enabled) throw new Error("当前未启用评审团");
+            if (!Array.isArray(args.source_image_ids) || !args.source_image_ids.length) throw new Error("请选择实际图片 ID");
+            const sources = selectImageSources(readSession()?.messages ?? [], args.source_image_ids);
+            if (sources.length > 4) throw new Error("一次最多评审 4 张图片");
+            await reviewImages(toolId, sources, `评审 ${sources.length} 张已有图片。`, "", [], typeof args.focus === "string" ? args.focus : "");
+            continue;
+          }
           if (call.name === "review_goal") {
             if (!goal.enabled) throw new Error("当前会话未开启 Goal 模式");
             const review = parseGoalReview(args);
@@ -953,17 +1145,25 @@ async function runTurn(sessionId: string, set: Setter, get: () => SessionState):
           if (stopped) abort();
           const items = await request.promise;
           abort = null;
+          if (!active()) throw new Error("已停止");
           if (!items.length) throw new Error("服务没有返回图片");
           if (imageStage === "final") { lastFinalIds = items.map((item) => `image_${item.id}`); inCorrection = false; }
-          useGallery.getState().add(items);
           update(toolId, { pending: false, content: `已生成 ${items.length} 张${imageStage === "asset" ? "中间素材，请继续剩余生成/合成步骤" : "图片"}。`, images: items.map((item) => ({
             galleryId: item.id, path: item.path, dataUrl: item.dataUrl ?? undefined, prompt: item.prompt, size: item.size, model: item.model,
+            kind: item.kind, createdAt: item.createdAt, parentId: item.parentId, revisedPrompt: item.revisedPrompt,
           })) });
+          if (jury.enabled && imageStage === "final") {
+            update(toolId, { pending: true });
+            await reviewImages(toolId, items.map((item, index) => ({ id: `image_${item.id}`, label: `结果图 ${index + 1}（图片 ID：image_${item.id}）`, path: item.path, dataUrl: item.dataUrl ?? undefined })),
+              `已生成 ${items.length} 张图片。`, imageRequest.prompt,
+              (imageRequest.images ?? []).map((dataUrl, index) => ({ id: `reference_${index}`, label: sourceLabels[index] ?? `素材 ${index + 1}`, dataUrl })));
+          }
         } catch (err) {
           abort = null;
-          const error = stopped ? "已停止" : imageFailureMessage(err, cfg.image);
+          const error = stopped ? "已停止" : jurySafeText(imageFailureMessage(err, cfg.image), cfg);
           if (prepared && !stopped && !terminal) failedRequests.set(call.id, prepared);
-          update(toolId, { pending: false, content: `执行失败：${error}${!stopped && !terminal && call.name !== "review_goal" ? `\n${JSON.stringify({ failed_call_id: call.id, model: prepared?.request.model, retry_available: !!prepared, enabled_models: configuredImageModels(cfg.image).map((model) => model.id), decision: "由 Chat 分析错误，决定使用 retry_image 重试同一模型、选择其他启用模型，或说明无法继续；不能丢失原始要求和素材。" })}` : ""}` });
+          if (codeExecution) update(toolId, { codeExecution: { ...codeExecution, status: stopped ? "stopped" : "error", error } });
+          update(toolId, { pending: false, content: `执行失败：${error}${!stopped && !terminal && call.name !== "review_goal" && call.name !== "review_images" && call.name !== "edit_image_code" ? `\n${JSON.stringify({ failed_call_id: call.id, model: prepared?.request.model, retry_available: !!prepared, enabled_models: configuredImageModels(cfg.image).map((model) => model.id), decision: "由 Chat 分析错误，决定使用 retry_image 重试同一模型、选择其他启用模型，或说明无法继续；不能丢失原始要求和素材。" })}` : ""}` });
           if (!stopped) toast.error(error);
         }
       }
@@ -984,6 +1184,7 @@ async function runTurn(sessionId: string, set: Setter, get: () => SessionState):
       set((state) => { const runs = { ...state.runs }; delete runs[sessionId]; return { runs }; });
     }
     void get().persist();
+    void get().advanceQueue(sessionId);
   }
 }
 

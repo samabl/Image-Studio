@@ -1,20 +1,26 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Markdown } from "./Markdown";
-import { Empty, FileImage, Spinner } from "./ui";
+import { Empty, FileImage, NumberInput, Panel, Spinner } from "./ui";
 import { showImage } from "./Overlays";
 import { useConfig, useSessions, useStudio, useToast, channelReady } from "../lib/store";
 import { fileToAttachment } from "../lib/image";
+import { readImageDataUrl } from "../lib/api";
 import { SaveImageButton } from "./SaveImageButton";
+import { AddToGalleryButton } from "./AddToGalleryButton";
 import { ImageToolDetails } from "./ImageToolDetails";
 import { configuredImageModels } from "../lib/imageModels";
 import { GOAL_LEVELS, goalSettings } from "../lib/goal";
 import { GoalReport } from "./GoalReport";
-import type { ChatAttachment, ChatMessage, GeneratedRef, GoalLevel } from "../types";
+import { JuryReport } from "./JuryReport";
+import { CodeExecutionReport } from "./CodeExecutionReport";
+import { juryMembers } from "../lib/jury";
+import { generatedGalleryItem } from "../lib/gallery";
+import type { ChatAttachment, ChatMessage, GeneratedRef, GoalLevel, SendMode } from "../types";
 
 const SUGGESTIONS = [
-  "帮我画一只在雨夜街头的赛博朋克猫，霓虹灯反射在积水上",
-  "把上一张图改成清晨暖色调，并加上咖啡杯",
-  "先聊聊这张海报的构图，再决定要不要出图",
+  "画一只雨夜霓虹街头的猫",
+  "把上一张图改成暖色清晨",
+  "先分析图片构图",
 ];
 
 export function ChatView() {
@@ -67,13 +73,14 @@ export function ChatView() {
   const imageModels = cfg ? configuredImageModels(cfg.image) : [];
   const selectedImageModel = session?.imageModel ?? "";
   const goal = goalSettings(session?.goal);
-  const toolsReady = !!cfg?.linkage.enabled && !!cfg.linkage.useTools;
+  const toolsReady = (!!cfg?.linkage.enabled && !!cfg.linkage.useTools) || !!cfg?.codeRuntime?.enabled;
+  const queued = session?.queuedMessages ?? [];
+  const canSubmit = ready && (!!text.trim() || atts.length > 0);
 
-  const submit = () => {
+  const submit = (mode: SendMode = busy ? "queue" : "send") => {
     const value = text.trim();
     if (!value && atts.length === 0) return;
-    if (busy) return;
-    void useSessions.getState().send(value, atts);
+    void useSessions.getState().send(value, atts, mode);
   };
 
   const onPickFiles = async (files: FileList | null) => {
@@ -118,27 +125,24 @@ export function ChatView() {
             {cfg.chat.model || "未配置模型"}
           </span>
         )}
-        {cfg?.linkage.enabled && cfg.linkage.useTools && (
-          <span className="chip accent" title="对话模型可直接调用图像模型">
-            图像联动已开
-          </span>
-        )}
       </div>
 
-      {cfg?.linkage.enabled && cfg.linkage.useTools && (
+      <div className="chat-secondary">
+      {session && <Panel key={session.id} title={<><span>对话选项</span>{goal.enabled && <span className="chip accent">Goal · {GOAL_LEVELS[goal.level].label}</span>}</>} className="chat-options">
+      {toolsReady && (
         <div className="chat-image-model">
           <label htmlFor="chat-image-model">生图模型</label>
           <select id="chat-image-model" className="input" value={selectedImageModel} disabled={busy}
             onChange={(e) => useSessions.getState().setImageModel(e.target.value)}>
-            <option value="">自动 · Chat 从 {imageModels.length} 个模型中选择</option>
-            {selectedImageModel && !imageModels.some((model) => model.id === selectedImageModel) && <option value={selectedImageModel}>{selectedImageModel}（已从模型池移除，请重选）</option>}
+            <option value="">自动选择（{imageModels.length} 个模型）</option>
+            {selectedImageModel && !imageModels.some((model) => model.id === selectedImageModel) && <option value={selectedImageModel}>{selectedImageModel}（不可用）</option>}
             {imageModels.map((model) => <option key={model.id} value={model.id}>{model.id}</option>)}
           </select>
-          <button type="button" className="btn sm ghost" onClick={() => useConfig.getState().setTab("settings")}>配置模型池</button>
+          <button type="button" className="btn sm ghost" onClick={() => useConfig.getState().setTab("settings")}>配置模型</button>
         </div>
       )}
 
-      {session && <div className="chat-goal">
+      <div className="chat-goal">
         <button type="button" role="switch" aria-checked={goal.enabled} className={`btn sm goal-toggle${goal.enabled ? " active" : ""}`}
           disabled={busy || (!toolsReady && !goal.enabled)}
           onClick={() => useSessions.getState().setGoal({ enabled: !goal.enabled })}>Goal 自动修正</button>
@@ -147,39 +151,33 @@ export function ChatView() {
             onChange={(e) => { const level = e.target.value as GoalLevel; useSessions.getState().setGoal({ level, maxCorrections: GOAL_LEVELS[level].corrections }); }}>
             {Object.entries(GOAL_LEVELS).map(([value, entry]) => <option key={value} value={value}>{entry.label}</option>)}
           </select></label>
-          <label>最多修正<input className="input" type="number" min={0} max={20} aria-label="Goal 最多修正次数" disabled={busy} value={goal.maxCorrections}
-            onChange={(e) => useSessions.getState().setGoal({ maxCorrections: e.target.valueAsNumber })} /></label>
-          <span className="hint" title={GOAL_LEVELS[goal.level].description}>检查实际回图后自主修正；失败时由 Chat 决定重试或换模型。</span>
+          <label>最多修正<NumberInput className="input" min={0} max={20} aria-label="Goal 最多修正次数" disabled={busy} value={goal.maxCorrections}
+            onValueChange={(maxCorrections) => useSessions.getState().setGoal({ maxCorrections })} /></label>
         </>}
-        {!toolsReady && <span className="hint">请先在设置中启用图像联动和工具调用。</span>}
-      </div>}
-      {run?.goalProgress && <div className="goal-running"><GoalReport progress={run.goalProgress} /></div>}
+        {!toolsReady && <span className="hint">需启用图像工具或内置 JS</span>}
+      </div>
+      {cfg?.jury?.enabled && <div className="chat-feature-status"><span className="chip">评审团 · {juryMembers(cfg).length} 位</span>
+        <button type="button" className="btn sm ghost" onClick={() => useConfig.getState().setTab("settings")}>配置评审</button></div>}
+      {cfg?.codeRuntime?.enabled && <span className="chip">内置 JS 图像编辑</span>}
+      </Panel>}
+      {run?.goalProgress && <Panel title={`Goal 进度 · 修正 ${run.goalProgress.corrections}/${run.goalProgress.maxCorrections}`} className="goal-running"><GoalReport progress={run.goalProgress} /></Panel>}
 
       {showSessions && (
-        <div
-          style={{
-            display: "flex",
-            gap: 8,
-            padding: "10px 16px",
-            overflowX: "auto",
-            borderBottom: "1px solid var(--border-soft)",
-            background: "var(--bg-elev)",
-          }}
-        >
+        <div className="session-list" aria-label="历史会话">
           {sessions.map((s) => (
             <div
               key={s.id}
               className={`session-pill${s.id === currentId ? " active" : ""}`}
-              onClick={() => {
+            >
+              <button type="button" className="session-select" onClick={() => {
                 useSessions.getState().selectSession(s.id);
                 setShowSessions(false);
-              }}
-            >
-              <span className="t">{s.title || "新对话"}</span>
-              {runs[s.id] && <Spinner />}
+              }}><span className="t">{s.title || "新对话"}</span>{runs[s.id] && <Spinner />}</button>
               {sessions.length > 1 && (
-                <span
-                  role="button"
+                <button
+                  type="button"
+                  className="session-delete"
+                  aria-label={`删除会话 ${s.title || "新对话"}`}
                   title="删除"
                   style={{ opacity: 0.6 }}
                   onClick={(e) => {
@@ -188,12 +186,13 @@ export function ChatView() {
                   }}
                 >
                   ✕
-                </span>
+                </button>
               )}
             </div>
           ))}
         </div>
       )}
+      </div>
 
       {/* 消息区 */}
       <div className="messages" ref={scrollRef}>
@@ -203,8 +202,8 @@ export function ChatView() {
             title={ready ? "开始一段对话" : "还没有配置对话模型"}
             hint={
               ready
-                ? "可以直接聊天，也可以让它出图。开启「图像联动」后，模型会自己调用图像模型并把结果贴回对话里。"
-                : "请到「设置 → 对话模型」填入 Base URL、API Key 和模型名。"
+                ? undefined
+                : "在设置中配置对话模型"
             }
           >
             {ready && (
@@ -259,6 +258,19 @@ export function ChatView() {
       {/* 输入区 */}
       <div className="composer">
         <div className="composer-inner">
+          {queued.length > 0 && <Panel title={<><span>待发送 {queued.length}</span><span className="chip">{session?.queuePaused ? "已暂停" : "按序发送"}</span></>} className="queue-panel">
+            <div className="queue-actions">
+              <button type="button" className="btn sm ghost" onClick={() => session?.queuePaused ? void useSessions.getState().resumeQueue() : useSessions.getState().pauseQueue()}>
+                {session?.queuePaused ? "继续队列" : "暂停队列"}
+              </button>
+              <button type="button" className="btn sm ghost" onClick={() => useSessions.getState().clearQueue()}>清空</button>
+            </div>
+            <ol className="queue-list">{queued.map((message) => <li key={message.id}>
+              {message.mode === "interrupt" && <span className="chip accent">插话</span>}
+              <span className="queue-text" title={message.text}>{message.text || "图片消息"}{message.attachments.length > 0 && ` · ${message.attachments.length} 张图片`}</span>
+              <button type="button" className="btn sm ghost" aria-label={`移除待发送消息 ${message.text || "图片消息"}`} onClick={() => useSessions.getState().removeQueued(message.id)}>✕</button>
+            </li>)}</ol>
+          </Panel>}
           {!ready && (
             <div className="err" style={{ marginBottom: 9, marginTop: 0 }}>
               对话模型尚未配置完整，请先前往「设置」。
@@ -292,7 +304,7 @@ export function ChatView() {
               value={text}
               placeholder={
                 ready
-                  ? "说点什么，或直接描述你想要的画面…（Shift + Enter 换行）"
+                  ? busy ? "继续输入，可排队或插话…" : "输入消息…"
                   : "请先配置对话模型"
               }
               onChange={(e) => setText(e.target.value)}
@@ -310,10 +322,10 @@ export function ChatView() {
               onKeyDown={(e) => {
                 if (e.nativeEvent.isComposing) return;
                 const sendOnEnter = cfg?.ui.sendOnEnter ?? true;
-                if (e.key === "Enter" && !e.shiftKey && sendOnEnter) {
+                if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
                   e.preventDefault();
-                  submit();
-                } else if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+                  submit(busy ? "interrupt" : "send");
+                } else if (e.key === "Enter" && !e.shiftKey && sendOnEnter) {
                   e.preventDefault();
                   submit();
                 }
@@ -339,7 +351,10 @@ export function ChatView() {
               >
                 🖼 图片
               </button>
-              {busy ? (
+              <div className="grow" />
+              {busy ? <>
+                <button type="button" className="btn sm" disabled={!canSubmit} onClick={() => submit("queue")} title="当前任务结束后发送（Enter）">排队发送</button>
+                <button type="button" className="btn sm primary" disabled={!canSubmit} onClick={() => submit("interrupt")} title="停止当前回复，优先发送（Ctrl / ⌘ + Enter）">插话发送</button>
                 <button
                   type="button"
                   className="btn sm danger"
@@ -347,17 +362,16 @@ export function ChatView() {
                 >
                   ■ 停止
                 </button>
-              ) : (
+              </> : (
                 <button
                   type="button"
                   className="btn sm primary"
-                  disabled={!ready || (!text.trim() && atts.length === 0)}
-                  onClick={submit}
+                  disabled={!canSubmit}
+                  onClick={() => submit()}
                 >
                   发送 ↵
                 </button>
               )}
-              <div className="grow" />
               {session && session.messages.length > 0 && !busy && (
                 <button
                   type="button"
@@ -396,7 +410,7 @@ function MessageRow({ message, live }: { message: ChatMessage; live?: boolean })
             {message.pending ? (
               <span style={{ color: "var(--text-dim)" }}>正在调用图像模型…</span>
             ) : message.goalReview ? <GoalReport review={message.goalReview} /> : (
-              <Markdown source={message.content} />
+              <Markdown source={message.juryReview ? message.content.split("\n评审团意见（")[0] : message.content} />
             )}
             {imgs.length > 0 && <GeneratedImages images={imgs} />}
           </div>
@@ -448,13 +462,15 @@ function MessageRow({ message, live }: { message: ChatMessage; live?: boolean })
 
           {message.toolCalls && message.toolCalls.length > 0 && !live && (
             <div className="image-tool-list">
-              {message.toolCalls.filter((tc) => tc.name !== "review_goal").map((tc) => (
+              {message.toolCalls.filter((tc) => tc.name !== "review_goal" && tc.name !== "review_images" && tc.name !== "edit_image_code").map((tc) => (
                 <ImageToolDetails key={tc.id} call={tc} labels={tc.sourceLabels} sentPrompt={tc.sentPrompt} />
               ))}
             </div>
           )}
 
           {message.images && message.images.length > 0 && <GeneratedImages images={message.images} />}
+          {message.juryReview && <JuryReport review={message.juryReview} />}
+          {message.codeExecution && <CodeExecutionReport execution={message.codeExecution} />}
 
           {message.error && <div className="err">{message.error}</div>}
         </div>
@@ -466,7 +482,15 @@ function MessageRow({ message, live }: { message: ChatMessage; live?: boolean })
 function GeneratedImages({ images }: { images: GeneratedRef[] }) {
   return (
     <div className="gen-grid">
-      {images.map((img) => (
+      {images.map((img) => {
+        const item = generatedGalleryItem(img);
+        const edit = (mode: "edit" | "generate") => void (async () => {
+          try {
+            const dataUrl = img.dataUrl || await readImageDataUrl(img.path);
+            useStudio.getState().sendToStudio({ dataUrl, galleryId: img.galleryId, prompt: img.prompt }, mode);
+          } catch (error) { useToast.getState().push("error", (error as Error).message); }
+        })();
+        return (
         <div className="gen-card" key={img.galleryId}>
           <FileImage
             dataUrl={img.dataUrl}
@@ -476,45 +500,21 @@ function GeneratedImages({ images }: { images: GeneratedRef[] }) {
               showImage({
                 dataUrl: img.dataUrl,
                 path: img.path,
+                item,
                 title: `${img.model ?? ""} ${img.size ?? ""}`.trim(),
               })
             }
           />
           <div className="gen-actions">
-            <SaveImageButton image={{ dataUrl: img.dataUrl, path: img.path }} />
-            <button
-              type="button"
-              className="btn sm ghost"
-              onClick={() =>
-                useStudio.getState().sendToStudio(
-                  {
-                    dataUrl: img.dataUrl ?? "",
-                    galleryId: img.galleryId,
-                    prompt: img.prompt,
-                  },
-                  "edit",
-                )
-              }
-              title="以这张图为参考图，进入图像工作室继续修改"
-            >
-              ✎ 送去编辑
-            </button>
-            <button
-              type="button"
-              className="btn sm ghost"
-              onClick={() =>
-                useStudio.getState().sendToStudio(
-                  { dataUrl: img.dataUrl ?? "", galleryId: img.galleryId, prompt: img.prompt },
-                  "generate",
-                )
-              }
-              title="以这张图为灵感做变体"
-            >
-              ✨ 做变体
-            </button>
+            <AddToGalleryButton item={item} />
+            <SaveImageButton image={{ item, dataUrl: img.dataUrl, path: img.path }} />
           </div>
+          <details className="image-more"><summary>更多</summary><div className="image-more-actions">
+            <button type="button" className="btn sm ghost" onClick={() => edit("edit")}>✎ 继续编辑</button>
+            <button type="button" className="btn sm ghost" onClick={() => edit("generate")}>✨ 做变体</button>
+          </div></details>
         </div>
-      ))}
+      ); })}
     </div>
   );
 }

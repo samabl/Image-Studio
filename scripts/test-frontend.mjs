@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import ts from "typescript";
+import vm from "node:vm";
 
 const compile = async (path, imports = {}) => {
   let code = ts.transpileModule(await readFile(new URL(`../${path}`, import.meta.url), "utf8"), {
@@ -17,8 +18,33 @@ const imageModelsUrl = await compile("src/lib/imageModels.ts");
 const imageModels = await import(imageModelsUrl);
 const imageSizeUrl = await compile("src/lib/imageSize.ts");
 const goalUrl = await compile("src/lib/goal.ts");
+const juryUrl = await compile("src/lib/jury.ts", { "./chat": chatUrl });
+const jury = await import(juryUrl);
+const codeWorkerSource = await readFile(new URL("../src/lib/codeWorker.js", import.meta.url), "utf8");
+const codeWorkerUrl = `data:text/javascript,${encodeURIComponent(`export default ${JSON.stringify(codeWorkerSource)};`)}`;
+const codeRuntimeUrl = await compile("src/lib/codeRuntime.ts", { "./codeWorker.js?raw": codeWorkerUrl });
+const codeRuntime = await import(codeRuntimeUrl);
+const codeMockUrl = `data:text/javascript,${encodeURIComponent(`export { codeRuntimeSettings, codeImageTool, codeImageInstructions } from ${JSON.stringify(codeRuntimeUrl)}; export const startCodeEdit = (...args) => globalThis.__studioTestApi.startCodeEdit(...args);`)}`;
+const numberInput = await import(await compile("src/lib/numberInput.ts"));
+const preview = await import(await compile("src/lib/preview.ts"));
+const gallery = await import(await compile("src/lib/gallery.ts"));
 const attachment = (id) => ({ id, dataUrl: `data:image/png;base64,${Buffer.from(id).toString("base64")}`, name: `${id}.png` });
 const message = (role, extra = {}) => ({ id: `${role}_${Math.random()}`, role, content: "", createdAt: 1, ...extra });
+
+test("主按钮在鼠标悬停或移动端触摸后仍保留高对比背景", async () => {
+  const css = await readFile(new URL("../src/styles.css", import.meta.url), "utf8");
+  assert.match(css, /\.btn:not\(\.primary\):hover:not\(:disabled\)/);
+  assert.match(css, /\.btn\.primary\s*\{[^}]*background:\s*linear-gradient/);
+  assert.doesNotMatch(css, /\.btn:hover:not\(:disabled\)\s*\{[^}]*background:/);
+});
+
+test("设置开关保留键盘焦点与可访问的 switch 角色", async () => {
+  const css = await readFile(new URL("../src/styles.css", import.meta.url), "utf8");
+  const ui = await readFile(new URL("../src/components/ui.tsx", import.meta.url), "utf8");
+  assert.match(ui, /type="checkbox" role="switch"/);
+  assert.doesNotMatch(css, /\.switch input\s*\{[^}]*display:\s*none/);
+  assert.match(css, /\.switch input:focus-visible \+ \.track/);
+});
 
 test("多素材按展示顺序发送，文字标签与每张图片相邻", () => {
   const [m] = chat.toApiMessages(message("user", { content: "保留素材 1 的人物，使用素材 2 的背景", attachments: [attachment("a"), attachment("b")] }));
@@ -55,6 +81,10 @@ async function harness() {
   const streams = [];
   const imageCalls = [];
   const textCalls = [];
+  const codeCalls = [];
+  const outputSaves = [];
+  const archives = [];
+  let galleryItems = [];
   const saves = [];
   const backgroundTasks = [];
   const backgroundState = { enabled: false };
@@ -77,7 +107,7 @@ async function harness() {
       const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
       const call = { request, parentId, resolve, reject, canceled: false };
       imageCalls.push(call);
-      return { promise, cancel: () => { call.canceled = true; reject(new Error("已停止")); } };
+      return { promise, cancel: () => { call.canceled = true; if (!call.deferCancel) reject(new Error("已停止")); } };
     },
     readImageDataUrl: async () => attachment("disk").dataUrl,
     cancellableText: (request) => {
@@ -87,11 +117,31 @@ async function harness() {
       return { promise, cancel: () => { task.canceled = true; reject(new Error("已停止")); } };
     },
     chatOnce: async (request) => { api.onceRequest = request; return "优化后的提示词"; },
+    startCodeEdit: (sources, code, config) => {
+      let resolve, reject;
+      const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+      const task = { sources, code, config, resolve, reject, canceled: false }; codeCalls.push(task);
+      return { promise, cancel: () => { task.canceled = true; reject(new Error("已停止代码执行")); } };
+    },
+    saveImageOutputs: async (dataUrls, meta) => {
+      outputSaves.push({ dataUrls, meta });
+      return dataUrls.map((dataUrl, index) => ({ id: `code_${outputSaves.length}_${index}`, path: `outputs/code_${index}.png`, dataUrl,
+        kind: meta.kind, model: meta.model, prompt: meta.prompt, size: "100x100", parentId: meta.parentId, createdAt: 1 }));
+    },
+    galleryArchive: async (item) => {
+      archives.push(item);
+      const saved = { ...item, path: `gallery/${item.id}.png`, fileName: `${item.id}.png` };
+      if (!galleryItems.some((stored) => stored.id === item.id)) galleryItems.push(saved);
+      return saved;
+    },
+    galleryList: async () => galleryItems,
+    galleryDelete: async (ids) => { galleryItems = galleryItems.filter((item) => !ids.includes(item.id)); },
+    galleryClear: async () => { galleryItems = []; },
   };
   globalThis.__studioTestApi = api;
   const apiUrl = `data:text/javascript,${encodeURIComponent(Object.keys(api).map((name) => `export const ${name} = (...args) => globalThis.__studioTestApi.${name}(...args);`).join("\n"))}`;
   const imageUrl = await compile("src/lib/image.ts");
-  const storeUrl = await compile("src/lib/store.ts", { zustand: import.meta.resolve("zustand"), "./api": apiUrl, "./image": imageUrl, "./chat": chatUrl, "./imageModels": imageModelsUrl, "./imageSize": imageSizeUrl, "./goal": goalUrl });
+  const storeUrl = await compile("src/lib/store.ts", { zustand: import.meta.resolve("zustand"), "./api": apiUrl, "./image": imageUrl, "./chat": chatUrl, "./imageModels": imageModelsUrl, "./imageSize": imageSizeUrl, "./goal": goalUrl, "./jury": juryUrl, "./codeRuntime": codeMockUrl });
   const store = await import(`${storeUrl}#${++harnessId}`);
   store.useConfig.setState({ ready: true, config: {
     chat: { protocol: "openai", baseUrl: "https://example.test", apiKey: "test-key", model: "test-model", systemPrompt: "测试", maxTokens: 4096, temperature: null, timeoutSecs: 30, stream: true, models: [] },
@@ -99,11 +149,334 @@ async function harness() {
     linkage: { enabled: true, useTools: true, autoOptimizePrompt: false, visionModel: "", optimizeSystemPrompt: "优化", reverseSystemPrompt: "反推" }, ui: { sendOnEnter: true },
   } });
   await store.useSessions.getState().init();
-  return { ...store, streams, imageCalls, textCalls, saves, api, backgroundTasks, backgroundState };
+  return { ...store, streams, imageCalls, textCalls, codeCalls, outputSaves, archives, saves, api, backgroundTasks, backgroundState };
 }
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 const complete = (stream, text = "完成") => { stream.onEvent({ type: "delta", text }); stream.onEvent({ type: "done", finishReason: "stop" }); };
+
+const reviewer = (id, patch = {}) => ({ id, name: id, enabled: true, model: `vision-${id}`, inheritChat: true, protocol: "openai", baseUrl: "", apiKey: "", focus: "", models: [], ...patch });
+const withJury = (config, patch = {}) => ({ ...config, jury: { enabled: true, includeChat: false, members: [reviewer("a"),reviewer("b")], ...patch } });
+
+test("评审团默认关闭，Chat 可独立参与，每位成员使用自己的模型和连接", async () => {
+  const h = await harness(); const config = withJury(h.useConfig.getState().config, { includeChat: true, members: [reviewer("a"),reviewer("b", { inheritChat: false, protocol: "anthropic", baseUrl: "https://vision.test", apiKey: "vision-test-key" }),reviewer("disabled", { enabled: false })] });
+  config.linkage.visionModel = "not-the-chat-model";
+  assert.deepEqual(jury.jurySettings(), { enabled: false, includeChat: true, members: [] });
+  const members = jury.juryMembers(config);
+  assert.deepEqual(members.map((member) => member.model), [config.chat.model,"vision-a","vision-b"]);
+  assert.deepEqual(jury.juryConnection(members[2], config), { protocol: "anthropic", baseUrl: "https://vision.test", apiKey: "vision-test-key" });
+  assert.equal(jury.juryMembers({ ...config, jury: { ...config.jury, enabled: false } }).length, 0);
+  assert.equal(jury.juryMembers(withJury(config, { includeChat: true, members: Array.from({length:20}, (_, i) => reviewer(`${i}`)) })).length, 13);
+});
+
+test("每份评审请求包含原始约束和实际图片，不掺入其他评审意见", async () => {
+  const h = await harness(); const config = withJury(h.useConfig.getState().config);
+  const request = jury.juryRequest(reviewer("a", { focus: "检查文字" }), config, { requirements: "保留两个人", prompt: "保持数量", goal: "严格", focus: "检查边缘", references: [{id:"ref",label:"原图",dataUrl:attachment("ref").dataUrl}], images: [{id:"out",label:"结果",dataUrl:attachment("out").dataUrl}] });
+  assert.equal(request.tools, null); assert.equal(request.stream, false);
+  assert.deepEqual(request.messages[1].content.filter((part) => part.type === "image_url").map((part) => part.image_url.url), [attachment("ref").dataUrl,attachment("out").dataUrl]);
+  assert.match(request.messages[1].content[0].text, /保留两个人/); assert.match(request.messages[1].content[0].text, /检查文字/);
+  assert.ok(JSON.stringify(request.messages).includes("参考图 1")); assert.ok(JSON.stringify(request.messages).includes("待评审结果 1"));
+  assert.throws(() => jury.juryRequest(reviewer("a", { inheritChat: false, protocol: "toString", baseUrl: "x", apiKey: "x" }), config, { requirements: "", images: [{dataUrl:attachment("ref").dataUrl}] }), /协议/);
+});
+
+test("独立评审并行执行，单成员失败不阻断其余意见，保存前隐藏连接信息", async () => {
+  const h = await harness(); const config = withJury(h.useConfig.getState().config); const tasks = [], updates = [];
+  const review = jury.startJuryReview(config, { requirements: "两个人", images: [{id:"out",label:"结果",dataUrl:attachment("out").dataUrl}] }, (request) => {
+    let resolve, reject; const promise = new Promise((res, rej) => { resolve=res; reject=rej; });
+    tasks.push({request,resolve,reject}); return { promise, cancel: () => {} };
+  }, (report) => updates.push(report));
+  assert.equal(tasks.length, 2); assert.equal(updates[0].status, "reviewing");
+  tasks[0].reject(new Error(`HTTP error ${config.chat.baseUrl} Authorization: Bearer ${config.chat.apiKey}`)); await tick();
+  assert.equal(updates.at(-1).opinions[0].status, "error"); assert.equal(updates.at(-1).opinions[1].status, "pending");
+  tasks[1].resolve("符合数量，建议改善边缘"); const report = await review.promise;
+  assert.equal(report.status, "partial"); assert.equal(report.opinions[1].text, "符合数量，建议改善边缘");
+  assert.ok(!JSON.stringify(report).includes(config.chat.apiKey)); assert.ok(!JSON.stringify(report).includes(config.chat.baseUrl));
+  assert.equal(updates[0].opinions[0].status, "pending", "发布的是独立快照");
+});
+
+test("取消评审立即收束所有成员，迟到意见不能覆盖已停止状态", async () => {
+  const h = await harness(); const config = withJury(h.useConfig.getState().config); const tasks=[], updates=[];
+  const review = jury.startJuryReview(config, { requirements: "", images: [{id:"out",label:"结果",dataUrl:attachment("out").dataUrl}] }, () => {
+    let resolve; const promise = new Promise((res) => { resolve=res; }); const task={resolve,canceled:false}; tasks.push(task);
+    return { promise, cancel: () => { task.canceled=true; } };
+  }, (report) => updates.push(report));
+  review.cancel(); const report=await review.promise;
+  assert.equal(report.status, "stopped"); assert.ok(tasks.every((task) => task.canceled)); assert.ok(report.opinions.every((opinion) => opinion.status === "stopped"));
+  const count=updates.length; tasks.forEach((task) => task.resolve("迟到意见")); await tick(); assert.equal(updates.length, count);
+});
+
+test("最终成图自动评审，全部意见交给主 Chat 汇总而非增加另一轮总结请求", async () => {
+  const h=await harness(); h.useConfig.setState({config:withJury(h.useConfig.getState().config,{includeChat:true})});
+  const pending=h.useSessions.getState().send("两个人，保留文字",[attachment("ref")]);
+  callTool(h.streams[0],[{args:{prompt:"两个人，保留文字"}}]); await tick();
+  h.imageCalls[0].resolve([generated("out","image-test")]); await tick();
+  assert.equal(h.textCalls.length,3); assert.equal(h.streams.length,1);
+  assert.ok(h.textCalls.every((task) => JSON.stringify(task.request.messages).includes(attachment("out").dataUrl)));
+  assert.equal(h.textCalls[0].request.model,"test-model");
+  h.textCalls[0].resolve("Chat：人数正确"); h.textCalls[1].resolve("文字正确，边缘需修正"); await tick(); assert.equal(h.streams.length,1);
+  h.textCalls[2].reject(new Error("不支持看图")); await tick();
+  const tool=h.useSessions.getState().current().messages.find((message) => message.juryReview);
+  assert.equal(tool.juryReview.status,"partial"); assert.equal(tool.pending,false); assert.equal(tool.images.length,1);
+  assert.match(JSON.stringify(h.streams[1].request.messages),/文字正确，边缘需修正/);
+  assert.match(JSON.stringify(h.streams[1].request.messages),/不支持看图/);
+  assert.ok(JSON.stringify(h.streams[1].request.messages).includes(attachment("out").dataUrl));
+  assert.equal(h.useGallery.getState().items.length,0); assert.equal(h.archives.length,0);
+  complete(h.streams[1],"采纳边缘建议；评审失败不代表通过"); await pending;
+});
+
+test("中间素材不自动评审；手动评审可在关闭图像联动时使用历史图片", async () => {
+  const h=await harness(); const cfg=withJury(h.useConfig.getState().config); h.useConfig.setState({config:cfg});
+  const pending=h.useSessions.getState().send("生成素材",[]); callTool(h.streams[0],[{args:{prompt:"素材",stage:"asset"}}]); await tick();
+  h.imageCalls[0].resolve([generated("asset","image-test")]); await tick(); assert.equal(h.textCalls.length,0); complete(h.streams[1]); await pending;
+  h.useConfig.setState({config:{...cfg,linkage:{...cfg.linkage,enabled:false}}});
+  const review=h.useSessions.getState().send("只评审已有图",[]);
+  assert.deepEqual(h.streams[2].request.tools.map((tool) => tool.function.name),["review_images"]);
+  callTool(h.streams[2],[{name:"review_images",args:{source_image_ids:["image_asset"],focus:"检查构图"}}]); await tick();
+  assert.equal(h.imageCalls.length,1); assert.equal(h.textCalls.length,2);
+  h.textCalls.forEach((task) => task.resolve("构图合适")); await tick(); complete(h.streams[3]); await review;
+});
+
+test("停止评审保留已经生成的图片，取消每位评审且不再调用主 Chat", async () => {
+  const h=await harness();h.useConfig.setState({config:withJury(h.useConfig.getState().config)});
+  const pending=h.useSessions.getState().send("生成",[]);callTool(h.streams[0],[{args:{prompt:"生成"}}]);await tick();
+  h.imageCalls[0].resolve([generated("out","image-test")]);await tick();h.useSessions.getState().stop();await pending;
+  const tool=h.useSessions.getState().current().messages.find((message) => message.juryReview);
+  assert.equal(tool.juryReview.status,"stopped");assert.equal(tool.images.length,1);assert.equal(tool.pending,false);
+  assert.ok(h.textCalls.every((task) => task.canceled));assert.equal(h.streams.length,1);
+});
+
+const codeOutput = (id="pixels") => ({dataUrls:[attachment(id).dataUrl],sizes:["100x100"],logs:["已修改像素"],elapsedMs:2});
+test("Chat 代码编辑独立于图像 API，输入顺序、元数据和实际回图完整保留且不入库", async () => {
+  const h=await harness();const cfg=h.useConfig.getState().config;
+  h.useConfig.setState({config:{...cfg,linkage:{...cfg.linkage,enabled:false},codeRuntime:{enabled:true,timeoutSecs:7}}});
+  const pending=h.useSessions.getState().send("组合两张图",[attachment("a"),{...attachment("b"),galleryId:"base"}]);
+  assert.deepEqual(h.streams[0].request.tools.map((tool) => tool.function.name),["edit_image_code"]);
+  callTool(h.streams[0],[{name:"edit_image_code",args:{source_image_ids:["b","a"],description:"精确拼接",code:"return image.clone(images[0]);"}}]);await tick();
+  assert.deepEqual(h.codeCalls[0].sources.map((source) => source.id),["b","a"]);assert.equal(h.codeCalls[0].config.timeoutSecs,7);
+  h.codeCalls[0].resolve(codeOutput());await tick();
+  assert.equal(h.imageCalls.length,0);assert.equal(h.outputSaves[0].meta.model,"builtin-js");assert.equal(h.outputSaves[0].meta.parentId,"base");
+  const tool=h.useSessions.getState().current().messages.find((message) => message.codeExecution);
+  assert.equal(tool.codeExecution.status,"complete");assert.deepEqual(tool.codeExecution.outputSizes,["100x100"]);
+  assert.equal(tool.images[0].kind,"edit");assert.equal(tool.images[0].createdAt,1);assert.equal(tool.images[0].parentId,"base");
+  assert.ok(JSON.stringify(h.streams[1].request.messages).includes(attachment("pixels").dataUrl));
+  assert.equal(h.useGallery.getState().items.length,0);assert.equal(h.archives.length,0);
+  complete(h.streams[1]);await pending;
+});
+
+test("代码输出接入评审团，停止时保留代码成图并取消评审", async () => {
+  const h=await harness();const cfg=withJury(h.useConfig.getState().config);h.useConfig.setState({config:{...cfg,codeRuntime:{enabled:true,timeoutSecs:10}}});
+  const pending=h.useSessions.getState().send("绘制",[attachment("ref")]);callTool(h.streams[0],[{name:"edit_image_code",args:{source_image_ids:["ref"],description:"绘制",code:"return images[0];"}}]);await tick();
+  h.codeCalls[0].resolve(codeOutput());await tick();assert.equal(h.textCalls.length,2);assert.equal(h.streams.length,1);
+  h.useSessions.getState().stop();await pending;
+  const tool=h.useSessions.getState().current().messages.find((message) => message.codeExecution);
+  assert.equal(tool.codeExecution.status,"complete");assert.equal(tool.juryReview.status,"stopped");assert.equal(tool.images.length,1);
+});
+
+test("代码执行失败可由 Chat 修正代码，取消不会保存迟到结果", async () => {
+  const h=await harness();const cfg=h.useConfig.getState().config;h.useConfig.setState({config:{...cfg,codeRuntime:{enabled:true,timeoutSecs:10}}});
+  const pending=h.useSessions.getState().send("修改",[attachment("ref")]);callTool(h.streams[0],[{name:"edit_image_code",args:{source_image_ids:["ref"],description:"修改",code:"bad();"}}]);await tick();
+  h.codeCalls[0].reject(new Error("bad is not defined"));await tick();
+  const failed=h.useSessions.getState().current().messages.find((message) => message.codeExecution);
+  assert.equal(failed.codeExecution.status,"error");assert.ok(!failed.content.includes("failed_call_id"));
+  callTool(h.streams[1],[{name:"edit_image_code",args:{source_image_ids:["ref"],description:"重试",code:"return images[0];"}}]);await tick();
+  h.useSessions.getState().stop();await pending;h.codeCalls[1].resolve(codeOutput());await tick();
+  assert.equal(h.codeCalls[1].canceled,true);assert.equal(h.outputSaves.length,0);assert.equal(h.streams.length,2);
+  assert.equal(h.useSessions.getState().current().messages.filter((message) => message.codeExecution).at(-1).codeExecution.status,"stopped");
+});
+
+test("Goal 可只使用内置 JS，代码成图也遵守修正上限", async () => {
+  const h=await harness();const cfg=h.useConfig.getState().config;h.useConfig.setState({config:{...cfg,linkage:{...cfg.linkage,enabled:false},codeRuntime:{enabled:true,timeoutSecs:10}}});
+  h.useSessions.getState().setGoal({enabled:true,maxCorrections:0});const pending=h.useSessions.getState().send("精确修改",[attachment("ref")]);
+  assert.deepEqual(h.streams[0].request.tools.map((tool) => tool.function.name),["review_goal","edit_image_code"]);
+  const edit={name:"edit_image_code",args:{source_image_ids:["ref"],description:"修改",code:"return images[0];"}};
+  callTool(h.streams[0],[edit]);await tick();h.codeCalls[0].resolve(codeOutput());await tick();
+  callTool(h.streams[1],[edit]);await tick();assert.equal(h.codeCalls.length,1);assert.equal(h.streams[2].request.tools,null);
+  complete(h.streams[2],"已达到修正上限");await pending;
+  const progress=h.useSessions.getState().current().messages.at(-1).goalProgress;
+  assert.equal(progress.status,"limit");assert.equal(progress.attempts,1);assert.equal(progress.corrections,0);
+});
+
+test("排队发送严格 FIFO，附件提交时复制且队列推进不清空新草稿", async () => {
+  const h=await harness();const sessions=h.useSessions.getState;const first=sessions().send("第一条",[]);
+  const atts=[attachment("queued")];await sessions().send("第二条",atts,"queue");atts[0].name="changed.png";
+  await sessions().send("第三条",[],"queue");sessions().setDraftText("下一条还在写");sessions().addDraftAtts([attachment("draft")]);
+  assert.equal(h.streams.length,1);assert.equal(sessions().current().queuedMessages.length,2);
+  complete(h.streams[0]);await first;await tick();
+  assert.equal(h.streams.length,2);assert.equal(sessions().current().draftText,"下一条还在写");assert.equal(sessions().current().draftAtts[0].id,"draft");
+  assert.equal(sessions().current().messages.filter((message) => message.role === "user")[1].attachments[0].name,"queued.png");
+  complete(h.streams[1]);await tick();assert.equal(h.streams.length,3);complete(h.streams[2]);await tick();
+  assert.deepEqual(sessions().current().messages.filter((message) => message.role === "user").map((message) => message.content),["第一条","第二条","第三条"]);
+  assert.equal(sessions().current().queuedMessages.length,0);assert.equal(Object.keys(sessions().runs).length,0);
+});
+
+test("插话优先于队列，保留旧回答片段并忽略取消后的事件", async () => {
+  const h=await harness();const sessions=h.useSessions.getState;const first=sessions().send("原请求",[]);
+  h.streams[0].onEvent({type:"delta",text:"已写的片段"});await sessions().send("原队列",[],"queue");await sessions().send("新要求",[],"interrupt");
+  await first;await tick();assert.equal(h.streams[0].canceled,true);assert.equal(h.streams.length,2);
+  h.streams[0].onEvent({type:"delta",text:"迟到片段"});h.streams[0].onEvent({type:"done",finishReason:"stop"});
+  assert.equal(sessions().current().messages.find((message) => message.role === "assistant").content,"已写的片段");
+  complete(h.streams[1]);await tick();complete(h.streams[2]);await tick();
+  assert.deepEqual(sessions().current().messages.filter((message) => message.role === "user").map((message) => message.content),["原请求","新要求","原队列"]);
+});
+
+test("工具执行中插话等待清理，所有工具响应补齐后才发送新用户消息", async () => {
+  const h=await harness();const sessions=h.useSessions.getState;const first=sessions().send("两张图",[]);
+  callTool(h.streams[0],[{args:{prompt:"图一"}},{args:{prompt:"图二"}}]);await tick();h.imageCalls[0].deferCancel=true;
+  await sessions().send("改成另一种构图",[],"interrupt");assert.equal(h.imageCalls[0].canceled,true);assert.equal(h.streams.length,1);
+  h.imageCalls[0].resolve([generated("late","image-test")]);await first;await tick();
+  assert.equal(h.imageCalls.length,1);assert.equal(h.streams.length,2);
+  const tail=h.streams[1].request.messages.slice(-4);assert.deepEqual(tail.map((message) => message.role),["assistant","tool","tool","user"]);
+  assert.ok(tail[1].content.includes("停止"));assert.ok(tail[2].content.includes("停止"));
+  assert.ok(!JSON.stringify(h.streams[1].request.messages).includes(attachment("late").dataUrl));
+  complete(h.streams[1]);await tick();
+});
+
+test("暂停和停止保留队列，新排队不能偷偷恢复，可移除、继续和清空", async () => {
+  const h=await harness();const sessions=h.useSessions.getState;const first=sessions().send("当前",[]);
+  await sessions().send("移除这条",[],"queue");await sessions().send("保留这条",[],"queue");sessions().pauseQueue();
+  sessions().removeQueued(sessions().current().queuedMessages[0].id);await sessions().send("后加的",[],"queue");
+  assert.equal(sessions().current().queuePaused,true);complete(h.streams[0]);await first;await tick();assert.equal(h.streams.length,1);
+  const resume=sessions().resumeQueue();await tick();assert.equal(h.streams.length,2);sessions().stop();await resume;await tick();
+  assert.equal(sessions().current().queuePaused,true);assert.equal(sessions().current().queuedMessages.length,1);
+  sessions().clearQueue();assert.equal(sessions().current().queuedMessages.length,0);
+  const interrupt=sessions().send("明确插话恢复",[],"interrupt");await tick();assert.equal(sessions().current().queuePaused,false);
+  complete(h.streams[2]);await interrupt;
+});
+
+test("队列属于原会话，在另一会话编辑时仍不会串消息或清空其草稿", async () => {
+  const h=await harness();const sessions=h.useSessions.getState;const a=sessions().currentId;
+  const first=sessions().send("A 原消息",[]);await sessions().send("A 排队消息",[],"queue");
+  sessions().newSession();const b=sessions().currentId;sessions().setDraftText("B 草稿");
+  complete(h.streams[0]);await first;await tick();assert.equal(sessions().currentId,b);assert.equal(sessions().current().draftText,"B 草稿");
+  assert.equal(sessions().current().messages.length,0);assert.ok(sessions().runs[a]);assert.ok(!sessions().runs[b]);
+  complete(h.streams[1]);await tick();assert.deepEqual(sessions().sessions.find((session) => session.id===a).messages.filter((message) => message.role==="user").map((message) => message.content),["A 原消息","A 排队消息"]);
+});
+
+test("重启只恢复队列不自动付费请求，未完成的评审和代码标记为停止", async () => {
+  const h=await harness();const original=h.useSessions.getState().current();
+  const stored={...original,queuedMessages:[{id:"q",text:"待发送",attachments:[attachment("ref")],mode:"queue",createdAt:1}],queuePaused:false,
+    messages:[message("tool",{pending:true,juryReview:{imageIds:["out"],status:"reviewing",createdAt:1,opinions:[{memberId:"a",name:"a",model:"vision-a",status:"pending"}]},codeExecution:{language:"javascript",code:"return images[0]",description:"处理",sourceLabels:[],logs:[],status:"running"}})]};
+  h.api.loadState=async()=>JSON.stringify({sessions:[stored],currentId:stored.id});await h.useSessions.getState().init();
+  const restored=h.useSessions.getState().current();assert.equal(restored.queuePaused,true);assert.equal(restored.queuedMessages.length,1);
+  assert.equal(restored.messages[0].pending,false);assert.equal(restored.messages[0].juryReview.status,"stopped");
+  assert.equal(restored.messages[0].juryReview.opinions[0].status,"stopped");assert.equal(restored.messages[0].codeExecution.status,"stopped");
+  assert.equal(h.streams.length,0);assert.equal(h.textCalls.length,0);assert.equal(h.codeCalls.length,0);
+});
+
+test("结果不自动入库，手动归档并发幂等且完整保留图片来源信息", async () => {
+  const h=await harness();const ref={galleryId:"out",path:"outputs/images/out.png",dataUrl:attachment("out").dataUrl,prompt:"原指令",kind:"edit",model:"model",size:"100x100",createdAt:123,parentId:"parent",revisedPrompt:"实际指令"};
+  const item=gallery.generatedGalleryItem(ref);assert.equal(item.createdAt,123);assert.equal(item.revisedPrompt,"实际指令");
+  const first=h.useGallery.getState().archive(item);const second=h.useGallery.getState().archive(item);assert.deepEqual(h.useGallery.getState().archiving,["out"]);
+  const [a,b]=await Promise.all([first,second]);assert.equal(a.id,b.id);assert.equal(h.archives.length,1);assert.equal(h.useGallery.getState().items.length,1);
+  assert.equal(h.useGallery.getState().items[0].parentId,"parent");assert.equal(h.useGallery.getState().archiving.length,0);
+  await h.useGallery.getState().archive(item);assert.equal(h.archives.length,1);await h.useGallery.getState().remove(["out"]);assert.equal(h.useGallery.getState().items.length,0);
+  await h.useGallery.getState().archive(item);assert.equal(h.archives.length,2);
+});
+
+test("入库失败不留下已保存状态，用户可重试；兼容旧图片引用", async () => {
+  const h=await harness();const item=gallery.generatedGalleryItem({galleryId:"old",path:"C:\\outputs\\old.png",prompt:"旧指令"});
+  assert.equal(item.fileName,"old.png");assert.equal(item.kind,"chat");assert.equal(item.size,"auto");
+  const original=h.api.galleryArchive;h.api.galleryArchive=async()=>{throw new Error("磁盘不可写");};
+  await assert.rejects(h.useGallery.getState().archive(item),/磁盘/);assert.equal(h.useGallery.getState().items.length,0);assert.equal(h.useGallery.getState().archiving.length,0);
+  h.api.galleryArchive=original;await h.useGallery.getState().archive(item);assert.equal(h.useGallery.getState().items.length,1);
+});
+
+test("数字草稿清空不改成最小值，提交时才恢复或限制范围", () => {
+  assert.equal(numberInput.commitNumberDraft("", 6, 0, 20), 6);
+  assert.equal(numberInput.commitNumberDraft("  ", 6, 0, 20), 6);
+  assert.equal(numberInput.commitNumberDraft("12", 6, 0, 20), 12);
+  assert.equal(numberInput.commitNumberDraft("0", 6, 0, 20), 0);
+  assert.equal(numberInput.commitNumberDraft("99", 6, 0, 20), 20);
+  assert.equal(numberInput.commitNumberDraft("-2", 6, 0, 20), 0);
+  assert.equal(numberInput.commitNumberDraft("3.9", 6, 0, 20), 3);
+  for (const text of ["abc", "NaN", "Infinity"]) assert.equal(numberInput.commitNumberDraft(text, 6, 0, 20), 6);
+});
+
+test("预览适应屏幕，锚点缩放与双指平移保持像素位置并限制拖动", () => {
+  const bounds = preview.fitPreview(500, 400, 1000, 500);
+  assert.equal(bounds.imageWidth, 476); assert.equal(bounds.imageHeight, 238);
+  assert.equal(preview.fitPreview(500, 400, 100, 80).imageWidth, 100);
+  assert.equal(preview.fitPreview(0, 0, 100, 80).imageWidth, 0);
+  const full = { width: 500, height: 400, imageWidth: 476, imageHeight: 376 };
+  assert.deepEqual(preview.zoomPreview(preview.FIT_PREVIEW, 2, { x: 100, y: 40 }, full), { scale: 2, x: -100, y: -40 });
+  assert.deepEqual(preview.zoomPreview(preview.FIT_PREVIEW, 2, { x: 100, y: 40 }, full, { x: 130, y: 60 }), { scale: 2, x: -70, y: -20 });
+  assert.equal(preview.clampPreview({ scale: 0.5, x: 9999, y: -9999 }, full).scale, 1);
+  assert.equal(preview.clampPreview({ scale: 99, x: 9999, y: 9999 }, full).scale, 8);
+  assert.deepEqual(preview.zoomPreview({ scale: 3, x: 50, y: 20 }, 1, { x: 0, y: 0 }, full), { scale: 1, x: 0, y: 0 });
+});
+
+async function runPixelCode(code, inputs = [{ width: 2, height: 2, data: new Uint8ClampedArray([255,0,0,255,0,255,0,255,0,0,255,255,255,255,255,255]) }]) {
+  const results = [];
+  const context = vm.createContext({ Uint8ClampedArray, performance: { now: () => 0 }, postMessage: (result) => results.push(result) });
+  vm.runInContext(codeWorkerSource.replace("/*__CHAT_CODE__*/", () => code), context, { timeout: 1000 });
+  await context.onmessage({ data: { id: "pixels", images: inputs } });
+  assert.equal(results.length, 1); return results[0];
+}
+const imageBytes = (result, index = 0) => Array.from(result.images[index].data);
+
+test("内置 JS 克隆和填色不修改输入，裁剪支持边界外透明像素", async () => {
+  const source = { width: 2, height: 1, data: new Uint8ClampedArray([255,0,0,255,0,255,0,255]) };
+  const result = await runPixelCode("const out=image.clone(images[0]);image.fill(out,[0,0,255,128],1,0,1,1);return image.crop(out,-1,0,3,1);", [source]);
+  assert.equal(result.type, "result");
+  assert.deepEqual(Array.from(source.data), [255,0,0,255,0,255,0,255]);
+  assert.deepEqual(imageBytes(result), [0,0,0,0,255,0,0,255,0,0,255,128]);
+});
+
+test("内置 JS 翻转、旋转和逐像素调色使用准确坐标", async () => {
+  const result = await runPixelCode("return [image.flip(images[0]),image.rotate(images[0]),image.rotate(images[0],-1),image.map(images[0],(r,g,b,a,x,y)=>[x*255,y*255,0,a])];");
+  assert.equal(result.type, "result");
+  assert.deepEqual(imageBytes(result), [0,255,0,255,255,0,0,255,255,255,255,255,0,0,255,255]);
+  assert.deepEqual(imageBytes(result, 1), [0,0,255,255,255,0,0,255,255,255,255,255,0,255,0,255]);
+  assert.deepEqual(imageBytes(result, 2), [0,255,0,255,255,255,255,255,255,0,0,255,0,0,255,255]);
+  assert.deepEqual(imageBytes(result, 3), [0,0,0,255,255,0,0,255,0,255,0,255,255,255,0,255]);
+});
+
+test("内置 JS 缩放预乘透明度，合成保持正确 alpha", async () => {
+  const source = { width: 2, height: 1, data: new Uint8ClampedArray([255,0,0,255,0,0,255,0]) };
+  const resized = await runPixelCode("return image.resize(images[0],1,1);", [source]);
+  assert.deepEqual(imageBytes(resized), [255,0,0,128]);
+  const result = await runPixelCode("const out=image.create(1,1,[0,0,255,255]);return image.composite(out,image.create(1,1,[255,0,0,128]));");
+  assert.deepEqual(imageBytes(result), [128,0,127,255]);
+  const transparent = await runPixelCode("return image.composite(image.create(1,1),image.create(1,1,[10,20,30,128]));");
+  assert.deepEqual(imageBytes(transparent), [10,20,30,128]);
+});
+
+test("内置 JS 拒绝非法尺寸、输出数量与像素格式，不支持画布时明确报错", async () => {
+  for (const code of ["return image.create(0,2);","return image.create(4097,1);","return image.create(1.5,1);","return [];","return Array(5).fill(images[0]);","return {width:1,height:1,data:[0,0,0,0]};","return image.composite(images[0],images[0],0,0,2);"]) {
+    const result = await runPixelCode(code); assert.equal(result.type, "error", code); assert.ok(result.message);
+  }
+  const canvas = await runPixelCode("return image.canvas(images[0]);");
+  assert.equal(canvas.type, "error"); assert.match(canvas.message, /OffscreenCanvas/);
+});
+
+test("内置 JS 限制日志且剥离任意输出字段，不暴露网络、存储或应用接口", async () => {
+  const result = await runPixelCode("log(typeof fetch,typeof importScripts,typeof Worker,typeof indexedDB,typeof navigator,typeof document,typeof window);log(1n);const circular={};circular.self=circular;log(circular);for(let i=0;i<80;i++)console.log('x'.repeat(700));return {...images[0],secret:'drop'};");
+  assert.equal(result.type, "result"); assert.equal(result.logs[0], Array(7).fill("undefined").join(" "));
+  assert.equal(result.logs.length, 40); assert.ok(result.logs.every((line) => line.length <= 500));
+  assert.deepEqual(Object.keys(result.images[0]).sort(), ["data","height","width"]);
+});
+
+test("代码运行时默认关闭，超时配置有效，主窗口重新验证输出", () => {
+  assert.deepEqual(codeRuntime.codeRuntimeSettings(), { enabled: false, timeoutSecs: 10 });
+  for (const timeoutSecs of [NaN,Infinity,undefined]) assert.equal(codeRuntime.codeRuntimeSettings({ timeoutSecs }).timeoutSecs, 10);
+  assert.equal(codeRuntime.codeRuntimeSettings({ timeoutSecs: -3 }).timeoutSecs, 1);
+  assert.equal(codeRuntime.codeRuntimeSettings({ timeoutSecs: 90 }).timeoutSecs, 30);
+  assert.equal(codeRuntime.codeRuntimeSettings({ enabled: true, timeoutSecs: 3.9 }).timeoutSecs, 3);
+  const pixels = { width: 1, height: 1, data: new Uint8ClampedArray(4), arbitrary: "drop" };
+  assert.deepEqual(Object.keys(codeRuntime.validateCodeOutputs([pixels])[0]).sort(), ["data","height","width"]);
+  for (const value of [[],Array(5).fill(pixels),[null],[{...pixels,width:5000}],[{...pixels,data:new Uint8Array(4)}]]) assert.throws(() => codeRuntime.validateCodeOutputs(value));
+});
+
+test("隔离页无同源权限，Worker 继承禁止联网与动态脚本的 CSP", async () => {
+  const html = await readFile(new URL("../public/runtime/sandbox.html", import.meta.url), "utf8");
+  const bootstrap = await readFile(new URL("../public/runtime/sandbox.js", import.meta.url), "utf8");
+  const runtime = await readFile(new URL("../src/lib/codeRuntime.ts", import.meta.url), "utf8");
+  const nativeConfig = JSON.parse(await readFile(new URL("../src-tauri/tauri.conf.json", import.meta.url), "utf8"));
+  assert.match(html, /connect-src 'none'/); assert.match(html, /worker-src blob:/);
+  assert.match(bootstrap, /script-src 'none'; worker-src blob:; connect-src 'none'/);
+  assert.match(runtime, /setAttribute\("sandbox", "allow-scripts"\)/); assert.ok(!runtime.includes("allow-same-origin"));
+  for (const policy of [nativeConfig.app.security.csp,nativeConfig.app.security.devCsp]) { assert.match(policy, /frame-src 'self'/); assert.match(policy, /worker-src blob:/); }
+});
 
 test("两个会话并发时输出、停止和草稿互不影响，同会话禁止重复提交", async () => {
   const h = await harness();
@@ -170,7 +543,7 @@ test("对话编辑完整传递多图、指定顺序、原始指令，并反馈�
   assert.deepEqual(roles.slice(-3), ["assistant", "tool", "user"]);
   assert.ok(JSON.stringify(h.streams[1].request.messages).includes(attachment("g").dataUrl));
   complete(h.streams[1]); await pending;
-  assert.equal(h.useGallery.getState().items.length, 1);
+  assert.equal(h.useGallery.getState().items.length, 0, "生成结果只能由用户主动入库");
 });
 
 test("停止图像工具中断其请求，不触发后续对话循环", async () => {

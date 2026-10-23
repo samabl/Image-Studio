@@ -98,7 +98,9 @@ pub async fn configure(app: &AppHandle) -> AppResult<()> {
 }
 
 pub async fn set_theme(app: &AppHandle, theme: String, mode: String) -> AppResult<()> {
-    if !matches!(theme.as_str(), "light" | "dark") || !matches!(mode.as_str(), "light" | "dark" | "system") {
+    if !matches!(theme.as_str(), "light" | "dark")
+        || !matches!(mode.as_str(), "light" | "dark" | "system")
+    {
         return Err(crate::error::AppError::other("不支持的主题"));
     }
     #[cfg(target_os = "android")]

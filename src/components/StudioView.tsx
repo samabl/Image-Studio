@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Empty, Field, FileImage, Seg, Spinner, Switch } from "./ui";
+import { Field, FileImage, Panel, Seg, Spinner, Switch } from "./ui";
 import { MaskCanvas } from "./MaskCanvas";
 import { showImage } from "./Overlays";
 import { useConfig, useStudio, useToast, channelReady } from "../lib/store";
@@ -7,6 +7,7 @@ import { fileToAttachment } from "../lib/image";
 import { copyText } from "../lib/shell";
 import { readImageDataUrl } from "../lib/api";
 import { SaveImageButton } from "./SaveImageButton";
+import { AddToGalleryButton } from "./AddToGalleryButton";
 import { isDesktop } from "../lib/platform";
 import { defaultImageConnection } from "../lib/imageModels";
 import type { GalleryItem } from "../types";
@@ -40,7 +41,7 @@ export function StudioView() {
   }, [hasRef]);
 
   const pick = async (files: FileList | null) => {
-    if (!files?.length) return;
+    if (busy || !files?.length) return;
     try {
       const next = [];
       for (const f of Array.from(files)) {
@@ -54,7 +55,7 @@ export function StudioView() {
   };
 
   return (
-    <div className="studio">
+    <div className={`studio${studio.results.length ? " has-results" : ""}`}>
       {/* ---------- 左侧控制面板 ---------- */}
       <div className="studio-panel">
         <Seg
@@ -90,29 +91,26 @@ export function StudioView() {
               </button>
             </span>
           }
-          hint={
-            cfg?.linkage.enabled
-              ? "提示词优化与反推由「对话模型」完成 —— 这就是两个模型的联动点。"
-              : "图像联动已在设置中关闭。"
-          }
         >
           <textarea
             className="textarea"
             value={studio.prompt}
-            placeholder="描述你想要的画面，例如：一只戴着飞行护目镜的柴犬，坐在复古螺旋桨飞机驾驶舱里，暖色夕阳，电影感"
+            placeholder="描述画面或修改要求…"
             onChange={(e) => studio.setPrompt(e.target.value)}
           />
         </Field>
 
         {/* 参考图 */}
+        <Panel key={`${hasRef}-${studio.mode}`} title={`参考图${hasRef ? ` · ${studio.refs.length}` : "（可选）"}`} defaultOpen={hasRef || studio.mode === "edit"} className="studio-references">
         <Field
-          label={studio.mode === "generate" ? "参考图（可选，加上即变图生图）" : "参考图"}
-          hint="按展示顺序编号；可在提示词里写「素材 1」「素材 2」。第一张是编辑基底，蒙版应用于第一张。"
+          label="素材"
+          hint={hasRef ? "素材 1 为编辑基底；可按编号指定参考图。" : undefined}
           right={
             hasRef ? (
               <button
                 type="button"
                 className="btn sm ghost"
+                disabled={busy}
                 onClick={() => {
                   studio.setRefs([]);
                   studio.setStrokes([]);
@@ -128,6 +126,7 @@ export function StudioView() {
             type="file"
             accept="image/*"
             multiple
+            disabled={busy}
             style={{ display: "none" }}
             onChange={(e) => {
               void pick(e.target.files);
@@ -156,7 +155,12 @@ export function StudioView() {
                 </div>
               ))}
               <div
-                className="dropzone"
+                className="dropzone ref-add"
+                role="button"
+                tabIndex={busy ? -1 : 0}
+                aria-label="添加参考图"
+                aria-disabled={busy}
+                onKeyDown={(event) => { if (!busy && (event.key === "Enter" || event.key === " ")) { event.preventDefault(); fileRef.current?.click(); } }}
                 style={{ width: 82, height: 82, padding: 0, display: "grid", placeItems: "center" }}
                 onClick={() => fileRef.current?.click()}
                 onDragOver={(e) => {
@@ -176,6 +180,11 @@ export function StudioView() {
           ) : (
             <div
               className={`dropzone${over ? " over" : ""}`}
+              role="button"
+              tabIndex={busy ? -1 : 0}
+              aria-label="选择参考图"
+              aria-disabled={busy}
+              onKeyDown={(event) => { if (!busy && (event.key === "Enter" || event.key === " ")) { event.preventDefault(); fileRef.current?.click(); } }}
               onClick={() => fileRef.current?.click()}
               onDragOver={(e) => {
                 e.preventDefault();
@@ -188,10 +197,7 @@ export function StudioView() {
                 void pick(e.dataTransfer.files);
               }}
             >
-              点击选择图片，或把图片拖到这里
-              <div style={{ fontSize: 11, marginTop: 4, opacity: 0.75 }}>
-                {isDesktop ? "支持 PNG / JPG / WEBP" : "支持从相册或文件中选择"}
-              </div>
+              {isDesktop ? "选择或拖入图片" : "选择图片"}
             </div>
           )}
         </Field>
@@ -203,7 +209,7 @@ export function StudioView() {
               checked={studio.maskEnabled}
               disabled={busy || !supportsMask}
               onChange={studio.setMaskEnabled}
-              label={supportsMask ? "局部重绘（只改涂抹区域）" : "局部重绘需使用 images 协议"}
+              label={supportsMask ? "局部重绘" : "局部重绘需 images 协议"}
             />
             {studio.maskEnabled && (
               <>
@@ -248,6 +254,7 @@ export function StudioView() {
             )}
           </>
         )}
+        </Panel>
 
         {/* 参数 */}
         <div className="grid-2">
@@ -279,12 +286,9 @@ export function StudioView() {
           </Field>
         </div>
 
-        <details>
-          <summary style={{ cursor: "pointer", fontSize: 12, color: "var(--text-dim)" }}>
-            高级参数
-          </summary>
-          <div className="grid-2" style={{ marginTop: 10 }}>
-            <Field label="质量" hint="auto 表示不下发该参数，兼容性最好">
+        <Panel title="高级参数">
+          <div className="grid-2">
+            <Field label="质量">
               <select
                 className="input"
                 value={studio.quality}
@@ -327,19 +331,21 @@ export function StudioView() {
               <input className="input" value={cfg?.image.model ?? ""} readOnly />
             </Field>
           </div>
-        </details>
+        </Panel>
 
         {!ready && (
           <div className="err" style={{ marginTop: 0 }}>
-            图像模型尚未配置完整，请先前往「设置 → 图像模型」。
+            请先在设置中配置图像模型
           </div>
         )}
         {studio.error && <div className="err">{studio.error}</div>}
 
+        <div className="studio-submit">
+        {busy && studio.note && <div className="task-status" role="status"><Spinner /> {studio.note}</div>}
+        <div className="row">
         <button
           type="button"
-          className="btn primary"
-          style={{ padding: "11px 16px" }}
+          className="btn primary generate-button"
           disabled={busy || !ready || !studio.prompt.trim()}
           onClick={() => void studio.run()}
         >
@@ -356,45 +362,21 @@ export function StudioView() {
           )}
         </button>
 
-        {busy && <button type="button" className="btn danger" onClick={() => studio.stop()}>■ 停止任务</button>}
-        {cfg?.linkage.autoOptimizePrompt && (
-          <div className="chip accent" style={{ alignSelf: "flex-start" }}>
-            已开启：出图前自动用对话模型优化提示词
-          </div>
-        )}
+        {busy && <button type="button" className="btn danger" onClick={() => studio.stop()}>■ 停止</button>}
+        </div>
+        </div>
       </div>
 
-      {/* ---------- 右侧结果区 ---------- */}
-      <div className="studio-canvas">
-        {busy && studio.note && (
-          <div
-            style={{
-              padding: "10px 18px",
-              borderBottom: "1px solid var(--border-soft)",
-              display: "flex",
-              gap: 9,
-              alignItems: "center",
-              color: "var(--text-dim)",
-              fontSize: 12.5,
-            }}
-          >
-            <Spinner /> {studio.note}
-          </div>
-        )}
-        {studio.results.length === 0 ? (
-          <Empty
-            icon="🎨"
-            title={busy ? "正在生成…" : "还没有结果"}
-            hint="左侧填写提示词后点击生成。gpt-image 系列出图通常需要 20 秒到 2 分钟，请耐心等待。"
-          />
-        ) : (
+      {/* 小屏时结果随页面滚动，始终位于编辑区下方。 */}
+      {studio.results.length > 0 && <Panel key={studio.results.map((item) => item.id).join(",")} title={`生成结果 · ${studio.results.length}`} defaultOpen className="studio-results">
+        <div className="studio-canvas">
           <div className="result-grid">
             {studio.results.map((it) => (
               <ResultCard key={it.id} item={it} />
             ))}
           </div>
-        )}
-      </div>
+        </div>
+      </Panel>}
     </div>
   );
 }
@@ -423,13 +405,17 @@ function ResultCard({ item }: { item: GalleryItem }) {
         {item.kind === "edit" && <span className="chip accent">图生图</span>}
       </div>
       <div className="result-actions">
+        <AddToGalleryButton item={item} />
+        <SaveImageButton image={{ item, path: item.path, dataUrl: item.dataUrl }} />
+      </div>
+      <details className="image-more"><summary>更多</summary><div className="image-more-actions">
         <button
           type="button"
           className="btn sm ghost"
           onClick={() =>
             void dataUrlOf().then((u) =>
               sendToStudio({ dataUrl: u, galleryId: item.id, prompt: item.prompt }, "edit"),
-            )
+            ).catch((error: Error) => note("error", error.message))
           }
         >
           ✎ 继续编辑
@@ -441,13 +427,13 @@ function ResultCard({ item }: { item: GalleryItem }) {
         >
           ⧉ 复制提示词
         </button>
-        <SaveImageButton image={{ item, path: item.path, dataUrl: item.dataUrl }} />
       </div>
       {item.revisedPrompt && (
         <div className="result-meta" style={{ paddingTop: 0 }}>
-          改写后提示词：{item.revisedPrompt.slice(0, 90)}
+          {item.revisedPrompt}
         </div>
       )}
+      </details>
     </div>
   );
 }

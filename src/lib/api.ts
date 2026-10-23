@@ -119,9 +119,13 @@ export function cancellableImage(request: ImageRequest, parentId?: string | null
 export const saveDataUrl = (dataUrl: string, meta: SaveMeta) =>
   call<GalleryItem[]>("save_data_url", { dataUrl, meta });
 
+export const saveImageOutputs = (dataUrls: string[], meta: SaveMeta) =>
+  call<GalleryItem[]>("save_image_outputs", { dataUrls, meta });
+
 // --- 图库 -----------------------------------------------------------------
 
 export const galleryList = () => call<GalleryItem[]>("gallery_list");
+export const galleryArchive = (item: GalleryItem) => call<GalleryItem>("gallery_archive", { item });
 export const galleryDelete = (ids: string[]) => call<number>("gallery_delete", { ids });
 export const galleryClear = () => call<number>("gallery_clear");
 export const galleryExport = (id: string, target: string) =>

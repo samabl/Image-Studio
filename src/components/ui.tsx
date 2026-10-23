@@ -1,6 +1,42 @@
 import React, { useEffect, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { readImageDataUrl } from "../lib/api";
+import { commitNumberDraft } from "../lib/numberInput";
+
+export function Panel({ title, children, defaultOpen = false, className = "" }: {
+  title: React.ReactNode;
+  children: React.ReactNode;
+  defaultOpen?: boolean;
+  className?: string;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+  return <details className={`panel ${className}`} open={open} onToggle={(event) => setOpen(event.currentTarget.open)}>
+    <summary className="panel-heading">{title}</summary>
+    <div className="panel-body">{children}</div>
+  </details>;
+}
+
+export function NumberInput({ value, onValueChange, min = 0, max = Number.MAX_SAFE_INTEGER, onBlur, onKeyDown, ...props }: {
+  value: number;
+  onValueChange: (value: number) => void;
+  min?: number;
+  max?: number;
+} & Omit<React.InputHTMLAttributes<HTMLInputElement>, "value" | "onChange" | "min" | "max" | "type">) {
+  const [draft, setDraft] = useState(String(value));
+  useEffect(() => setDraft(String(value)), [value]);
+  return <input {...props} type="number" inputMode="numeric" step={1} min={min} max={max} value={draft}
+    onChange={(event) => setDraft(event.target.value)}
+    onBlur={(event) => {
+      const next = commitNumberDraft(event.currentTarget.value, value, min, max);
+      setDraft(String(next));
+      onValueChange(next);
+      onBlur?.(event);
+    }}
+    onKeyDown={(event) => {
+      if (event.key === "Enter") event.currentTarget.blur();
+      onKeyDown?.(event);
+    }} />;
+}
 
 export function Spinner({ size = 14 }: { size?: number }) {
   return <span className="spin" style={{ width: size, height: size }} />;
@@ -41,8 +77,8 @@ export function Switch({
   disabled?: boolean;
 }) {
   return (
-    <label className="switch">
-      <input type="checkbox" checked={checked} disabled={disabled} onChange={(e) => onChange(e.target.checked)} />
+    <label className={`switch${disabled ? " disabled" : ""}`}>
+      <input type="checkbox" role="switch" checked={checked} disabled={disabled} onChange={(e) => onChange(e.target.checked)} />
       <span className="track" />
       {label && <span>{label}</span>}
     </label>
@@ -110,6 +146,7 @@ export function FileImage({
   onClick,
   className,
   style,
+  onLoad,
 }: {
   dataUrl?: string | null;
   path?: string | null;
@@ -117,6 +154,7 @@ export function FileImage({
   onClick?: () => void;
   className?: string;
   style?: React.CSSProperties;
+  onLoad?: React.ReactEventHandler<HTMLImageElement>;
 }) {
   const initial = dataUrl ?? (path ? convertFileSrc(path) : null);
   const [src, setSrc] = useState<string | null>(initial);
@@ -138,6 +176,7 @@ export function FileImage({
       loading="lazy"
       draggable={false}
       onClick={onClick}
+      onLoad={onLoad}
       onError={() => {
         if (triedFallback || !path) return;
         setTriedFallback(true);

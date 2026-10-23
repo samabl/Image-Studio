@@ -1,8 +1,6 @@
 import { create } from "zustand";
 import { useToast } from "../lib/store";
-import { copyText, revealPath } from "../lib/shell";
-import { SaveImageButton } from "./SaveImageButton";
-import { isDesktop } from "../lib/platform";
+import { ImagePreview } from "./ImagePreview";
 import { FileImage } from "./ui";
 import type { GalleryItem } from "../types";
 
@@ -50,52 +48,7 @@ export const showImage = (image: LightboxImage) => useLightbox.getState().show(i
 
 export function Lightbox() {
   const { image, hide } = useLightbox();
-  if (!image) return null;
-
-  const item = image.item ?? null;
-  const src = image.dataUrl || image.path || item?.dataUrl || item?.path || "";
-
-  return (
-    <div className="lightbox" onClick={hide}>
-      <button type="button" className="btn icon lightbox-close" onClick={hide} title="关闭">
-        ✕
-      </button>
-      <div onClick={(e) => e.stopPropagation()}>
-        <FileImage dataUrl={image.dataUrl || item?.dataUrl} path={image.path ?? item?.path} alt={image.title ?? ""} />
-      </div>
-      <div className="lightbox-bar" onClick={(e) => e.stopPropagation()}>
-        {image.title && <span className="chip">{image.title}</span>}
-        {item && (
-          <>
-            <span className="chip">{item.model}</span>
-            <span className="chip">{item.size}</span>
-            <span className="chip">{new Date(item.createdAt).toLocaleString()}</span>
-          </>
-        )}
-      </div>
-      <div className="lightbox-bar" onClick={(e) => e.stopPropagation()}>
-        <button
-          type="button"
-          className="btn sm"
-          onClick={() => void copyText(src).then(() => useToast.getState().push("success", "已复制"))}
-        >
-          {src.startsWith("data:") ? "复制 DataURL" : "复制路径"}
-        </button>
-        <SaveImageButton image={image} />
-        {isDesktop && item && (
-          <>
-            <button
-              type="button"
-              className="btn sm"
-              onClick={() => void revealPath(item.path).catch(() => undefined)}
-            >
-              打开所在文件夹
-            </button>
-          </>
-        )}
-      </div>
-    </div>
-  );
+  return image ? <ImagePreview image={image} hide={hide} /> : null;
 }
 
 /** 图库里直接用的缩略图 + 点击放大。 */

@@ -28,7 +28,7 @@ pub const DEFAULT_REVERSE_SYSTEM_PROMPT: &str = "\
 你是图像分析专家。观察用户提供的图片，输出一段可直接用于文生图模型的高质量英文提示词，
 准确复现画面的主体、构图、风格、光线与色调。只输出提示词本身，不要解释、不要 Markdown。";
 
-// 四个子结构都加 `serde(default)`：这样以后新增字段时，
+// 子结构都加 `serde(default)`：这样以后新增字段时，
 // 用户机器上的旧 config.json 依然能解析（缺失字段取默认值），不会整份被重置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -187,7 +187,75 @@ pub struct AppConfig {
     pub chat: ChatConfig,
     pub image: ImageConfig,
     pub linkage: LinkageConfig,
+    pub jury: JuryConfig,
+    pub code_runtime: CodeRuntimeConfig,
     pub ui: UiConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct JuryMemberConfig {
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
+    pub model: String,
+    pub inherit_chat: bool,
+    pub protocol: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub focus: String,
+    pub models: Vec<String>,
+}
+
+impl Default for JuryMemberConfig {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            enabled: true,
+            model: String::new(),
+            inherit_chat: true,
+            protocol: "openai".into(),
+            base_url: String::new(),
+            api_key: String::new(),
+            focus: String::new(),
+            models: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct JuryConfig {
+    pub enabled: bool,
+    pub include_chat: bool,
+    pub members: Vec<JuryMemberConfig>,
+}
+
+impl Default for JuryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            include_chat: true,
+            members: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CodeRuntimeConfig {
+    pub enabled: bool,
+    pub timeout_secs: u64,
+}
+
+impl Default for CodeRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            timeout_secs: 10,
+        }
+    }
 }
 
 fn current_version() -> u32 {
@@ -250,6 +318,48 @@ pub fn save_config(app: &AppHandle, cfg: &AppConfig) -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::AppConfig;
+
+    #[test]
+    fn old_config_does_not_enable_jury_or_code_execution() {
+        let mut old = serde_json::to_value(AppConfig::default()).unwrap();
+        let object = old.as_object_mut().unwrap();
+        object.remove("jury");
+        object.remove("codeRuntime");
+        old["chat"]["model"] = "kept-model".into();
+        let config: AppConfig = serde_json::from_value(old).unwrap();
+        assert_eq!(config.chat.model, "kept-model");
+        assert!(!config.jury.enabled);
+        assert!(config.jury.include_chat);
+        assert!(config.jury.members.is_empty());
+        assert!(!config.code_runtime.enabled);
+        assert_eq!(config.code_runtime.timeout_secs, 10);
+    }
+
+    #[test]
+    fn multi_provider_jury_and_runtime_config_round_trip() {
+        let mut value = serde_json::to_value(AppConfig::default()).unwrap();
+        value["jury"] = serde_json::json!({
+            "enabled": true, "includeChat": false,
+            "members": [
+                { "id": "a", "name": "构图", "model": "vision-a", "focus": "构图", "inheritChat": true },
+                { "id": "b", "name": "细节", "model": "vision-b", "inheritChat": false, "protocol": "anthropic", "baseUrl": "https://example.invalid", "apiKey": "fixture-key" },
+                { "id": "c", "model": "vision-c", "inheritChat": false, "protocol": "gemini" }
+            ]
+        });
+        value["codeRuntime"] = serde_json::json!({ "enabled": true, "timeoutSecs": 25 });
+        let config: AppConfig = serde_json::from_value(value).unwrap();
+        assert!(config.jury.members[0].enabled);
+        assert_eq!(config.jury.members[1].protocol, "anthropic");
+        assert_eq!(config.jury.members[2].protocol, "gemini");
+        let restored: AppConfig =
+            serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        assert!(restored.jury.enabled);
+        assert!(!restored.jury.include_chat);
+        assert_eq!(restored.jury.members[0].focus, "构图");
+        assert_eq!(restored.jury.members[1].api_key, "fixture-key");
+        assert!(restored.code_runtime.enabled);
+        assert_eq!(restored.code_runtime.timeout_secs, 25);
+    }
 
     #[test]
     fn old_config_keeps_connections_and_new_theme_survives_serialization() {

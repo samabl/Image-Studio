@@ -18,24 +18,26 @@ import {
 } from "./lib/store";
 import { importImageFile, setNativeTheme } from "./lib/api";
 import { fileToAttachment } from "./lib/image";
-import { isAndroid, supportsFileDrop } from "./lib/platform";
+import { isAndroid, isIOS, isMobile, supportsFileDrop } from "./lib/platform";
 import { createBackHandler } from "./lib/androidBack";
 import { cachedTheme, nextTheme, normalizeTheme, THEME_LABELS, watchTheme } from "./lib/theme";
 
-const NAV: { key: TabKey; icon: string; label: string; title: string; sub: string }[] = [
-  { key: "chat", icon: "💬", label: "对话", title: "AI 对话", sub: "多轮聊天 · 看图 · 驱动图像模型" },
-  { key: "studio", icon: "🎨", label: "生成", title: "图像工作室", sub: "文生图 · 图生图 · 局部重绘" },
-  { key: "gallery", icon: "🖼", label: "图库", title: "图库", sub: "所有产出的原图与历史" },
-  { key: "settings", icon: "⚙️", label: "设置", title: "设置", sub: "模型配置 · 联动 · 数据" },
+const NAV: { key: TabKey; icon: string; label: string; title: string }[] = [
+  { key: "chat", icon: "💬", label: "对话", title: "AI 对话" },
+  { key: "studio", icon: "🎨", label: "生成", title: "图像工作室" },
+  { key: "gallery", icon: "🖼", label: "图库", title: "图库" },
+  { key: "settings", icon: "⚙️", label: "设置", title: "设置" },
 ];
 
 export default function App() {
   const ready = useConfig((s) => s.ready);
   const tab = useConfig((s) => s.tab);
-  const dir = useConfig((s) => s.dir);
   const cfg = useConfig((s) => s.config);
   const [bootError, setBootError] = useState<string | null>(null);
   const [dropping, setDropping] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
+    try { return localStorage.getItem("image-studio-sidebar-collapsed") === "true"; } catch { return false; }
+  });
   const theme = cfg ? normalizeTheme(cfg.ui.theme) : cachedTheme();
   const next = nextTheme(theme);
 
@@ -45,6 +47,20 @@ export default function App() {
 
   useEffect(() => {
     bootstrap().catch((err) => setBootError((err as Error).message));
+  }, []);
+
+  useEffect(() => {
+    try { localStorage.setItem("image-studio-sidebar-collapsed", String(sidebarCollapsed)); } catch { /* 私密模式下仍可折叠。 */ }
+  }, [sidebarCollapsed]);
+
+  useEffect(() => {
+    if (!isMobile) return;
+    const viewport = window.visualViewport;
+    const resize = () => document.documentElement.style.setProperty("--app-height", `${viewport?.height ?? window.innerHeight}px`);
+    resize();
+    viewport?.addEventListener("resize", resize);
+    window.addEventListener("resize", resize);
+    return () => { viewport?.removeEventListener("resize", resize); window.removeEventListener("resize", resize); document.documentElement.style.removeProperty("--app-height"); };
   }, []);
 
   useEffect(() => {
@@ -174,13 +190,12 @@ export default function App() {
   }
 
   return (
-    <div className="app">
-      <nav className="sidebar">
+    <div className={`app${sidebarCollapsed ? " sidebar-collapsed" : ""}`} data-platform={isAndroid ? "android" : isIOS ? "ios" : "desktop"} data-mobile={isMobile}>
+      <nav id="main-navigation" className="sidebar" aria-label="主导航">
         <div className="brand">
           <img className="brand-mark" src="/app-icon.png" alt="Image Studio" />
           <div className="brand-text">
-            <strong>GPT Image Studio</strong>
-            <span>对话 · 文生图 · 图生图 · 编辑</span>
+            <strong>Image Studio</strong>
           </div>
         </div>
 
@@ -189,10 +204,13 @@ export default function App() {
             key={n.key}
             type="button"
             className={`nav-item${tab === n.key ? " active" : ""}`}
+            aria-label={n.label}
+            aria-current={tab === n.key ? "page" : undefined}
+            title={n.label}
             onClick={() => useConfig.getState().setTab(n.key)}
           >
             <span className="ico">{n.icon}</span>
-            <span>{n.label}</span>
+            <span className="nav-label">{n.label}</span>
           </button>
         ))}
 
@@ -207,17 +225,15 @@ export default function App() {
               图像 {channelReady("image") ? "就绪" : "未配置"}
             </span>
           </div>
-          {cfg?.image.model && <div>图像模型：{cfg.image.model}</div>}
-          {dir && <div title={dir}>数据目录：{dir}</div>}
         </div>
       </nav>
 
       <main className="main">
         <header className="topbar" data-tauri-drag-region>
+          <button type="button" className="btn icon ghost sidebar-toggle" aria-label={sidebarCollapsed ? "展开导航" : "收起导航"} aria-expanded={!sidebarCollapsed} aria-controls="main-navigation" onClick={() => setSidebarCollapsed((value) => !value)}>☰</button>
           <div>
             <h1>{active.title}</h1>
           </div>
-          <div className="sub">{active.sub}</div>
           <div className="topbar-right">
             <button type="button" className="btn sm ghost theme-toggle"
               aria-label={`主题：${THEME_LABELS[theme]}，切换为${THEME_LABELS[next]}`}
@@ -230,6 +246,7 @@ export default function App() {
               <button
                 type="button"
                 className="btn sm ghost"
+                aria-label="刷新图库"
                 onClick={() => void useGallery.getState().refresh()}
               >
                 ↻
