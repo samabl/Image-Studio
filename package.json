@@ -1,7 +1,7 @@
 {
   "name": "gpt-image-studio",
   "private": true,
-  "version": "0.2.8",
+  "version": "0.2.9",
   "type": "module",
   "description": "跨平台 AI 图像工作台：对话 / 文生图 / 图生图 / 图像编辑",
   "scripts": {
