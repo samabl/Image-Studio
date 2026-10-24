@@ -66,6 +66,15 @@ fn stream_client() -> AppResult<reqwest::Client> {
         .build()?)
 }
 
+async fn with_response_timeout<T>(
+    idle: Duration,
+    response: impl std::future::Future<Output = AppResult<T>>,
+) -> AppResult<T> {
+    tokio::time::timeout(idle, response)
+        .await
+        .map_err(|_| AppError::other(format!("等待服务端响应超过 {} 秒，已中断", idle.as_secs())))?
+}
+
 /// 解析 `data:image/png;base64,xxxx`，返回 (mime, bytes)。
 pub fn parse_data_url(input: &str) -> AppResult<(String, Vec<u8>)> {
     let s = input.trim();
@@ -288,6 +297,9 @@ pub struct ChatRequest {
     pub protocol: Option<String>,
     #[serde(default)]
     pub stream: Option<bool>,
+    /// 本地 IPC 选项；评审必须读取真实图片，不能把缺失文件当作占位图验收。
+    #[serde(default)]
+    pub strict_image_inputs: bool,
     pub base_url: String,
     pub api_key: String,
     pub model: String,
@@ -392,7 +404,7 @@ pub async fn chat_stream(
     let client = stream_client()?;
 
     let response = tokio::select! {
-        result = post_json(&client, &url, &req.api_key, &mut body, true) => result,
+        result = with_response_timeout(idle, post_json(&client, &url, &req.api_key, &mut body, true)) => result,
         _ = crate::native::wait_cancel(cancel.clone()) => return Ok(()),
     };
     let resp = match response {
@@ -413,7 +425,7 @@ pub async fn chat_stream(
         .is_some_and(|value| value.contains("text/event-stream"))
     {
         let value = tokio::select! {
-            value = resp.json::<Value>() => value?,
+            value = with_response_timeout(idle, async { Ok(resp.json::<Value>().await?) }) => value?,
             _ = crate::native::wait_cancel(cancel.clone()) => return Ok(()),
         };
         let reply = crate::native::parse_reply(&value, "openai")?;
@@ -1179,4 +1191,38 @@ pub fn truncate(s: &str, max: usize) -> String {
     }
     let t: String = s.chars().take(max).collect();
     format!("{t}…")
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    #[tokio::test]
+    async fn stream_deadline_covers_pending_headers_and_json_body() {
+        for send_headers in [false, true] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let (release, hold) = std::sync::mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+                let mut request = [0; 4096];
+                let _ = socket.read(&mut request);
+                if send_headers {
+                    socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n").unwrap();
+                }
+                let _ = hold.recv_timeout(Duration::from_secs(2));
+            });
+            let client = stream_client().unwrap();
+            let result = with_response_timeout(Duration::from_millis(100), async {
+                let response = client.get(url).send().await?;
+                let _ = response.json::<Value>().await?;
+                Ok(())
+            }).await;
+            let _ = release.send(());
+            server.join().unwrap();
+            assert!(result.unwrap_err().to_string().contains("等待服务端响应超过"));
+        }
+    }
 }

@@ -25,23 +25,22 @@ use serde_json::Value;
 /// 请求里依然是完整图片，没有减少任何一张。
 const IMAGE_PATH_PREFIX: &str = "image-studio-path:";
 
-/// 图片已被删除或路径越界时用 1×1 透明 PNG 顶替，避免整次请求因为一张旧图失败。
+/// 普通聊天的旧图缺失时容错；独立评审及编辑不使用占位图。
 const PLACEHOLDER_IMAGE: &str =
     "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
-fn inline_image_path(root: &std::path::Path, raw: &str) -> String {
-    let allowed = std::fs::canonicalize(raw).ok().filter(|path| {
-        std::fs::canonicalize(root)
-            .map(|root| path.starts_with(&root))
-            .unwrap_or(false)
-    });
-    allowed
-        .and_then(|path| gallery::read_as_data_url(&path.to_string_lossy()).ok())
-        .unwrap_or_else(|| PLACEHOLDER_IMAGE.to_string())
+fn inline_image_path(root: &std::path::Path, raw: &str) -> AppResult<String> {
+    let missing = || error::AppError::other("实际图片文件无法读取，请恢复图片或重新生成后再评审/编辑");
+    let path = std::fs::canonicalize(raw).map_err(|_| missing())?;
+    let root = std::fs::canonicalize(root).map_err(|_| missing())?;
+    if !path.starts_with(&root) {
+        return Err(error::AppError::other("图片路径不在应用数据目录内"));
+    }
+    gallery::read_as_data_url(&path.to_string_lossy()).map_err(|_| missing())
 }
 
 /// 递归替换 `{"image_url": {"url": "image-studio-path:..."}}`（OpenAI / Anthropic / Gemini 通用）。
-fn inline_local_images(root: &std::path::Path, value: &mut Value) {
+fn inline_local_images(root: &std::path::Path, value: &mut Value, strict: bool) -> AppResult<()> {
     match value {
         Value::Object(map) => {
             let replacement = match map.get("url") {
@@ -50,20 +49,26 @@ fn inline_local_images(root: &std::path::Path, value: &mut Value) {
                     .map(|raw| inline_image_path(root, raw)),
                 _ => None,
             };
-            if let Some(data) = replacement {
+            if let Some(result) = replacement {
+                let data = if strict {
+                    result?
+                } else {
+                    result.unwrap_or_else(|_| PLACEHOLDER_IMAGE.to_string())
+                };
                 map.insert("url".into(), Value::String(data));
             }
             for item in map.values_mut() {
-                inline_local_images(root, item);
+                inline_local_images(root, item, strict)?;
             }
         }
         Value::Array(items) => {
             for item in items {
-                inline_local_images(root, item);
+                inline_local_images(root, item, strict)?;
             }
         }
         _ => {}
     }
+    Ok(())
 }
 
 /// 流式对话的取消标志表，key 为前端生成的 streamId。
@@ -195,14 +200,19 @@ async fn chat_stream(
     mut request: ChatRequest,
     on_event: Channel<ChatEvent>,
 ) -> AppResult<()> {
-    if let Ok(root) = config::app_root(&app) {
-        for message in request.messages.iter_mut() {
-            inline_local_images(&root, message);
-        }
+    let root = config::app_root(&app)?;
+    for message in request.messages.iter_mut() {
+        inline_local_images(&root, message, request.strict_image_inputs)?;
     }
     let flag = streams.register(&stream_id);
 
-    let result = ai::chat_stream(request, on_event, flag).await;
+    let result = tokio::select! {
+        result = async {
+            background::wait_for_network(&app, request.timeout_secs.unwrap_or(300)).await?;
+            ai::chat_stream(request, on_event, flag.clone()).await
+        } => result,
+        _ = native::wait_cancel(flag.clone()) => Err(error::AppError::other("已停止对话请求")),
+    };
 
     streams.finish(&stream_id);
 
@@ -218,11 +228,11 @@ fn chat_cancel(streams: State<'_, Streams>, stream_id: String) {
 /// 非流式对话：用于提示词优化、图像反推等内部调用。
 #[tauri::command]
 async fn chat_once(app: AppHandle, mut request: ChatRequest) -> AppResult<String> {
-    if let Ok(root) = config::app_root(&app) {
-        for message in request.messages.iter_mut() {
-            inline_local_images(&root, message);
-        }
+    let root = config::app_root(&app)?;
+    for message in request.messages.iter_mut() {
+        inline_local_images(&root, message, request.strict_image_inputs)?;
     }
+    background::wait_for_network(&app, request.timeout_secs.unwrap_or(300)).await?;
     ai::chat_once(request).await
 }
 
@@ -244,6 +254,12 @@ async fn background_task_status(app: AppHandle) -> AppResult<background::Backgro
 #[tauri::command]
 async fn background_task_configure(app: AppHandle) -> AppResult<()> {
     background::configure(&app).await
+}
+
+/// 不依赖隐藏 WebView 的 JS 定时器；保留有界重试等待，不启动额外付费请求。
+#[tauri::command]
+async fn background_retry_delay(delay_ms: u64) {
+    tokio::time::sleep(std::time::Duration::from_millis(delay_ms.min(10_000))).await;
 }
 
 #[tauri::command]
@@ -273,22 +289,21 @@ async fn generate_image(
     streams: State<'_, Streams>,
 ) -> AppResult<Vec<GalleryItem>> {
     // 参考图可以只给磁盘路径，读盘和 base64 编码放在 Rust 侧，前端不再复制大字符串。
-    if let Ok(root) = config::app_root(&app) {
-        for image in request.images.iter_mut() {
-            let replacement = image
-                .strip_prefix(IMAGE_PATH_PREFIX)
-                .map(|raw| inline_image_path(&root, raw));
-            if let Some(data) = replacement {
-                *image = data;
-            }
+    let root = config::app_root(&app)?;
+    for image in request.images.iter_mut() {
+        let replacement = image
+            .strip_prefix(IMAGE_PATH_PREFIX)
+            .map(|raw| inline_image_path(&root, raw));
+        if let Some(data) = replacement {
+            *image = data?;
         }
-        if let Some(mask) = request.mask.as_mut() {
-            let replacement = mask
-                .strip_prefix(IMAGE_PATH_PREFIX)
-                .map(|raw| inline_image_path(&root, raw));
-            if let Some(data) = replacement {
-                *mask = data;
-            }
+    }
+    if let Some(mask) = request.mask.as_mut() {
+        let replacement = mask
+            .strip_prefix(IMAGE_PATH_PREFIX)
+            .map(|raw| inline_image_path(&root, raw));
+        if let Some(data) = replacement {
+            *mask = data?;
         }
     }
     let kind = if request.images.is_empty() {
@@ -316,7 +331,10 @@ async fn generate_image(
         .map(|id| streams.register(id))
         .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     let result = tokio::select! {
-        result = ai::run_image_request(&request) => result,
+        result = async {
+            background::wait_for_network(&app, request.timeout_secs.unwrap_or(600)).await?;
+            ai::run_image_request(&request).await
+        } => result,
         _ = native::wait_cancel(flag) => Err(error::AppError::other("已停止图像请求")),
     };
     if let Some(id) = &request_id {
@@ -359,16 +377,18 @@ mod request_tests {
         std::fs::write(&file, [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]).unwrap();
 
         let mut value = serde_json::json!({ "image_url": { "url": format!("{IMAGE_PATH_PREFIX}{}", file.display()) } });
-        inline_local_images(&root, &mut value);
+        inline_local_images(&root, &mut value, true).unwrap();
         let url = value["image_url"]["url"].as_str().unwrap();
         assert!(url.starts_with("data:image/png;base64,"), "{url}");
 
         let mut missing = serde_json::json!({ "url": format!("{IMAGE_PATH_PREFIX}{}", root.join("gone.png").display()) });
-        inline_local_images(&root, &mut missing);
+        assert!(inline_local_images(&root, &mut missing.clone(), true).is_err());
+        inline_local_images(&root, &mut missing, false).unwrap();
         assert_eq!(missing["url"].as_str(), Some(PLACEHOLDER_IMAGE));
 
         let mut outside = serde_json::json!({ "url": format!("{IMAGE_PATH_PREFIX}{}", file.parent().unwrap().join("..").join("escape.png").display()) });
-        inline_local_images(&root, &mut outside);
+        assert!(inline_local_images(&root, &mut outside.clone(), true).is_err());
+        inline_local_images(&root, &mut outside, false).unwrap();
         assert_eq!(outside["url"].as_str(), Some(PLACEHOLDER_IMAGE));
 
         std::fs::remove_dir_all(&root).ok();
@@ -509,6 +529,7 @@ pub fn run() {
             background_task_finish,
             background_task_status,
             background_task_configure,
+            background_retry_delay,
             save_image_to_album,
             set_native_theme,
             generate_image,

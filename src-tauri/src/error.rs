@@ -5,7 +5,7 @@ use serde::{Serialize, Serializer};
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
     #[error("网络请求失败：{0}")]
-    Http(#[from] reqwest::Error),
+    Http(String),
 
     #[error("接口返回 {status}：{body}")]
     Api { status: u16, body: String },
@@ -30,6 +30,27 @@ impl AppError {
 
     pub fn config(msg: impl Into<String>) -> Self {
         AppError::Config(msg.into())
+    }
+}
+
+impl From<reqwest::Error> for AppError {
+    fn from(value: reqwest::Error) -> Self {
+        // reqwest 的 Display 往往只有 error sending request，真正的 DNS/TLS/断连原因在 source 链。
+        // URL 可能带连接信息，保留底层原因但不把请求地址反射进错误。
+        let value = value.without_url();
+        let mut details = vec![value.to_string()];
+        let mut source = std::error::Error::source(&value);
+        for _ in 0..6 {
+            let Some(cause) = source else {
+                break;
+            };
+            let text = cause.to_string();
+            if !details.contains(&text) {
+                details.push(text);
+            }
+            source = cause.source();
+        }
+        AppError::Http(details.join("："))
     }
 }
 
@@ -59,4 +80,23 @@ pub async fn api_error(resp: reqwest::Response) -> AppError {
         body.to_string()
     };
     AppError::Api { status, body }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn connection_error_preserves_cause_without_request_url() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let url = format!("http://{address}/private-request?key=fixture-secret");
+        let error = reqwest::Client::new().get(&url).send().await.unwrap_err();
+        let message = AppError::from(error).to_string();
+        assert!(message.contains("网络请求失败"));
+        assert!(message.contains("tcp connect") || message.contains("connection") || message.contains("连接"), "{message}");
+        assert!(!message.contains("fixture-secret"));
+        assert!(!message.contains("private-request"));
+    }
 }

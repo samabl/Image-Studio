@@ -12,7 +12,39 @@ pub struct BackgroundStatus {
     #[serde(default)]
     wake_lock_held: bool,
     #[serde(default)]
+    network_available: bool,
+    #[serde(default)]
+    network_blocked: bool,
+    #[serde(default)]
     last_error: Option<String>,
+}
+
+/// 锁屏、网络切换或系统暂时阻断时先等待恢复，避免空耗模型重试次数。
+pub async fn wait_for_network(app: &AppHandle, timeout_secs: u64) -> AppResult<()> {
+    #[cfg(target_os = "android")]
+    {
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(timeout_secs.clamp(10, 60));
+        loop {
+            let connection = status(app).await?;
+            if connection.network_available {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(crate::error::AppError::other(if connection.network_blocked {
+                    "Android 已限制后台联网，等待恢复超时；请回到应用并允许后台数据及电池权限后重试"
+                } else {
+                    "Android 网络暂不可用，等待恢复超时；请检查 Wi-Fi、移动数据或 VPN 后重试"
+                }));
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (app, timeout_secs);
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "android")]

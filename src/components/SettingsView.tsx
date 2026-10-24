@@ -65,13 +65,14 @@ export function SettingsView() {
         {isAndroid && (
           <Panel title="后台与锁屏任务" className="settings-panel">
             <div className="hint" style={{ marginBottom: 10 }}>
-              任务期间自动持有 CPU Wake Lock，后台 WebView 保持多轮执行；完成或取消后释放。锁屏联网仍需允许忽略电池优化，并建议开启任务通知、允许厂商后台运行。
+              任务期间保持后台执行；网络切换或系统暂时限制联网时先等待恢复。锁屏联网需允许忽略电池优化、后台数据和厂商后台运行权限。
             </div>
             <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
               <span className="chip">锁屏运行：{background ? background.batteryOptimizationIgnored ? "已允许" : "待允许" : "读取中"}</span>
               <span className="chip">任务通知：{background ? background.notificationsEnabled ? "已开启" : "未开启" : "读取中"}</span>
               <span className="chip">CPU 唤醒锁：{background ? background.wakeLockHeld ? "已持有" : "未持有（空闲时正常）" : "读取中"}</span>
               <span className="chip">后台任务：{background?.activeTasks ?? 0}</span>
+              <span className="chip">联网状态：{background ? background.networkBlocked ? "被系统限制" : background.networkAvailable ? "可用" : "等待连接" : "读取中"}</span>
             </div>
             {background?.lastError && <div className="error">{background.lastError}</div>}
             <button type="button" className="btn" onClick={() => void configureBackgroundTasks().catch((err: Error) => note("error", err.message))}>

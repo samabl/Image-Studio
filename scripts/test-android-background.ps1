@@ -25,7 +25,7 @@ try {
     Install-AndroidBackgroundTasks -AndroidRoot $fixtureRoot -SourceRoot $source
     $first = [IO.File]::ReadAllText($manifestPath)
     [xml]$doc = $first
-    Assert-Background ($doc.manifest.'uses-permission'.Count -eq 7) '后台服务、电池优化、通知与旧版相册权限完整注入'
+    Assert-Background ($doc.manifest.'uses-permission'.Count -eq 8) '后台服务、电池优化、通知、网络监测与旧版相册权限完整注入'
     $legacy = $doc.manifest.'uses-permission' | Where-Object { $_.name -eq 'android.permission.WRITE_EXTERNAL_STORAGE' }
     Assert-Background ($legacy.maxSdkVersion -eq '28') '旧存储权限只适用于 Android 9 及以下'
     Assert-Background ($doc.manifest.application.activity.name -eq '.MainActivity') '保留现有 Activity'
@@ -72,6 +72,8 @@ try {
     Assert-Background ($runtime -match 'RENDERER_PRIORITY_IMPORTANT, false' -and $runtime -match 'if \(running \|\| !paused\)' -and $runtime -match 'view\.resumeTimers\(\)') '运行任务在隐藏页面保留 JS 调度与渲染优先级'
     Assert-Background ($runtime -match 'JSONObject\.quote\(reason\)' -and $runtime -match 'image-studio-background-error' -and $runtime.Contains('view.evaluateJavascript(script) { applyScheduling() }')) '安全传递中断原因，派发完成后再恢复空闲策略'
     Assert-Background ($runtime -match 'postDelayed\(\{ applyScheduling\(\) \}, 1_000L\)') '渲染进程不回调时也能收回运行优先级'
+    Assert-Background ($runtime -match 'registerDefaultNetworkCallback' -and $runtime -match 'onBlockedStatusChanged' -and $runtime -match 'onLost' -and $runtime -match 'unregisterNetworkCallback') '监测默认网络中断和系统后台联网限制，销毁时注销回调'
+    Assert-Background ($runtime -match 'available = usable && blocked == false' -and $runtime -notmatch 'hasCapability\(NetworkCapabilities.NET_CAPABILITY_VALIDATED\)') '等待网络真实可用且未被阻断，局域网网关不依赖外网验证'
 
     foreach ($file in @('test-android-background.ps1', 'lib/android-background.ps1')) {
         $errors = $null; $tokens = $null

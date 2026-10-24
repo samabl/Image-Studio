@@ -259,6 +259,8 @@ class BackgroundTasksPlugin(private val activity: Activity) : Plugin(activity) {
     result.put("notificationsEnabled", NotificationManagerCompat.from(activity).areNotificationsEnabled())
     result.put("activeTasks", BackgroundTaskRuntime.activeTasks)
     result.put("wakeLockHeld", BackgroundTaskRuntime.wakeLockHeld)
+    result.put("networkAvailable", BackgroundTaskRuntime.networkAvailable)
+    result.put("networkBlocked", BackgroundTaskRuntime.networkBlocked)
     result.put("lastError", BackgroundTaskRuntime.lastError)
     invoke.resolve(result)
   }

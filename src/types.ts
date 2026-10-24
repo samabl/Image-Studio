@@ -325,6 +325,7 @@ export interface ImageRequest {
 export interface ChatRequest {
   protocol?: ChatProtocol;
   stream?: boolean;
+  strictImageInputs?: boolean;
   baseUrl: string;
   apiKey: string;
   model: string;

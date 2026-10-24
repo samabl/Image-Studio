@@ -596,8 +596,8 @@ const MAX_TOOL_ROUNDS = 4;
 /** 对话请求遇到传输类故障时的总尝试次数（含首次）。 */
 const CHAT_ATTEMPTS = 3;
 /** 只重试网络/限流/服务端故障；鉴权、参数、停止等确定性失败重试没有意义。 */
-const RETRYABLE_CHAT_ERROR = /超时|timed out|timeout|网络|连接|connection|sending request|error sending|HTTP\s*(429|5\d\d)|rate limit|服务不可用|empty response|decoding response|unexpected end/i;
-const canRetryChat = (message?: string) => Boolean(message && !/已停止|停止/.test(message) && RETRYABLE_CHAT_ERROR.test(message));
+const RETRYABLE_CHAT_ERROR = /超时|timed out|timeout|网络|连接|connection|sending request|error sending|(?:HTTP\s*|接口返回\s*)(429|5\d\d)|rate limit|服务不可用|empty response|decoding response|unexpected end|等待服务端响应超过/i;
+const canRetryChat = (message?: string) => Boolean(message && !/停止|(?:HTTP\s*|接口返回\s*)4(?!29\b)\d\d|未配置|未填写|协议无效|鉴权|unauthorized|invalid api key/i.test(message) && RETRYABLE_CHAT_ERROR.test(message));
 
 export interface StreamingState {
   messageId: string;
@@ -663,9 +663,9 @@ function persistedSessions(sessions: ChatSession[]): ChatSession[] {
   const slim = sessions.map((session) => {
     let sessionChanged = false;
     const messages = session.messages.map((message) => {
-      if (!message.images?.some((image) => image.dataUrl)) return message;
+      if (!message.images?.some((image) => image.dataUrl && image.path)) return message;
       sessionChanged = true;
-      return { ...message, images: message.images.map((image) => (image.dataUrl ? { ...image, dataUrl: undefined } : image)) };
+      return { ...message, images: message.images.map((image) => (image.dataUrl && image.path ? { ...image, dataUrl: undefined } : image)) };
     });
     if (!sessionChanged) return session;
     changed = true;
@@ -958,6 +958,7 @@ async function runTurn(sessionId: string, set: Setter, get: () => SessionState):
   type PreparedImage = { request: ImageRequest; sourceLabels: string[]; sourceGalleryId?: string; stage: "asset" | "final"; retryOf?: string };
   const failedRequests = new Map<string, PreparedImage>();
   let lastFinalIds: string[] = [];
+  let lastFinalInput: { prompt: string; references: ReturnType<typeof selectImageSources> } | undefined;
   let inCorrection = false;
   // 本次运行内的评审缓存：同一批实际成果只评审一次，避免模型对同一张图反复付费评审。
   const reviewCache = new Map<string, JuryReview>();
@@ -993,31 +994,31 @@ async function runTurn(sessionId: string, set: Setter, get: () => SessionState):
   const dropOlderImageData = (keepIds: string[]) => {
     const keep = new Set(keepIds);
     const session = get().sessions.find((candidate) => candidate.id === sessionId);
-    const stale = (message: ChatMessage) => message.images?.some((image) => image.dataUrl && !keep.has(image.galleryId));
+    const stale = (message: ChatMessage) => message.images?.some((image) => image.dataUrl && image.path && !keep.has(image.galleryId));
     if (!session?.messages.some(stale)) return;
     set((state) => ({ sessions: state.sessions.map((candidate) => candidate.id !== sessionId ? candidate : {
       ...candidate,
       messages: candidate.messages.map((message) => {
-        if (!message.images?.some((image) => image.dataUrl && !keep.has(image.galleryId))) return message;
+        if (!message.images || !stale(message)) return message;
         return { ...message, images: message.images.map((image) =>
-          image.dataUrl && !keep.has(image.galleryId) ? { ...image, dataUrl: undefined } : image) };
+          image.dataUrl && image.path && !keep.has(image.galleryId) ? { ...image, dataUrl: undefined } : image) };
       }),
     }) }));
   };
   /** 同一批成果 + 同一评审模式的签名；参考图只影响意见措辞，不改变被评分的成果，因此不进签名。 */
-  const reviewSignature = (ids: string[], focus: string, scoring: boolean, answer?: string) =>
-    `${scoring ? "score" : "review"}|${[...ids].sort().join(",")}|${focus}|${answer ?? ""}`;
+  const reviewSignature = (ids: string[], scoring: boolean, answer?: string) =>
+    JSON.stringify([scoring ? "score" : "review", [...ids].sort(), answer ?? ""]);
   const reviewImages = async (toolId: string, sources: ReturnType<typeof selectImageSources>, text: string,
     prompt = "", references: ReturnType<typeof selectImageSources> = [], focus = "", scoring = false, answer?: string) => {
     let report: JuryReview;
     const reviewConfig = scoring ? scoringConfig : cfg;
     const imageIds = sources.map((source) => source.id);
-    const imageKey = [...imageIds].sort().join(",");
-    const cacheKey = reviewSignature(imageIds, focus, scoring, answer);
+    const imageKey = JSON.stringify([...imageIds].sort());
+    const cacheKey = reviewSignature(imageIds, scoring, answer);
     const cachedReview = reviewCache.get(cacheKey);
     if (cachedReview) {
       // 直接复用本次运行已经拿到的真实评审，既不重复付费，也不让同一批成果反复出现在历史里。
-      update(toolId, { pending: false, content: `${text}\n${juryFeedback(cachedReview)}`, juryReview: cachedReview });
+      update(toolId, { pending: false, content: `${text}\n本批成果本次运行已经评审过，评审意见见之前的工具结果，未重复调用评审。` });
       return cachedReview;
     }
     // 成图已自动评审后模型常会再调一次 review_images：同一批图片在本次运行里只评一次，
@@ -1040,7 +1041,7 @@ async function runTurn(sessionId: string, set: Setter, get: () => SessionState):
       }, api.cancellableText, (juryReview) => {
         if (get().runs[sessionId]?.runId !== runId) return;
         update(toolId, { juryReview });
-      }, [...failedJuryMembers]);
+      }, [...failedJuryMembers], api.waitForRetry);
       abort = task.cancel;
       if (stopped) task.cancel();
       report = await task.promise;
@@ -1086,7 +1087,7 @@ async function runTurn(sessionId: string, set: Setter, get: () => SessionState):
           ...(!imageToolsEnabled && (goal.enabled || jury.enabled || codeRuntime.enabled) ? [{ role: "system", content: imageCatalogInstructions(session.messages) }] : []),
           ...(jury.enabled ? [{ role: "system", content: juryInstructions }] : []),
           ...(codeRuntime.enabled ? [{ role: "system", content: `${codeImageInstructions}\n本次代码超时上限：${codeRuntime.timeoutSecs} 秒。` }] : []),
-          ...(goal.enabled ? [{ role: "system", content: `${goalInstructions(goal, progress.corrections)}${terminal ? `\n自动执行已结束：${progress.summary}。诚实总结已完成成果和未解决问题，不再调用工具。` : ""}` }] : []),
+          ...(goal.enabled ? [{ role: "system", content: `${goalInstructions(goal, progress.corrections)}${lastFinalIds.length ? `\n当前待验收的全部最终图片 ID：${JSON.stringify(lastFinalIds)}。review_goal 的 image_ids 必须使用这个完整集合，不能包含旧图或中间素材。` : ""}${terminal ? `\n自动执行已结束：${progress.summary}。诚实总结已完成成果和未解决问题，不再调用工具。` : ""}` }] : []),
           ...history,
           ...(continuation ? [{ role: "user", content: continuation }] : []),
         ],
@@ -1125,10 +1126,10 @@ async function runTurn(sessionId: string, set: Setter, get: () => SessionState):
       // 网络抖动/限流/服务端错误自动重试，避免一次瞬时失败就结束整轮或整个 Goal。
       for (let attempt = 1; !final.ok && attempt < CHAT_ATTEMPTS && canRetryChat(final.error) && active(); attempt += 1) {
         const wait = 1200 * attempt;
-        patchRun({ toolNote: `请求失败（${final.error}），${Math.round(wait / 1000)} 秒后自动重试（${attempt + 1}/${CHAT_ATTEMPTS}）…` });
+        patchRun({ toolNote: `请求失败（${jurySafeText(final.error, cfg)}），${Math.round(wait / 1000)} 秒后自动重试（${attempt + 1}/${CHAT_ATTEMPTS}）…` });
         // 上一次的残片作废，重试从干净状态重新流式输出。
         patchRun({ streaming: { messageId, content: "", reasoning: "", toolCalls: [] } });
-        await new Promise((resolve) => setTimeout(resolve, wait));
+        await api.waitForRetry(wait);
         if (!stopped && active()) final = await attemptChat();
       }
       const streamed = get().runs[sessionId]?.streaming;
@@ -1198,34 +1199,45 @@ async function runTurn(sessionId: string, set: Setter, get: () => SessionState):
               images: items.map((item) => ({ galleryId: item.id, path: item.path, dataUrl: item.dataUrl ?? undefined, prompt: item.prompt, size: item.size, model: item.model,
                 kind: item.kind, createdAt: item.createdAt, parentId: item.parentId, revisedPrompt: item.revisedPrompt })),
             });
-            if (imageStage === "final") { lastFinalIds = items.map((item) => `image_${item.id}`); inCorrection = false; lastScoreSignature = ""; repeatedScores = 0; dropOlderImageData(items.map((item) => item.id)); }
-            if (jury.enabled && imageStage === "final" && (!goal.enabled || goalScorer === "jury")) {
+            if (imageStage === "final") {
+              lastFinalIds = items.map((item) => `image_${item.id}`);
+              lastFinalInput = { prompt: codeExecution.description, references: sources };
+              inCorrection = false; lastScoreSignature = ""; repeatedScores = 0; dropOlderImageData(items.map((item) => item.id));
+            }
+            if (jury.enabled && imageStage === "final" && !goal.enabled) {
               update(toolId, { pending: true });
               await reviewImages(toolId, items.map((item, index) => ({ id: `image_${item.id}`, label: `代码结果 ${index + 1}（图片 ID：image_${item.id}）`, path: item.path, dataUrl: item.dataUrl ?? undefined })),
-                `代码已处理 ${items.length} 张图片：${codeExecution.description}`, codeExecution.description, inputs, "", goal.enabled);
+                `代码已处理 ${items.length} 张图片：${codeExecution.description}`, codeExecution.description, inputs);
             }
             continue;
           }
           if (call.name === "review_images") {
             if (!jury.enabled) throw new Error("当前未启用评审团");
+            if (goal.enabled) {
+              update(toolId, { pending: false, content: `Goal 模式统一通过 review_goal 独立评分，请提交最新全部最终图片及完整答案；不另行调用评审团。\n${JSON.stringify({ required_image_ids: lastFinalIds })}` });
+              continue;
+            }
             if (!Array.isArray(args.source_image_ids) || !args.source_image_ids.length) throw new Error("请选择实际图片 ID");
             const sources = selectImageSources(readSession()?.messages ?? [], args.source_image_ids);
             if (sources.length > 4) throw new Error("一次最多评审 4 张图片");
-            await reviewImages(toolId, sources, `评审 ${sources.length} 张已有图片。`, "", [], typeof args.focus === "string" ? args.focus : "", goal.enabled && goalScorer === "jury");
+            await reviewImages(toolId, sources, `评审 ${sources.length} 张已有图片。`, "", [], typeof args.focus === "string" ? args.focus : "");
             continue;
           }
           if (call.name === "review_goal") {
             if (!goal.enabled) throw new Error("当前会话未开启 Goal 模式");
             const submission = parseGoalSubmission(args);
             if (!submission.blockedReason && progress.attempts > 0 && !lastFinalIds.length) throw new Error("本 Goal 已请求图像，但尚未返回实际最终图片，不能宣称图像任务已满足");
+            if (!submission.blockedReason && lastFinalIds.length && (submission.imageIds.length !== lastFinalIds.length || lastFinalIds.some((id) => !submission.imageIds.includes(id)))) {
+              update(toolId, { pending: false, content: `Goal 检查必须包含本次最新的全部最终图片，不能以旧图代替。请用以下真实 ID 重新提交 review_goal；本次未评分，无需重新生图。\n${JSON.stringify({ required_image_ids: lastFinalIds, submitted_image_ids: submission.imageIds })}` });
+              continue;
+            }
             const sources = submission.imageIds.length ? selectImageSources(readSession()?.messages ?? [], submission.imageIds) : [];
-            if (!submission.blockedReason && lastFinalIds.some((id) => !submission.imageIds.includes(id))) throw new Error("Goal 检查必须包含本次最新的全部最终图片，不能以旧图代替");
             let review: GoalReview;
             if (submission.blockedReason) {
               review = { status: "blocked", summary: submission.blockedReason, checks: [], imageIds: submission.imageIds,
                 targetScore: goal.targetScore, scorer: goalScorer, answer: submission.answer };
             } else {
-              const signature = reviewSignature(submission.imageIds, "", true, submission.answer);
+              const signature = reviewSignature(submission.imageIds, true, submission.answer);
               // 同一批成果只给一次独立评分。重复提交必须先产出新成果，否则会对着同一张图无限重评。
               if (signature === lastScoreSignature) {
                 repeatedScores += 1;
@@ -1233,7 +1245,7 @@ async function runTurn(sessionId: string, set: Setter, get: () => SessionState):
                 update(toolId, { pending: false, content: `同一批成果已经评分（${lastScoreLabel}），不会重复评审。请先按评分意见生成/编辑出新的最终图片，或改写文字答案，再提交 review_goal。` });
                 continue;
               }
-              const report = await reviewImages(toolId, sources, "Goal 正在为实际成果评分。", "", [], "", true, submission.answer);
+              const report = await reviewImages(toolId, sources, "Goal 正在为实际成果评分。", lastFinalInput?.prompt, lastFinalInput?.references, "", true, submission.answer);
               if (!active()) throw new Error(stoppedMessage());
               // 个别评审失败只忽略该成员；只有全员都拿不出有效评分时才无法判定。
               if (!report.opinions.some((opinion) => opinion.status === "complete" && opinion.goalScore)) {
@@ -1253,7 +1265,7 @@ async function runTurn(sessionId: string, set: Setter, get: () => SessionState):
             else if (progress.corrections >= goal.maxCorrections) endGoal("limit", `已达到 ${goal.maxCorrections} 次修正上限，仍未达标：${review.summary}`);
             else if (!review.imageIds.length) { progress.corrections += 1; syncGoal(); }
             else syncGoal();
-            lastScoreSignature = reviewSignature(submission.imageIds, "", true, submission.answer);
+            lastScoreSignature = reviewSignature(submission.imageIds, true, submission.answer);
             lastScoreLabel = `${review.score ?? "?"}/100，${review.status === "needs_revision" ? "未达标" : review.status}`;
             repeatedScores = 0;
             continue;
@@ -1303,16 +1315,20 @@ async function runTurn(sessionId: string, set: Setter, get: () => SessionState):
           abort = null;
           if (!active()) throw new Error(stoppedMessage());
           if (!items.length) throw new Error("服务没有返回图片");
-          if (imageStage === "final") { lastFinalIds = items.map((item) => `image_${item.id}`); inCorrection = false; lastScoreSignature = ""; repeatedScores = 0; dropOlderImageData(items.map((item) => item.id)); }
+          if (imageStage === "final") {
+            lastFinalIds = items.map((item) => `image_${item.id}`);
+            lastFinalInput = { prompt: imageRequest.prompt, references: (imageRequest.images ?? []).map((dataUrl, index) => ({ id: `reference_${index}`, label: sourceLabels[index] ?? `素材 ${index + 1}`, dataUrl })) };
+            inCorrection = false; lastScoreSignature = ""; repeatedScores = 0; dropOlderImageData(items.map((item) => item.id));
+          }
           update(toolId, { pending: false, content: `已生成 ${items.length} 张${imageStage === "asset" ? "中间素材，请继续剩余生成/合成步骤" : "图片"}。`, images: items.map((item) => ({
             galleryId: item.id, path: item.path, dataUrl: item.dataUrl ?? undefined, prompt: item.prompt, size: item.size, model: item.model,
             kind: item.kind, createdAt: item.createdAt, parentId: item.parentId, revisedPrompt: item.revisedPrompt,
           })) });
-          if (jury.enabled && imageStage === "final" && (!goal.enabled || goalScorer === "jury")) {
+          if (jury.enabled && imageStage === "final" && !goal.enabled) {
             update(toolId, { pending: true });
             await reviewImages(toolId, items.map((item, index) => ({ id: `image_${item.id}`, label: `结果图 ${index + 1}（图片 ID：image_${item.id}）`, path: item.path, dataUrl: item.dataUrl ?? undefined })),
               `已生成 ${items.length} 张图片。`, imageRequest.prompt,
-              (imageRequest.images ?? []).map((dataUrl, index) => ({ id: `reference_${index}`, label: sourceLabels[index] ?? `素材 ${index + 1}`, dataUrl })), "", goal.enabled);
+              (imageRequest.images ?? []).map((dataUrl, index) => ({ id: `reference_${index}`, label: sourceLabels[index] ?? `素材 ${index + 1}`, dataUrl })));
           }
         } catch (err) {
           abort = null;

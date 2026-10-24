@@ -20,7 +20,7 @@ export function goalSettings(value?: Partial<GoalSettings> & { level?: unknown }
 
 export function goalInstructions(settings: GoalSettings, corrections: number): string {
   return `Goal 模式已开启，采用 100 分制，目标分数：${settings.targetScore}/100，评分来源：${GOAL_SCORERS[settings.scorer]}。达到目标分数且没有违反明确要求才算达标。最多修正 ${settings.maxCorrections} 次，当前已修正 ${corrections} 次。
-先整理当前用户目标及必须遵守的要求，再完成任务。涉及图片时必须检查实际回图；编号只是图片引用，不能仅凭生图提示词判断达标。每次成图后调用 review_goal，提交本次最新全部最终图片的真实 image_ids，由客户端交给评审团或 Chat 模型独立打分；你不能自行填写分数、宣称通过或篡改评审分数。
+先整理当前用户目标及必须遵守的要求，再完成任务。涉及图片时必须检查实际回图；编号只是图片引用，不能仅凭生图提示词判断达标。每次成图后调用 review_goal，提交本次最新全部最终图片的真实 image_ids 和需要验收的完整 answer，由客户端统一交给评审团或 Chat 模型独立打分；Goal 模式不会在成图时另行自动评审，不要调用 review_images 重复评分。你不能自行填写分数、宣称通过或篡改评审分数。
 收到 needs_revision 后根据评分和逐项依据自行修正，再提交新成果评分，不要等用户催促。同一批成果只能评分一次：必须先产出新的最终图片或改写答案再提交 review_goal，反复提交同一批成果会被客户端拒绝。文字任务提交完整 answer 和空 image_ids；未达分时自行改写答案，再重新评分。真实能力或服务限制无法继续时用 blocked_reason 说明实际障碍，不能假称成功。修正不能改变原始要求、扩大任务或添加无关元素。不要编造图片 ID，也不能用仅文生图的模型编辑参考图。`;
 }
 
@@ -52,6 +52,8 @@ export function parseGoalSubmission(args: Record<string, unknown>) {
   return { imageIds: ids as string[], answer, blockedReason };
 }
 
+export class GoalScoreFormatError extends Error {}
+
 /**
  * 只接受评分模型返回的结构化结果，拒绝空意见、越界分数和编造的通过状态。
  * 部分模型会把 JSON 裹在“这是我的评分：…”之类的说明里，这里先尝试整体解析，
@@ -71,15 +73,15 @@ export function parseGoalScore(text: string): GoalScore {
       if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) { result = parsed as Record<string, unknown>; break; }
     } catch { /* 换下一个候选片段继续解析。 */ }
   }
-  if (!result) throw new Error("评分模型未返回有效 JSON，请重新评分");
+  if (!result) throw new GoalScoreFormatError("评分模型未返回有效 JSON，请重新评分");
   const validScore = (score: unknown): score is number => typeof score === "number" && Number.isFinite(score) && score >= 0 && score <= 100;
-  if (!validScore(result.score)) throw new Error("评分必须是 0–100 之间的有限数值");
-  if (typeof result.summary !== "string" || !result.summary.trim()) throw new Error("评分必须说明实际依据");
-  if (!Array.isArray(result.checks) || !result.checks.length || result.checks.length > 40) throw new Error("评分必须逐项核对用户要求");
+  if (!validScore(result.score)) throw new GoalScoreFormatError("评分必须是 0–100 之间的有限数值");
+  if (typeof result.summary !== "string" || !result.summary.trim()) throw new GoalScoreFormatError("评分必须说明实际依据");
+  if (!Array.isArray(result.checks) || !result.checks.length || result.checks.length > 40) throw new GoalScoreFormatError("评分必须逐项核对用户要求");
   const checks = result.checks.map((item) => {
     if (!item || typeof item !== "object" || typeof item.requirement !== "string" || !item.requirement.trim()
       || !validScore(item.score) || typeof item.passed !== "boolean" || typeof item.details !== "string" || !item.details.trim()) {
-      throw new Error("评分项必须包含要求、0–100 分数、是否符合明确约束及实际依据");
+      throw new GoalScoreFormatError("评分项必须包含要求、0–100 分数、是否符合明确约束及实际依据");
     }
     return { requirement: item.requirement.trim(), score: item.score, passed: item.passed, details: item.details.trim() };
   });

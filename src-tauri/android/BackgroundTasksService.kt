@@ -36,6 +36,7 @@ class BackgroundTasksService : Service() {
       try {
         acquireWakeLock()
         BackgroundTaskRuntime.update(tasks.size, wakeLock?.isHeld == true)
+        logProtection("renew")
         handler.postDelayed(this, RENEW_INTERVAL_MS)
       } catch (error: Exception) {
         interrupt("Android 唤醒锁续期失败：${error.message ?: "系统拒绝"}")
@@ -55,6 +56,7 @@ class BackgroundTasksService : Service() {
           updateNotification()
           acquireWakeLock()
           BackgroundTaskRuntime.update(tasks.size, wakeLock?.isHeld == true, clearError = true)
+          logProtection("start")
           handler.removeCallbacks(renewLock)
           handler.postDelayed(renewLock, RENEW_INTERVAL_MS)
           reply(intent, null)
@@ -129,9 +131,14 @@ class BackgroundTasksService : Service() {
     wakeLock = null
   }
 
+  private fun logProtection(event: String) {
+    BackgroundTaskRuntime.trace(this, event)
+  }
+
   private fun stopProtection(startId: Int) {
     releaseWakeLock()
     BackgroundTaskRuntime.update(0, false)
+    logProtection("finish")
     stopForeground(STOP_FOREGROUND_REMOVE)
     stopSelf(startId)
   }
@@ -140,6 +147,7 @@ class BackgroundTasksService : Service() {
     tasks.clear()
     releaseWakeLock()
     BackgroundTaskRuntime.interrupted(reason)
+    logProtection("interrupted")
     stopForeground(STOP_FOREGROUND_REMOVE)
     stopSelf()
   }

@@ -53,6 +53,7 @@ macro_rules! cfg_or_skip {
 
 fn chat_req(cfg: &Cfg, prompt: &str) -> ChatRequest {
     ChatRequest {
+        strict_image_inputs: false,
         protocol: None,
         stream: None,
         base_url: cfg.base.clone(),

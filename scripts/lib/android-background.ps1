@@ -15,7 +15,7 @@ function Install-AndroidBackgroundTasks {
     $ns.AddNamespace('android', $androidNs)
     $application = $manifest.SelectSingleNode('/manifest/application')
     if ($null -eq $application) { throw 'AndroidManifest.xml 缺少 application' }
-    foreach ($permission in @('FOREGROUND_SERVICE', 'FOREGROUND_SERVICE_DATA_SYNC', 'WAKE_LOCK', 'POST_NOTIFICATIONS', 'REQUEST_IGNORE_BATTERY_OPTIMIZATIONS')) {
+    foreach ($permission in @('FOREGROUND_SERVICE', 'FOREGROUND_SERVICE_DATA_SYNC', 'WAKE_LOCK', 'POST_NOTIFICATIONS', 'REQUEST_IGNORE_BATTERY_OPTIMIZATIONS', 'ACCESS_NETWORK_STATE')) {
         $name = 'android.permission.' + $permission
         if ($null -eq $manifest.SelectSingleNode("/manifest/uses-permission[@android:name='$name']", $ns)) {
             $entry = $manifest.CreateElement('uses-permission')

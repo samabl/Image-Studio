@@ -47,8 +47,12 @@ export function startBackgroundTask() {
   };
 }
 
-export const backgroundTaskStatus = () => call<{ batteryOptimizationIgnored: boolean; notificationsEnabled: boolean; activeTasks: number; wakeLockHeld: boolean; lastError?: string | null }>("background_task_status");
+export const backgroundTaskStatus = () => call<{ batteryOptimizationIgnored: boolean; notificationsEnabled: boolean; activeTasks: number; wakeLockHeld: boolean; networkAvailable: boolean; networkBlocked: boolean; lastError?: string | null }>("background_task_status");
 export const configureBackgroundTasks = () => call<void>("background_task_configure");
+/** 锁屏 WebView 会节流/暂停 JS 定时器；重试等待必须由原生运行时计时。 */
+export const waitForRetry = (delayMs: number): Promise<void> => isAndroid
+  ? call<void>("background_retry_delay", { delayMs })
+  : new Promise((resolve) => setTimeout(resolve, delayMs));
 export const saveImageToAlbum = (dataUrl: string, fileName: string) => call<string>("save_image_to_album", { dataUrl, fileName });
 
 // --- 模型 -----------------------------------------------------------------
